@@ -1,0 +1,424 @@
+# MapLibre Frontend Files — Reference for Cleanup
+
+This document contains the full contents of the MapLibre-based frontend so they can be shared, copy-pasted, or used for a concrete cleanup plan. Drawing/blockage logic lives inside **MapLibreMap.tsx** (MapboxDraw).
+
+---
+
+## 1. `frontend/package.json`
+
+```json
+{
+  "name": "israel-gtfs-detour-frontend",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@mapbox/mapbox-gl-draw": "^1.5.1",
+    "axios": "^1.7.7",
+    "maplibre-gl": "^4.7.1",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-rnd": "^10.4.1"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.5",
+    "@types/react-dom": "^18.3.0",
+    "@vitejs/plugin-react-swc": "^3.7.0",
+    "typescript": "^5.6.3",
+    "vite": "^5.4.10"
+  }
+}
+```
+
+---
+
+## 2. `frontend/src/MapLibreMap.tsx` (map + drawing/blockage)
+
+```tsx
+import "maplibre-gl/dist/maplibre-gl.css";
+import "@mapbox/mapbox-gl-draw/dist/mapbox-gl-draw.css";
+
+import React, { useEffect, useImperativeHandle, useRef, useState } from "react";
+import maplibregl from "maplibre-gl";
+import MapboxDraw from "@mapbox/mapbox-gl-draw";
+
+// GeoJSON types for internal use (coordinates as [lng, lat])
+type GeoJSONPosition = [number, number];
+type GeoJSONGeometry =
+  | { type: "Polygon"; coordinates: GeoJSONPosition[][] }
+  | { type: "LineString"; coordinates: GeoJSONPosition[] }
+  | { type: "Point"; coordinates: GeoJSONPosition };
+type GeoJSONFeature = { type: "Feature"; geometry: GeoJSONGeometry; properties?: Record<string, unknown> };
+type GeoJSONFeatureCollection = { type: "FeatureCollection"; features: GeoJSONFeature[] };
+
+const OSM_STYLE: maplibregl.StyleSpecification = {
+  version: 8,
+  sources: {
+    osm: {
+      type: "raster",
+      tiles: ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"],
+      tileSize: 256,
+      attribution: "© OpenStreetMap",
+    },
+  },
+  layers: [{ id: "osm", type: "raster", source: "osm" }],
+};
+
+const SOURCE_BLOCKAGE = "blockage";
+const SOURCE_ROUTE = "route";
+const SOURCE_DETOUR = "detour";
+const SOURCE_STOPS = "stops";
+const SOURCE_PIN = "pin";
+
+/** Normalize drawn geometry: close polygon ring if needed (GeoJSON spec; backend expects closed). */
+function normalizeBlockageGeometry(geom: GeoJSON.Geometry): GeoJSON.Geometry {
+  if (geom.type === "Polygon" && geom.coordinates?.[0]?.length) {
+    const ring = geom.coordinates[0];
+    const first = ring[0];
+    const last = ring[ring.length - 1];
+    const closed =
+      first &&
+      last &&
+      first.length >= 2 &&
+      last.length >= 2 &&
+      first[0] === last[0] &&
+      first[1] === last[1];
+    if (!closed && ring.length >= 2) {
+      return {
+        type: "Polygon",
+        coordinates: [[...ring, [ring[0][0], ring[0][1]]]],
+      };
+    }
+  }
+  if (geom.type === "MultiPolygon" && geom.coordinates?.length) {
+    return {
+      type: "MultiPolygon",
+      coordinates: geom.coordinates.map((poly) => {
+        const ring = poly[0];
+        if (!ring?.length) return poly;
+        const first = ring[0] as number[];
+        const last = ring[ring.length - 1] as number[];
+        const closed = first && last && first[0] === last[0] && first[1] === last[1];
+        if (!closed && ring.length >= 2) return [[...ring, [ring[0][0], ring[0][1]]]];
+        return poly;
+      }),
+    };
+  }
+  return geom;
+}
+
+export type MapLibreMapHandle = {
+  clearBlockage: () => void;
+  cancelDrawing: () => void;
+  undoLastPoint: () => void;
+  fitToBlockage: () => void;
+  fitToRoute: () => void;
+  fitToDetour: () => void;
+  flyTo: (lat: number, lng: number, zoom?: number) => void;
+};
+
+export type MapLibreMapProps = {
+  /** Center as [lat, lng] (converted to [lng, lat] for MapLibre) */
+  center: [number, number];
+  stops: { stop_id: string; name: string; lat: number; lon: number; sequence: number }[];
+  routeGeojson: GeoJSON.FeatureCollection | null;
+  detour: { path_geojson?: GeoJSON.FeatureCollection | null } | null;
+  blockageGeojson: GeoJSON.Geometry | null;
+  onBlockageChange: (geom: GeoJSON.Geometry | null) => void;
+  pinPosition: [number, number] | null;
+};
+
+const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(function MapLibreMap(
+  { center, stops, routeGeojson, detour, blockageGeojson, onBlockageChange, pinPosition },
+  ref
+) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const mapRef = useRef<maplibregl.Map | null>(null);
+  const drawRef = useRef<MapboxDraw | null>(null);
+  const blockageRef = useRef<GeoJSON.Geometry | null>(null);
+  const routeRef = useRef<GeoJSON.FeatureCollection | null>(null);
+  const detourRef = useRef<MapLibreMapProps["detour"]>(null);
+  const [mapReady, setMapReady] = useState(false);
+
+  blockageRef.current = blockageGeojson;
+  routeRef.current = routeGeojson;
+  detourRef.current = detour;
+
+  useEffect(() => {
+    if (!containerRef.current) return;
+    const [lat, lng] = center;
+    const map = new maplibregl.Map({
+      container: containerRef.current,
+      style: OSM_STYLE,
+      center: [lng, lat],
+      zoom: 8,
+    });
+    map.addControl(new maplibregl.NavigationControl(), "top-right");
+    mapRef.current = map;
+
+    const onLoad = () => {
+      // Draw control: polygon and rectangle only
+      const draw = new MapboxDraw({
+        displayControlsDefault: false,
+        controls: {
+          polygon: true,
+          rectangle: true,
+          trash: true,
+        },
+        defaultMode: "draw_polygon",
+      });
+      map.addControl(draw as any, "top-left");
+      drawRef.current = draw;
+
+      map.on("draw.create", (e: { features?: GeoJSON.Feature[] }) => {
+        let feature = e?.features?.[0];
+        if (!feature && typeof draw.getAll === "function") {
+          const all = draw.getAll();
+          feature = all?.features?.[0];
+        }
+        if (feature?.geometry) {
+          const geom = normalizeBlockageGeometry(feature.geometry);
+          onBlockageChange(geom);
+          draw.deleteAll();
+        }
+      });
+      map.on("draw.delete", () => onBlockageChange(null));
+
+      setMapReady(true);
+    };
+
+    map.on("load", onLoad);
+    return () => {
+      map.remove();
+      mapRef.current = null;
+      drawRef.current = null;
+    };
+  }, [onBlockageChange]);
+
+  // Keep map center in sync when prop changes
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !mapReady) return;
+    const [lat, lng] = center;
+    map.setCenter([lng, lat]);
+  }, [center, mapReady]);
+
+  // Update sources when data changes
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !mapReady) return;
+
+    const setGeoJSON = (id: string, data: GeoJSON.FeatureCollection | GeoJSON.Feature | null) => {
+      if (!map.getSource(id)) return;
+      (map.getSource(id) as maplibregl.GeoJSONSource).setData(data as any);
+    };
+
+    // Blockage
+    if (blockageGeojson) {
+      if (!map.getSource(SOURCE_BLOCKAGE)) {
+        map.addSource(SOURCE_BLOCKAGE, {
+          type: "geojson",
+          data: { type: "Feature", geometry: blockageGeojson as GeoJSON.Geometry, properties: {} } as GeoJSON.Feature,
+        });
+        map.addLayer({
+          id: "blockage-fill",
+          type: "fill",
+          source: SOURCE_BLOCKAGE,
+          paint: { "fill-color": "#f97316", "fill-opacity": 0.35 },
+        });
+        map.addLayer({
+          id: "blockage-line",
+          type: "line",
+          source: SOURCE_BLOCKAGE,
+          paint: { "line-color": "#dc2626", "line-width": 2 },
+        });
+      } else {
+        setGeoJSON(SOURCE_BLOCKAGE, { type: "Feature", geometry: blockageGeojson, properties: {} } as GeoJSON.Feature);
+      }
+    } else {
+      if (map.getLayer("blockage-line")) map.removeLayer("blockage-line");
+      if (map.getLayer("blockage-fill")) map.removeLayer("blockage-fill");
+      if (map.getSource(SOURCE_BLOCKAGE)) map.removeSource(SOURCE_BLOCKAGE);
+    }
+
+    // Route
+    if (!map.getSource(SOURCE_ROUTE)) {
+      map.addSource(SOURCE_ROUTE, { type: "geojson", data: routeGeojson || { type: "FeatureCollection", features: [] } });
+      map.addLayer({
+        id: "route-line",
+        type: "line",
+        source: SOURCE_ROUTE,
+        paint: { "line-color": "#2563eb", "line-width": 4 },
+      });
+    } else {
+      setGeoJSON(SOURCE_ROUTE, routeGeojson);
+    }
+
+    // Detour
+    const detourFc = detour?.path_geojson ?? null;
+    if (!map.getSource(SOURCE_DETOUR)) {
+      map.addSource(SOURCE_DETOUR, { type: "geojson", data: detourFc || { type: "FeatureCollection", features: [] } });
+      map.addLayer({
+        id: "detour-line",
+        type: "line",
+        source: SOURCE_DETOUR,
+        paint: { "line-color": "#16a34a", "line-width": 6 },
+      });
+    } else {
+      setGeoJSON(SOURCE_DETOUR, detourFc);
+    }
+
+    // Stops
+    const stopsFc: GeoJSONFeatureCollection = {
+      type: "FeatureCollection",
+      features: stops.map((s) => ({
+        type: "Feature" as const,
+        geometry: { type: "Point" as const, coordinates: [s.lon, s.lat] },
+        properties: { stop_id: s.stop_id },
+      })),
+    };
+    if (!map.getSource(SOURCE_STOPS)) {
+      map.addSource(SOURCE_STOPS, { type: "geojson", data: stopsFc });
+      map.addLayer({
+        id: "stops-circles",
+        type: "circle",
+        source: SOURCE_STOPS,
+        paint: { "circle-radius": 6, "circle-color": "#1e40af", "circle-stroke-width": 2, "circle-stroke-color": "#fff" },
+      });
+    } else {
+      setGeoJSON(SOURCE_STOPS, stopsFc);
+    }
+
+    // Pin
+    const pinFc: GeoJSONFeatureCollection = pinPosition
+      ? {
+          type: "FeatureCollection",
+          features: [
+            {
+              type: "Feature",
+              geometry: { type: "Point" as const, coordinates: [pinPosition[1], pinPosition[0]] },
+              properties: {},
+            },
+          ],
+        }
+      : { type: "FeatureCollection", features: [] };
+    if (!map.getSource(SOURCE_PIN)) {
+      map.addSource(SOURCE_PIN, { type: "geojson", data: pinFc });
+      map.addLayer({
+        id: "pin-marker",
+        type: "circle",
+        source: SOURCE_PIN,
+        paint: { "circle-radius": 10, "circle-color": "#e11d48", "circle-stroke-width": 2, "circle-stroke-color": "#fff" },
+      });
+    } else {
+      setGeoJSON(SOURCE_PIN, pinFc);
+    }
+  }, [mapReady, blockageGeojson, routeGeojson, detour, stops, pinPosition]);
+
+  const fitBoundsFromGeoJSON = (geojson: GeoJSON.FeatureCollection | null) => {
+    const map = mapRef.current;
+    if (!map || !geojson?.features?.length) return;
+    const bounds = new maplibregl.LngLatBounds();
+    const extend = (coord: number[]) => {
+      if (coord.length >= 2) bounds.extend([coord[0], coord[1]]);
+    };
+    geojson.features.forEach((f) => {
+      const g = f.geometry;
+      if (g.type === "Point") extend(g.coordinates);
+      else if (g.type === "LineString") g.coordinates.forEach(extend);
+      else if (g.type === "Polygon") g.coordinates[0].forEach(extend);
+    });
+    if (bounds.isEmpty()) return;
+    map.fitBounds(bounds, { padding: 50, maxZoom: 16 });
+  };
+
+  useImperativeHandle(
+    ref,
+    () => ({
+      clearBlockage() {
+        drawRef.current?.deleteAll();
+        onBlockageChange(null);
+      },
+      cancelDrawing() {
+        drawRef.current?.changeMode("simple_select");
+      },
+      undoLastPoint() {
+        // MapboxDraw doesn't expose undo easily; no-op or could implement with custom mode
+      },
+      fitToBlockage() {
+        if (!blockageRef.current) return;
+        fitBoundsFromGeoJSON({
+          type: "FeatureCollection",
+          features: [{ type: "Feature", geometry: blockageRef.current, properties: {} }],
+        } as GeoJSON.FeatureCollection);
+      },
+      fitToRoute() {
+        fitBoundsFromGeoJSON(routeRef.current ?? null);
+      },
+      fitToDetour() {
+        const d = detourRef.current;
+        if (d?.path_geojson) fitBoundsFromGeoJSON(d.path_geojson);
+      },
+      flyTo(lat: number, lng: number, zoom = 15) {
+        mapRef.current?.flyTo({ center: [lng, lat], zoom });
+      },
+    }),
+    [onBlockageChange]
+  );
+
+  return <div ref={containerRef} className="maplibre-map-container" />;
+});
+
+export default MapLibreMap;
+```
+
+---
+
+## 3. `frontend/src/App.tsx` (main page)
+
+See the repo file `frontend/src/App.tsx` for the full 479-line component. Summary:
+
+- State: `blockageGeojson`, `areaDate`, `areaStartTime`, `areaEndTime`, `areaRoutes`, `selectedRoute`, `stops`, `routeGeojson`, `detour`, `detourAreaResults`, `pinPosition`, explorer window state, line/address search.
+- Calls MapLibreMap with: `center`, `stops`, `routeGeojson`, `detour`, `blockageGeojson`, `onBlockageChange={setBlockageGeojson}`, `pinPosition`.
+- Rail: Blockage (Clear/Cancel/Undo), Time window, Detour (One route / All, Compute), Map (Fit blockage/route/detour), Explorer toggle.
+- No automatic `fitBounds` on route load; fit only via rail buttons.
+
+---
+
+## 4. `frontend/src/ExplorerWindow.tsx`
+
+See the repo file `frontend/src/ExplorerWindow.tsx` for the full 335-line component. Summary:
+
+- Tabs: Area, Line, Point, Address (Rnd draggable/resizable).
+- Area: “Find lines in polygon”, list of area routes, per-route detour badge, “Use for route-only detour”.
+- Line: search input, table of lines (RTL).
+- Point: lat/lng inputs, Go.
+- Address: search + result list, click to fly to and set pin.
+
+---
+
+## 5. `frontend/src/app.css`
+
+See the repo file `frontend/src/app.css` for the full 514-line stylesheet. Summary:
+
+- Global: Arial, full viewport, `.app` flex.
+- Rail: dark gradient, sections (Blockage, Time window, Detour, Map, Explorer toggle), inputs, buttons, status.
+- Map: `.map-container`, `.maplibre-map-container` (100% size, Arial).
+- Explorer: `.explorer-rnd`, header/tabs, area/line/point/address tabs, badges, lines table (RTL), address list.
+
+---
+
+## Suggested improvements (from your list)
+
+- **One source per thing:** `blockage`, `selected-route`, `detour`, `stops`, `pin` — add once on load, then only `setData(...)`.
+- **Layer order:** route → blockage → detour → stops/pin (and arrows if re-added as symbol layers).
+- **No auto fitBounds** except when user clicks “Fit blockage”, “Fit route”, “Fit detour”.
+- **Symbol layers** for direction arrows instead of custom triangles.
+- **Draw behavior:** blockage as single source of truth; no unexpected map jump on draw complete.
+- **Feature state / IDs** if you need interactivity (e.g. selected route vs others).
+
+The full `App.tsx`, `ExplorerWindow.tsx`, and `app.css` are in the repo at `frontend/src/`; this doc gives the map component and `package.json` in full and pointers to the rest.

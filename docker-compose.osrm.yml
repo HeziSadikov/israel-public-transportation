@@ -1,0 +1,25 @@
+version: "3.8"
+
+services:
+  osrm:
+    image: osrm/osrm-backend:latest
+    container_name: osrm-israel
+    command: >
+      osrm-routed
+      --algorithm mld
+      /data/israel-latest.osrm
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./osm:/data
+    restart: unless-stopped
+
+# Usage:
+# 1) Place israel.osm.pbf into ./osm as ./osm/israel.osm.pbf
+# 2) Preprocess:
+#    docker compose -f docker-compose.osrm.yml run --rm osrm osrm-extract -p /opt/car.lua /data/israel.osm.pbf
+#    docker compose -f docker-compose.osrm.yml run --rm osrm osrm-partition /data/israel.osrm
+#    docker compose -f docker-compose.osrm.yml run --rm osrm osrm-customize /data/israel.osrm
+# 3) Start the routing engine:
+#    docker compose -f docker-compose.osrm.yml up
+
