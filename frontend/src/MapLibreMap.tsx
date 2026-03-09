@@ -120,6 +120,75 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
     mapRef.current = map;
 
     const onLoad = () => {
+      // Persistent sources + layers (created once)
+      const emptyFc: GeoJSONFeatureCollection = { type: "FeatureCollection", features: [] };
+
+      if (!map.getSource(SOURCE_ROUTE)) {
+        map.addSource(SOURCE_ROUTE, { type: "geojson", data: emptyFc });
+        map.addLayer({
+          id: "route-line",
+          type: "line",
+          source: SOURCE_ROUTE,
+          paint: { "line-color": "#2563eb", "line-width": 4 },
+        });
+      }
+
+      if (!map.getSource(SOURCE_BLOCKAGE)) {
+        map.addSource(SOURCE_BLOCKAGE, { type: "geojson", data: emptyFc });
+        map.addLayer({
+          id: "blockage-fill",
+          type: "fill",
+          source: SOURCE_BLOCKAGE,
+          paint: { "fill-color": "#f97316", "fill-opacity": 0.35 },
+        });
+        map.addLayer({
+          id: "blockage-line",
+          type: "line",
+          source: SOURCE_BLOCKAGE,
+          paint: { "line-color": "#dc2626", "line-width": 2 },
+        });
+      }
+
+      if (!map.getSource(SOURCE_DETOUR)) {
+        map.addSource(SOURCE_DETOUR, { type: "geojson", data: emptyFc });
+        map.addLayer({
+          id: "detour-line",
+          type: "line",
+          source: SOURCE_DETOUR,
+          paint: { "line-color": "#16a34a", "line-width": 6 },
+        });
+      }
+
+      if (!map.getSource(SOURCE_STOPS)) {
+        map.addSource(SOURCE_STOPS, { type: "geojson", data: emptyFc });
+        map.addLayer({
+          id: "stops-circles",
+          type: "circle",
+          source: SOURCE_STOPS,
+          paint: {
+            "circle-radius": 6,
+            "circle-color": "#1e40af",
+            "circle-stroke-width": 2,
+            "circle-stroke-color": "#fff",
+          },
+        });
+      }
+
+      if (!map.getSource(SOURCE_PIN)) {
+        map.addSource(SOURCE_PIN, { type: "geojson", data: emptyFc });
+        map.addLayer({
+          id: "pin-marker",
+          type: "circle",
+          source: SOURCE_PIN,
+          paint: {
+            "circle-radius": 10,
+            "circle-color": "#e11d48",
+            "circle-stroke-width": 2,
+            "circle-stroke-color": "#fff",
+          },
+        });
+      }
+
       // Draw control: polygon and rectangle only
       const draw = new MapboxDraw({
         displayControlsDefault: false,
@@ -142,7 +211,6 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
         if (feature?.geometry) {
           const geom = normalizeBlockageGeometry(feature.geometry);
           onBlockageChange(geom);
-          draw.deleteAll();
         }
       });
       map.on("draw.delete", () => onBlockageChange(null));
@@ -158,80 +226,62 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
     };
   }, [onBlockageChange]);
 
-  // Keep map center in sync when prop changes
+  // Keep Draw in sync with React blockage state (React is the source of truth)
   useEffect(() => {
-    const map = mapRef.current;
-    if (!map || !mapReady) return;
-    const [lat, lng] = center;
-    map.setCenter([lng, lat]);
-  }, [center, mapReady]);
-
-  // Update sources when data changes
-  useEffect(() => {
-    const map = mapRef.current;
-    if (!map || !mapReady) return;
-
-    const setGeoJSON = (id: string, data: GeoJSON.FeatureCollection | GeoJSON.Feature | null) => {
-      if (!map.getSource(id)) return;
-      (map.getSource(id) as maplibregl.GeoJSONSource).setData(data as any);
-    };
-
-    // Blockage
+    if (!mapReady) return;
+    const draw = drawRef.current;
+    if (!draw) return;
+    // Suppress API events by default, so this does not loop back into React.
+    draw.deleteAll();
     if (blockageGeojson) {
-      if (!map.getSource(SOURCE_BLOCKAGE)) {
-        map.addSource(SOURCE_BLOCKAGE, {
-          type: "geojson",
-          data: { type: "Feature", geometry: blockageGeojson as GeoJSON.Geometry, properties: {} } as GeoJSON.Feature,
-        });
-        map.addLayer({
-          id: "blockage-fill",
-          type: "fill",
-          source: SOURCE_BLOCKAGE,
-          paint: { "fill-color": "#f97316", "fill-opacity": 0.35 },
-        });
-        map.addLayer({
-          id: "blockage-line",
-          type: "line",
-          source: SOURCE_BLOCKAGE,
-          paint: { "line-color": "#dc2626", "line-width": 2 },
-        });
-      } else {
-        setGeoJSON(SOURCE_BLOCKAGE, { type: "Feature", geometry: blockageGeojson, properties: {} } as GeoJSON.Feature);
-      }
-    } else {
-      if (map.getLayer("blockage-line")) map.removeLayer("blockage-line");
-      if (map.getLayer("blockage-fill")) map.removeLayer("blockage-fill");
-      if (map.getSource(SOURCE_BLOCKAGE)) map.removeSource(SOURCE_BLOCKAGE);
+      draw.add({
+        type: "Feature",
+        geometry: blockageGeojson as GeoJSON.Geometry,
+        properties: {},
+      } as GeoJSON.Feature);
     }
+  }, [mapReady, blockageGeojson]);
 
-    // Route
-    if (!map.getSource(SOURCE_ROUTE)) {
-      map.addSource(SOURCE_ROUTE, { type: "geojson", data: routeGeojson || { type: "FeatureCollection", features: [] } });
-      map.addLayer({
-        id: "route-line",
-        type: "line",
-        source: SOURCE_ROUTE,
-        paint: { "line-color": "#2563eb", "line-width": 4 },
-      });
+  // Blockage source data
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !mapReady) return;
+    const source = map.getSource(SOURCE_BLOCKAGE) as maplibregl.GeoJSONSource | undefined;
+    if (!source) return;
+    if (blockageGeojson) {
+      source.setData({ type: "Feature", geometry: blockageGeojson, properties: {} } as GeoJSON.Feature);
     } else {
-      setGeoJSON(SOURCE_ROUTE, routeGeojson);
+      source.setData({ type: "FeatureCollection", features: [] });
     }
+  }, [mapReady, blockageGeojson]);
 
-    // Detour
+  // Route source data
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !mapReady) return;
+    const source = map.getSource(SOURCE_ROUTE) as maplibregl.GeoJSONSource | undefined;
+    if (!source) return;
+    const data = routeGeojson || ({ type: "FeatureCollection", features: [] } as GeoJSON.FeatureCollection);
+    source.setData(data as any);
+  }, [mapReady, routeGeojson]);
+
+  // Detour source data
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !mapReady) return;
+    const source = map.getSource(SOURCE_DETOUR) as maplibregl.GeoJSONSource | undefined;
+    if (!source) return;
     const detourFc = detour?.path_geojson ?? null;
-    if (!map.getSource(SOURCE_DETOUR)) {
-      map.addSource(SOURCE_DETOUR, { type: "geojson", data: detourFc || { type: "FeatureCollection", features: [] } });
-      map.addLayer({
-        id: "detour-line",
-        type: "line",
-        source: SOURCE_DETOUR,
-        paint: { "line-color": "#16a34a", "line-width": 6 },
-      });
-    } else {
-      setGeoJSON(SOURCE_DETOUR, detourFc);
-    }
+    const data = detourFc || ({ type: "FeatureCollection", features: [] } as GeoJSON.FeatureCollection);
+    source.setData(data as any);
+  }, [mapReady, detour]);
 
-    // Stops
+  // Stops source data
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !mapReady) return;
+    const source = map.getSource(SOURCE_STOPS) as maplibregl.GeoJSONSource | undefined;
+    if (!source) return;
     const stopsFc: GeoJSONFeatureCollection = {
       type: "FeatureCollection",
       features: stops.map((s) => ({
@@ -240,19 +290,15 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
         properties: { stop_id: s.stop_id },
       })),
     };
-    if (!map.getSource(SOURCE_STOPS)) {
-      map.addSource(SOURCE_STOPS, { type: "geojson", data: stopsFc });
-      map.addLayer({
-        id: "stops-circles",
-        type: "circle",
-        source: SOURCE_STOPS,
-        paint: { "circle-radius": 6, "circle-color": "#1e40af", "circle-stroke-width": 2, "circle-stroke-color": "#fff" },
-      });
-    } else {
-      setGeoJSON(SOURCE_STOPS, stopsFc);
-    }
+    source.setData(stopsFc as any);
+  }, [mapReady, stops]);
 
-    // Pin
+  // Pin source data
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !mapReady) return;
+    const source = map.getSource(SOURCE_PIN) as maplibregl.GeoJSONSource | undefined;
+    if (!source) return;
     const pinFc: GeoJSONFeatureCollection = pinPosition
       ? {
           type: "FeatureCollection",
@@ -265,18 +311,8 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
           ],
         }
       : { type: "FeatureCollection", features: [] };
-    if (!map.getSource(SOURCE_PIN)) {
-      map.addSource(SOURCE_PIN, { type: "geojson", data: pinFc });
-      map.addLayer({
-        id: "pin-marker",
-        type: "circle",
-        source: SOURCE_PIN,
-        paint: { "circle-radius": 10, "circle-color": "#e11d48", "circle-stroke-width": 2, "circle-stroke-color": "#fff" },
-      });
-    } else {
-      setGeoJSON(SOURCE_PIN, pinFc);
-    }
-  }, [mapReady, blockageGeojson, routeGeojson, detour, stops, pinPosition]);
+    source.setData(pinFc as any);
+  }, [mapReady, pinPosition]);
 
   const fitBoundsFromGeoJSON = (geojson: GeoJSON.FeatureCollection | null) => {
     const map = mapRef.current;
