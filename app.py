@@ -13,6 +13,7 @@ from backend.gtfs_updater import update_feed, get_feed_status
 from backend.pattern_builder import PatternBuilder, RoutePattern
 from backend.graph_builder import (
     GraphBuilder,
+    build_graph_for_pattern_from_postgis,
     pattern_stop_node_id,
     parse_pattern_stop_node_id,
 )
@@ -58,6 +59,7 @@ from backend.sqlite_db import (
     get_trip_time_bounds_from_db,
 )
 from backend.area_search import find_routes_in_polygon
+from backend import db_access as db_access_module
 from backend.stop_services import get_stops_in_bounds, get_routes_serving_stop
 from backend.service_calendar import ServiceCalendar
 
@@ -232,6 +234,36 @@ def _graph_cache_key(
     )
 
 
+def _graph_cache_keys_for_lookup(
+    route_id: str,
+    direction_id: str | None,
+    date_str: str,
+) -> list[str]:
+    """Return candidate cache keys to try (PostGIS first, then feed version if loaded)."""
+    keys = []
+    try:
+        feed_id = db_access_module.get_active_feed_id()
+        keys.append(
+            _graph_cache_key(f"postgis-{feed_id}", route_id, direction_id, date_str, False)
+        )
+        keys.append(
+            _graph_cache_key(f"postgis-{feed_id}", route_id, direction_id, date_str, True)
+        )
+    except (RuntimeError, Exception):
+        pass
+    try:
+        feed = load_active_feed()
+        keys.append(
+            _graph_cache_key(feed.version_id, route_id, direction_id, date_str, False)
+        )
+        keys.append(
+            _graph_cache_key(feed.version_id, route_id, direction_id, date_str, True)
+        )
+    except Exception:
+        pass
+    return keys
+
+
 def _graph_cache_file_path(cache_key: str, feed_version: str):
     """
     Map an in-memory graph cache key to a safe on-disk file path.
@@ -245,8 +277,75 @@ def _graph_cache_file_path(cache_key: str, feed_version: str):
 
 @app.post("/graph/build", response_model=GraphBuildResponse)
 def graph_build(req: GraphBuildRequest):
-    feed = load_active_feed()
     date_str = req.date or datetime.utcnow().strftime("%Y%m%d")
+
+    # Prefer PostGIS when an active feed is available and we have a pattern for this route.
+    try:
+        feed_id = db_access_module.get_active_feed_id()
+        dir_param = str(req.direction_id) if req.direction_id is not None else None
+        meta = db_access_module.get_pattern_for_route(
+            req.route_id, dir_param, date_str
+        )
+        if meta is not None:
+            feed_version = f"postgis-{feed_id}"
+            key = _graph_cache_key(
+                feed_version=feed_version,
+                route_id=req.route_id,
+                direction_id=req.direction_id,
+                date=date_str,
+                pretty_osm=req.pretty_osm,
+            )
+            cached = GRAPH_CACHE.get(key)
+            if cached is not None:
+                pat = cached["pattern"]
+                return GraphBuildResponse(
+                    pattern_id=pat.pattern_id,
+                    stop_count=len(pat.stop_ids),
+                    edge_count=len(cached["edge_geometries"]),
+                    used_shape=cached["used_shape"],
+                    used_osm_snapping=cached.get("used_osm_snapping", False),
+                    example_stop_ids=pat.stop_ids[:5],
+                    feed_version=feed_version,
+                )
+            build_result = build_graph_for_pattern_from_postgis(meta, date_str)
+            edge_geoms = build_result.edge_geometries
+            used_osm = False
+            snapped_pattern_geom = None
+            if req.pretty_osm:
+                try:
+                    osm_res = map_match_pattern(
+                        pattern_geom=_merge_edge_geometries(edge_geoms),
+                        edge_geometries=edge_geoms,
+                    )
+                    used_osm = osm_res.used_osm
+                    snapped_pattern_geom = osm_res.snapped_pattern_geom
+                    edge_geoms = osm_res.snapped_edges
+                except Exception:
+                    pass
+            cache_entry = {
+                "graph": build_result.graph,
+                "edge_geometries": edge_geoms,
+                "pattern": build_result.pattern,
+                "used_shape": build_result.used_shape,
+                "used_osm_snapping": used_osm,
+                "snapped_pattern_geom": snapped_pattern_geom,
+                "date": date_str,
+            }
+            GRAPH_CACHE[key] = cache_entry
+            pat = build_result.pattern
+            return GraphBuildResponse(
+                pattern_id=pat.pattern_id,
+                stop_count=len(pat.stop_ids),
+                edge_count=len(edge_geoms),
+                used_shape=build_result.used_shape,
+                used_osm_snapping=used_osm,
+                example_stop_ids=pat.stop_ids[:5],
+                feed_version=feed_version,
+            )
+    except (RuntimeError, Exception):
+        pass
+
+    feed = load_active_feed()
     feed_version = feed.version_id
     key = _graph_cache_key(
         feed_version=feed_version,
@@ -371,7 +470,8 @@ def graph_build(req: GraphBuildRequest):
         from shapely.geometry import LineString
 
         g = nx.DiGraph()
-        # Add nodes with coordinates.
+        # Add nodes with coordinates and pattern frequency so A* can slightly
+        # prefer more frequent lines when multiple detours have similar time.
         for s in stops_meta:
             sid = s["stop_id"]
             g.add_node(
@@ -380,6 +480,7 @@ def graph_build(req: GraphBuildRequest):
                 stop_name=s.get("name"),
                 lat=float(s["lat"]),
                 lon=float(s["lon"]),
+                frequency=frequency,
             )
 
         # Map stop indices to ids.
@@ -584,8 +685,12 @@ def graph_stops(
       1. If a matching pattern is present in GRAPH_CACHE (from /graph/build),
          use that (avoids date mismatches and extra GTFS scans).
       2. Otherwise, fall back to rebuilding patterns for the given date.
+    Stops are resolved from feed when available, else from PostGIS via db_access.
     """
-    feed = load_active_feed()
+    try:
+        feed = load_active_feed()
+    except Exception:
+        feed = None
 
     # 1) Try to reuse an existing cached graph pattern first.
     cached_pattern: RoutePattern | None = None
@@ -596,7 +701,6 @@ def graph_stops(
                 cached_pattern = pat
                 break
     else:
-        # If no pattern_id was given, try to find any cached pattern for this route.
         for entry in GRAPH_CACHE.values():
             pat: RoutePattern = entry.get("pattern")
             if pat and pat.route_id == route_id:
@@ -606,7 +710,11 @@ def graph_stops(
     if cached_pattern is not None:
         chosen = cached_pattern
     else:
-        # 2) Fallback: rebuild patterns for the given date.
+        if feed is None:
+            raise HTTPException(
+                status_code=503,
+                detail="No cached pattern and GTFS feed not loaded; call /graph/build first or load feed.",
+            )
         date_str = date or datetime.utcnow().strftime("%Y%m%d")
         patterns_builder = PatternBuilder(feed)
         patterns = patterns_builder.build_patterns_for_route(
@@ -624,21 +732,40 @@ def graph_stops(
             chosen = patterns_builder.pick_most_frequent_pattern(patterns)
             assert chosen is not None
 
-    stops_by_id = {s["stop_id"]: s for s in feed.stops}
     res_stops: list[GraphStopsResponseStop] = []
-    for idx, sid in enumerate(chosen.stop_ids):
-        st = stops_by_id.get(sid)
-        if not st:
-            continue
-        res_stops.append(
-            GraphStopsResponseStop(
-                stop_id=sid,
-                name=st.get("stop_name"),
-                lat=float(st["stop_lat"]),
-                lon=float(st["stop_lon"]),
-                sequence=idx,
+    if feed is not None:
+        stops_by_id = {s["stop_id"]: s for s in feed.stops}
+        for idx, sid in enumerate(chosen.stop_ids):
+            st = stops_by_id.get(sid)
+            if not st:
+                continue
+            res_stops.append(
+                GraphStopsResponseStop(
+                    stop_id=sid,
+                    name=st.get("stop_name"),
+                    lat=float(st["stop_lat"]),
+                    lon=float(st["stop_lon"]),
+                    sequence=idx,
+                )
             )
-        )
+    else:
+        try:
+            stops_meta = db_access_module.get_pattern_stops(chosen.pattern_id)
+            for idx, s in enumerate(stops_meta):
+                res_stops.append(
+                    GraphStopsResponseStop(
+                        stop_id=s.stop_id,
+                        name=s.name,
+                        lat=s.lat,
+                        lon=s.lon,
+                        sequence=idx,
+                    )
+                )
+        except (RuntimeError, Exception):
+            raise HTTPException(
+                status_code=503,
+                detail="Could not load stop details from PostGIS.",
+            )
 
     return GraphStopsResponse(pattern_id=chosen.pattern_id, stops=res_stops)
 
@@ -646,27 +773,30 @@ def graph_stops(
 @app.post("/detour", response_model=DetourResponse)
 def detour(req: DetourRequest):
     blockage_geojson = _ensure_geometry(req.blockage_geojson)
-    feed = load_active_feed()
     date_str = req.date or datetime.utcnow().strftime("%Y%m%d")
 
-    # Graph must have been built earlier with /graph/build
-    # We try both pretty_osm true/false keys in case of mismatch.
-    for pretty in (True, False):
-        key = _graph_cache_key(
-            feed_version=feed.version_id,
-            route_id=req.route_id,
-            direction_id=req.direction_id,
-            date=date_str,
-            pretty_osm=pretty,
-        )
+    # Graph must have been built earlier with /graph/build.
+    # Try both PostGIS and feed-based cache keys.
+    candidate_keys = _graph_cache_keys_for_lookup(
+        req.route_id, req.direction_id, date_str
+    )
+    cache = None
+    cache_key_used = None
+    for key in candidate_keys:
         if key in GRAPH_CACHE:
             cache = GRAPH_CACHE[key]
+            cache_key_used = key
             break
-    else:
+    if cache is None:
         raise HTTPException(
             status_code=400,
             detail="Graph not built yet; call /graph/build first.",
         )
+    feed_version = cache_key_used.split("|")[0] if cache_key_used else ""
+    try:
+        feed = load_active_feed()
+    except Exception:
+        feed = None
 
     graph = cache["graph"]
     edge_geometries = cache["edge_geometries"]
@@ -902,7 +1032,7 @@ def detour(req: DetourRequest):
         detour_extra_distance_m=detour_extra_distance_m,
         used_shape=used_shape,
         used_osm_snapping=used_osm_snapping,
-        feed_version=feed.version_id,
+        feed_version=feed_version,
     )
 
 
@@ -917,17 +1047,20 @@ def graph_geojson(
     """
     Optional endpoint returning full route pattern polyline and stops for display.
     """
-    feed = load_active_feed()
     date_str = date or datetime.utcnow().strftime("%Y%m%d")
-
-    key = _graph_cache_key(
-        feed_version=feed.version_id,
-        route_id=route_id,
-        direction_id=direction_id,
-        date=date_str,
-        pretty_osm=pretty_osm,
-    )
-    cache = GRAPH_CACHE.get(key)
+    candidate_keys = _graph_cache_keys_for_lookup(route_id, direction_id, date_str)
+    want_osm = "osm" if pretty_osm else "gtfs"
+    cache = None
+    fallback_cache = None
+    for key in candidate_keys:
+        if key in GRAPH_CACHE:
+            if want_osm in key:
+                cache = GRAPH_CACHE[key]
+                break
+            if fallback_cache is None:
+                fallback_cache = GRAPH_CACHE[key]
+    if cache is None:
+        cache = fallback_cache
     if not cache:
         raise HTTPException(
             status_code=400,
@@ -939,21 +1072,48 @@ def graph_geojson(
     pattern = cache["pattern"]
     edge_geometries = cache["edge_geometries"]
     snapped_pattern_geom = cache.get("snapped_pattern_geom")
+    graph = cache.get("graph")
 
-    stops_by_id = {s["stop_id"]: s for s in feed.stops}
+    # Build stop features from graph nodes (works for both PostGIS and feed-backed cache).
     stop_features = []
-    for sid in pattern.stop_ids:
-        st = stops_by_id.get(sid)
-        if not st:
-            continue
-        pt = Point(float(st["stop_lon"]), float(st["stop_lat"]))
-        stop_features.append(
-            {
-                "type": "Feature",
-                "geometry": mapping(pt),
-                "properties": {"stop_id": sid, "name": st.get("stop_name")},
-            }
-        )
+    if graph is not None:
+        for sid in pattern.stop_ids:
+            node = next(
+                (n for n, d in graph.nodes(data=True) if d.get("stop_id") == sid),
+                None,
+            )
+            if node is None:
+                continue
+            d = graph.nodes[node]
+            lat, lon = d.get("lat"), d.get("lon")
+            if lat is None or lon is None:
+                continue
+            pt = Point(float(lon), float(lat))
+            stop_features.append(
+                {
+                    "type": "Feature",
+                    "geometry": mapping(pt),
+                    "properties": {"stop_id": sid, "name": d.get("stop_name")},
+                }
+            )
+    else:
+        try:
+            feed = load_active_feed()
+            stops_by_id = {s["stop_id"]: s for s in feed.stops}
+            for sid in pattern.stop_ids:
+                st = stops_by_id.get(sid)
+                if not st:
+                    continue
+                pt = Point(float(st["stop_lon"]), float(st["stop_lat"]))
+                stop_features.append(
+                    {
+                        "type": "Feature",
+                        "geometry": mapping(pt),
+                        "properties": {"stop_id": sid, "name": st.get("stop_name")},
+                    }
+                )
+        except Exception:
+            pass
 
     edge_features = []
     for (u, v), eg in edge_geometries.items():

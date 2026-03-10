@@ -31,6 +31,9 @@ OSM_ENGINE_URL = os.getenv("OSM_ENGINE_URL", "http://localhost:5000")
 # Example: http://localhost:8002 (Valhalla default port)
 VALHALLA_URL = os.getenv("VALHALLA_URL", "")
 
+# PostgreSQL/PostGIS: backend/db_access.py reads DATABASE_URL for area search, graph build, detours.
+# Example: postgresql://user:pass@localhost:5432/israel_gtfs
+
 # In-memory caches (simple process-level caching)
 GRAPH_CACHE: dict = {}
 GTFS_CACHE: dict = {}

@@ -1,0 +1,36 @@
+# Postgres/PostGIS for Israel GTFS Detour Router (primary data layer).
+# Optional: run the API with DATABASE_URL pointing at this service.
+version: "3.8"
+
+services:
+  postgis:
+    image: postgis/postgis:16-3.4
+    container_name: israel-gtfs-postgis
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-pass}
+      POSTGRES_DB: ${POSTGRES_DB:-israel_gtfs}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgis_data:/var/lib/postgresql/data
+      - ./backend:/backend:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-user} -d ${POSTGRES_DB:-israel_gtfs}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgis_data:
+
+# Usage:
+# 1) Start: docker compose up -d
+# 2) Create schema (run once; requires superuser for CREATE EXTENSION postgis):
+#    docker compose exec postgis psql -U postgres -d israel_gtfs -f /backend/db_postgis_schema.sql
+#    Then grant your app user access to tables if you use a non-superuser.
+# 3) Ingest GTFS:
+#    set DATABASE_URL=postgresql://user:pass@localhost:5432/israel_gtfs  (PowerShell: $env:DATABASE_URL="...")
+#    python -m backend.scripts.ingest_gtfs_postgis --gtfs-zip ./israel-public-transportation.zip --database-url postgresql://user:pass@localhost:5432/israel_gtfs
+#    python -m backend.scripts.build_patterns_postgis --date 20260308 --database-url postgresql://user:pass@localhost:5432/israel_gtfs
+# 4) Run backend with: set DATABASE_URL=postgresql://user:pass@localhost:5432/israel_gtfs && uvicorn app:app --reload --port 8000

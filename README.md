@@ -81,6 +81,49 @@ The FastAPI app exposes:
 7. `POST /detour`
 8. `GET /graph/geojson` (optional helper for full pattern display)
 
+### 4. PostgreSQL/PostGIS (recommended backend)
+
+The app can use **PostgreSQL with PostGIS** as the primary data layer for area search, graph building, and detours. When `DATABASE_URL` is set and an active feed exists in PostGIS, `/area/routes`, `/graph/build`, and detour logic use it; otherwise the legacy SQLite/in-memory path is used.
+
+**Configuration**
+
+- Set `DATABASE_URL` to your Postgres connection string, e.g.  
+  `postgresql://user:pass@localhost:5432/israel_gtfs`  
+  (PowerShell: `$env:DATABASE_URL="postgresql://user:pass@localhost:5432/israel_gtfs"`)
+
+**Docker (Postgres + PostGIS)**
+
+```bash
+docker compose up -d
+```
+
+Then create the schema (once, as superuser for `CREATE EXTENSION postgis`):
+
+```bash
+docker compose exec postgis psql -U postgres -d israel_gtfs -f /backend/db_postgis_schema.sql
+```
+
+**Ingest and patterns**
+
+From the project root, with `DATABASE_URL` set (or pass `--database-url`):
+
+```bash
+# Ingest GTFS zip into PostGIS
+python -m backend.scripts.ingest_gtfs_postgis --gtfs-zip ./israel-public-transportation.zip --database-url "postgresql://user:pass@localhost:5432/israel_gtfs"
+
+# Precompute route patterns for a service date (YYYYMMDD)
+python -m backend.scripts.build_patterns_postgis --date 20260308 --database-url "postgresql://user:pass@localhost:5432/israel_gtfs"
+```
+
+After ingest, the new feed is marked active. Run the backend with `DATABASE_URL` set; `/graph/build` and area/detour endpoints will use PostGIS.
+
+**Manage / CI**
+
+- Schema: `backend/db_postgis_schema.sql`
+- Ingest: `backend/scripts/ingest_gtfs_postgis.py`
+- Patterns: `backend/scripts/build_patterns_postgis.py`
+- Data access: `backend/db_access.py` (used by area search, graph builder, detour graph)
+
 ### GTFS update behavior
 
 - Remote base: `https://gtfs.mot.gov.il/gtfsfiles/` (configurable via `GTFS_REMOTE_BASE`).

@@ -28,12 +28,37 @@ def astar_route(
         # Never route through a blocked edge: treat as impassable.
         if (u, v) in blocked_edges:
             return float("inf")
-        # Edge weight is travel time in seconds, with a small per-edge penalty
-        # to slightly discourage very stop-dense detours while keeping time
-        # as the dominant factor.
-        base = float(attrs.get("weight", 1.0))
-        # 10 seconds soft penalty per edge as a proxy for dwell/boarding/etc.
-        return base + 10.0
+
+        # Base edge weight: scheduled travel time in seconds (fallback to generic weight).
+        base = float(attrs.get("travel_time_s", attrs.get("weight", 1.0)))
+
+        # Soft per-edge penalty as a proxy for dwell/boarding/etc.
+        per_edge_penalty = 10.0
+
+        # Additional penalty for transfer edges so we strongly prefer staying
+        # on the same vehicle when possible.
+        transfer_penalty = 0.0
+        if attrs.get("is_transfer"):
+            transfer_penalty = 240.0  # ~4 minutes equivalent
+
+        # Frequency-based bias: prefer more frequent patterns when the graph
+        # carries per-node frequency metadata (trips per day). This is a
+        # modest discount that never dominates absolute time.
+        freq_factor = 1.0
+        try:
+            f1 = float(graph.nodes[u].get("frequency") or 0.0)
+            f2 = float(graph.nodes[v].get("frequency") or 0.0)
+            freq = max(f1, f2)
+            if freq > 0:
+                import math
+
+                # Clamp very high frequencies and apply a gentle discount.
+                freq = min(freq, 60.0)
+                freq_factor = 1.0 / (1.0 + 0.01 * freq)
+        except Exception:
+            freq_factor = 1.0
+
+        return (base + per_edge_penalty + transfer_penalty) * freq_factor
 
     def heuristic(n1: str, n2: str) -> float:
         # Use straight-line distance divided by an upper-bound speed

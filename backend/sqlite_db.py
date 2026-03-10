@@ -1,3 +1,11 @@
+"""
+Legacy SQLite persistence for GTFS and graph cache.
+
+PREFERRED: Use PostgreSQL/PostGIS (see backend/db_access.py and backend/db_postgis_schema.sql).
+This module is kept for backward compatibility when DATABASE_URL is not set or
+when precomputed graphs were stored in SQLite. Route graph cache (route_graphs_v2, etc.)
+is still written here by precompute scripts; /graph/build prefers PostGIS when available.
+"""
 from __future__ import annotations
 
 import sqlite3

@@ -10,12 +10,14 @@ from .gtfs_loader import GTFSFeed
 from .pattern_builder import PatternBuilder, RoutePattern
 from .graph_builder import (
     GraphBuilder,
+    build_graph_for_pattern_from_postgis,
     EdgeGeometry,
     haversine_meters,
     angle_difference_deg,
 )
 from .service_calendar import ServiceCalendar
 from .area_search import find_routes_in_polygon
+from . import db_access
 
 # Allow transfers between pattern-stop nodes whose outgoing headings are within this many degrees.
 TRANSFER_HEADING_TOLERANCE_DEG = 90.0
@@ -144,7 +146,7 @@ def _add_transfer_edges(
 
 
 def build_detour_graph(
-    feed: GTFSFeed,
+    feed: Optional[GTFSFeed],
     date_ymd: str,
     blockage_geojson: Dict,
     primary_route_id: str,
@@ -162,10 +164,8 @@ def build_detour_graph(
     - Blocking still uses the raw blockage geometry (caller uses blockage_geojson for
       compute_blocked_edges). Here we only use the buffer to select which routes go in the graph.
     - Nodes are pattern-stops; ride edges same-pattern only; transfers heading-compatible.
+    - Prefers PostGIS data layer when an active feed is available; otherwise uses GTFSFeed + SQLite.
     """
-    patterns_builder = PatternBuilder(feed)
-    graph_builder = GraphBuilder(feed)
-
     # Two geometries: raw blockage for blocking; buffered AOI for candidate route selection.
     blockage_geom = shape(blockage_geojson)
     try:
@@ -190,22 +190,61 @@ def build_detour_graph(
     edge_geoms: Dict[Tuple[str, str], EdgeGeometry] = {}
     primary_pattern_id: Optional[str] = None
 
-    primary_pattern = _build_route_pattern(
-        patterns_builder, primary_route_id, primary_direction_id, date_ymd
-    )
-    if primary_pattern is not None:
-        primary_pattern_id = primary_pattern.pattern_id
-        res = graph_builder.build_graph_for_pattern(primary_pattern)
+    # Prefer PostGIS when an active feed exists and we can get patterns from it.
+    # When feed is None (e.g. PostGIS-only env), we must use PostGIS.
+    use_postgis = False
+    primary_meta = None
+    try:
+        db_access.get_active_feed_id()
+        dir_param = str(primary_direction_id) if primary_direction_id is not None else None
+        primary_meta = db_access.get_pattern_for_route(
+            primary_route_id, dir_param, date_ymd
+        )
+        use_postgis = primary_meta is not None
+    except (RuntimeError, Exception):
+        pass
+    if feed is None and primary_meta is not None:
+        use_postgis = True
+
+    if use_postgis and primary_meta is not None:
+        primary_pattern_id = primary_meta.pattern_id
+        res = build_graph_for_pattern_from_postgis(primary_meta, date_ymd)
         _merge_graphs(g, edge_geoms, res.graph, res.edge_geometries)
 
-    for rid in route_ids:
-        if rid == primary_route_id:
-            continue
-        pat = _build_route_pattern(patterns_builder, rid, None, date_ymd)
-        if pat is None:
-            continue
-        res = graph_builder.build_graph_for_pattern(pat)
-        _merge_graphs(g, edge_geoms, res.graph, res.edge_geometries)
+        for rid in route_ids:
+            if rid == primary_route_id:
+                continue
+            meta = db_access.get_pattern_for_route(rid, None, date_ymd)
+            if meta is None:
+                continue
+            res = build_graph_for_pattern_from_postgis(meta, date_ymd)
+            _merge_graphs(g, edge_geoms, res.graph, res.edge_geometries)
+    else:
+        if feed is None:
+            return DetourGraph(
+                graph=g,
+                edge_geometries=edge_geoms,
+                primary_pattern_id=None,
+            )
+        patterns_builder = PatternBuilder(feed)
+        graph_builder = GraphBuilder(feed)
+
+        primary_pattern = _build_route_pattern(
+            patterns_builder, primary_route_id, primary_direction_id, date_ymd
+        )
+        if primary_pattern is not None:
+            primary_pattern_id = primary_pattern.pattern_id
+            res = graph_builder.build_graph_for_pattern(primary_pattern)
+            _merge_graphs(g, edge_geoms, res.graph, res.edge_geometries)
+
+        for rid in route_ids:
+            if rid == primary_route_id:
+                continue
+            pat = _build_route_pattern(patterns_builder, rid, None, date_ymd)
+            if pat is None:
+                continue
+            res = graph_builder.build_graph_for_pattern(pat)
+            _merge_graphs(g, edge_geoms, res.graph, res.edge_geometries)
 
     _add_transfer_edges(
         g,

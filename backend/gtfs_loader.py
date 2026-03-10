@@ -1,3 +1,12 @@
+"""
+Legacy GTFS loader: reads from SQLite (gtfs.db) populated by scripts/import_gtfs_to_sqlite.
+
+PREFERRED: Use PostgreSQL/PostGIS as the primary backend. Ingest data with
+  python -m backend.scripts.ingest_gtfs_postgis --gtfs-zip <path> --database-url <url>
+  python -m backend.scripts.build_patterns_postgis --date YYYYMMDD
+Then set DATABASE_URL; /area/routes, /graph/build, and detour logic will use db_access.
+This module remains for fallback when PostGIS is not configured or for feed/update.
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass
