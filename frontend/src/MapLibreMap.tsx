@@ -14,6 +14,7 @@ type GeoJSONGeometry =
 type GeoJSONFeature = { type: "Feature"; geometry: GeoJSONGeometry; properties?: Record<string, unknown> };
 type GeoJSONFeatureCollection = { type: "FeatureCollection"; features: GeoJSONFeature[] };
 
+// OSM raster basemap (standard tiles).
 const OSM_STYLE: maplibregl.StyleSpecification = {
   version: 8,
   sources: {
@@ -22,6 +23,7 @@ const OSM_STYLE: maplibregl.StyleSpecification = {
       tiles: ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"],
       tileSize: 256,
       attribution: "© OpenStreetMap",
+      maxzoom: 19,
     },
   },
   layers: [{ id: "osm", type: "raster", source: "osm" }],
@@ -114,9 +116,16 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
       container: containerRef.current,
       style: OSM_STYLE,
       center: [lng, lat],
-      zoom: 8,
+      zoom: 9,
+      minZoom: 5,
+      maxZoom: 19,
+      dragRotate: false,
+      pitchWithRotate: false,
     });
-    map.addControl(new maplibregl.NavigationControl(), "top-right");
+    // Make mouse-wheel zoom a bit faster/more responsive.
+    map.scrollZoom.setWheelZoomRate(1 / 180);
+    map.scrollZoom.setZoomRate(1.0);
+    map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "top-right");
     mapRef.current = map;
 
     const onLoad = () => {
