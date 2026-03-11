@@ -31,14 +31,18 @@ def _connect(database_url: Optional[str]):
 
 
 def _upsert_patterns_for_feed(cur, feed_id: int, yyyymmdd: str) -> None:
+  print(f"[patterns] Loading active GTFS feed from SQLite for date {yyyymmdd} ...", flush=True)
   feed = load_active_feed()
   patterns_builder = PatternBuilder(feed)
 
   # Clear existing patterns for this feed so we can rebuild deterministically.
+  print(f"[patterns] Clearing existing patterns for feed_id={feed_id} ...", flush=True)
   cur.execute("DELETE FROM pattern_stops WHERE feed_id = %s", (feed_id,))
   cur.execute("DELETE FROM patterns WHERE feed_id = %s", (feed_id,))
 
   routes = feed.routes
+  print(f"[patterns] Building patterns for {len(routes)} routes ...", flush=True)
+  processed_routes = 0
   for r in routes:
     route_id = r.get("route_id")
     if not route_id:
@@ -65,6 +69,9 @@ def _upsert_patterns_for_feed(cur, feed_id: int, yyyymmdd: str) -> None:
       )
       for pid, pat in pats.items():
         _insert_pattern(cur, feed_id, pat)
+    processed_routes += 1
+    if processed_routes % 50 == 0:
+      print(f"[patterns] Processed {processed_routes}/{len(routes)} routes ...", flush=True)
 
 
 def _insert_pattern(cur, feed_id: int, pat: RoutePattern) -> None:
@@ -124,13 +131,15 @@ def build_patterns(database_url: Optional[str], date_ymd: str) -> None:
   conn = _connect(database_url)
   conn.autocommit = False
   try:
+    print(f"[patterns] Starting pattern build for date {date_ymd} using {database_url or 'DEFAULT_DB_URL'}", flush=True)
     with conn:
       with conn.cursor() as cur:
         # Use db_access logic to resolve active feed_id inside Postgres.
         feed_id = get_active_feed_id(conn)
+        print(f"[patterns] Active PostGIS feed_id={feed_id}", flush=True)
         _upsert_patterns_for_feed(cur, feed_id, date_ymd)
     conn.commit()
-    print("Patterns and pattern_stops populated successfully.")
+    print("[patterns] Patterns and pattern_stops populated successfully.", flush=True)
   finally:
     conn.close()
 
