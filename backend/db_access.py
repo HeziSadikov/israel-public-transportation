@@ -38,7 +38,11 @@ def get_active_feed_id(conn=None) -> int:
             row = cur.fetchone()
             if not row:
                 raise RuntimeError("No active feed in feed_versions")
-            return int(row["id"])
+            # Support both DictCursor (row["id"]) and regular cursor (row[0]).
+            try:
+                return int(row["id"])  # type: ignore[index]
+            except Exception:
+                return int(row[0])
     finally:
         if close:
             conn.close()

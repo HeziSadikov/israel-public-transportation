@@ -71,11 +71,14 @@ def ingest_gtfs(gtfs_zip: Path, database_url: str, source_url: str | None = None
     conn.autocommit = False
     try:
         with conn, conn.cursor() as cur:
+            print(f"[ingest] Starting ingest for {gtfs_zip} into {database_url}")
             checksum = None  # could compute SHA256 of zip if desired
             feed_id = _create_feed_version(cur, source_url or str(gtfs_zip), checksum)
+            print(f"[ingest] Created feed_versions row feed_id={feed_id}")
 
             with zipfile.ZipFile(gtfs_zip, "r") as zf:
                 # agencies.txt
+                print("[ingest] Loading agencies.txt ...", flush=True)
                 agencies_rows = []
                 for row in _read_csv_from_zip(zf, "agency.txt"):
                     agencies_rows.append(
@@ -105,6 +108,7 @@ def ingest_gtfs(gtfs_zip: Path, database_url: str, source_url: str | None = None
                 )
 
                 # routes.txt
+                print("[ingest] Loading routes.txt ...", flush=True)
                 routes_rows = []
                 for row in _read_csv_from_zip(zf, "routes.txt"):
                     routes_rows.append(
@@ -136,6 +140,7 @@ def ingest_gtfs(gtfs_zip: Path, database_url: str, source_url: str | None = None
                 )
 
                 # stops.txt
+                print("[ingest] Loading stops.txt ...", flush=True)
                 stops_rows = []
                 for row in _read_csv_from_zip(zf, "stops.txt"):
                     lat = row.get("stop_lat")
@@ -145,7 +150,8 @@ def ingest_gtfs(gtfs_zip: Path, database_url: str, source_url: str | None = None
                         lon_f = float(lon) if lon is not None else None
                     except ValueError:
                         lat_f, lon_f = None, None
-                    geom_expr = f"ST_SetSRID(ST_MakePoint({lon_f}, {lat_f}), 4326)" if lat_f is not None and lon_f is not None else None
+                    # Store WKT and let PostGIS build the geography.
+                    wkt = f"POINT({lon_f} {lat_f})" if lat_f is not None and lon_f is not None else None
                     stops_rows.append(
                         (
                             feed_id,
@@ -154,14 +160,14 @@ def ingest_gtfs(gtfs_zip: Path, database_url: str, source_url: str | None = None
                             row.get("stop_desc"),
                             lat_f,
                             lon_f,
-                            geom_expr,
+                            wkt,
                             row.get("zone_id"),
                             row.get("parent_station"),
                         )
                     )
-                # geometry must be expressed as expressions; use execute_values with template
                 if stops_rows:
-                    values_template = "(%s,%s,%s,%s,%s,%s,COALESCE(%s::text, NULL)::geography, %s,%s)"
+                    # ST_GeogFromText(NULL) returns NULL, so missing coords are handled naturally.
+                    values_template = "(%s,%s,%s,%s,%s,%s,ST_GeogFromText(%s),%s,%s)"
                     execute_values(
                         cur,
                         """
@@ -175,6 +181,7 @@ def ingest_gtfs(gtfs_zip: Path, database_url: str, source_url: str | None = None
                     )
 
                 # trips.txt
+                print("[ingest] Loading trips.txt ...", flush=True)
                 trips_rows = []
                 for row in _read_csv_from_zip(zf, "trips.txt"):
                     trips_rows.append(
@@ -206,6 +213,7 @@ def ingest_gtfs(gtfs_zip: Path, database_url: str, source_url: str | None = None
                 )
 
                 # stop_times.txt
+                print("[ingest] Loading stop_times.txt ...", flush=True)
                 stop_time_rows = []
                 for row in _read_csv_from_zip(zf, "stop_times.txt"):
                     try:
@@ -248,6 +256,7 @@ def ingest_gtfs(gtfs_zip: Path, database_url: str, source_url: str | None = None
                 )
 
                 # calendar.txt
+                print("[ingest] Loading calendar.txt ...", flush=True)
                 cal_rows = []
                 for row in _read_csv_from_zip(zf, "calendar.txt"):
                     cal_rows.append(
@@ -285,6 +294,7 @@ def ingest_gtfs(gtfs_zip: Path, database_url: str, source_url: str | None = None
                 )
 
                 # calendar_dates.txt
+                print("[ingest] Loading calendar_dates.txt ...", flush=True)
                 cald_rows = []
                 for row in _read_csv_from_zip(zf, "calendar_dates.txt"):
                     cald_rows.append(
@@ -303,6 +313,7 @@ def ingest_gtfs(gtfs_zip: Path, database_url: str, source_url: str | None = None
                 )
 
                 # shapes.txt -> shapes + shapes_lines
+                print("[ingest] Loading shapes.txt ...", flush=True)
                 shapes_points: Dict[Tuple[str, int], Tuple[float, float, float | None]] = {}
                 for row in _read_csv_from_zip(zf, "shapes.txt"):
                     shape_id = row.get("shape_id")
@@ -348,6 +359,7 @@ def ingest_gtfs(gtfs_zip: Path, database_url: str, source_url: str | None = None
                 )
 
                 # Build shapes_lines using PostGIS aggregation
+                print("[ingest] Building shapes_lines (this can take a while) ...", flush=True)
                 cur.execute(
                     """
                     INSERT INTO shapes_lines(feed_id, shape_id, geom)
@@ -367,6 +379,7 @@ def ingest_gtfs(gtfs_zip: Path, database_url: str, source_url: str | None = None
                 )
 
                 # Compute basic trip_time_bounds from stop_times
+                print("[ingest] Computing trip_time_bounds ...", flush=True)
                 cur.execute(
                     """
                     INSERT INTO trip_time_bounds(feed_id, trip_id, first_sec, last_sec)
@@ -390,11 +403,12 @@ def ingest_gtfs(gtfs_zip: Path, database_url: str, source_url: str | None = None
                 )
 
             # Activate this feed and deactivate others
+            print("[ingest] Marking feed active in feed_versions ...", flush=True)
             cur.execute("UPDATE feed_versions SET active = FALSE WHERE id <> %s", (feed_id,))
             cur.execute("UPDATE feed_versions SET active = TRUE WHERE id = %s", (feed_id,))
 
         conn.commit()
-        print(f"Ingest completed for feed_id={feed_id}")
+        print(f"[ingest] Completed successfully for feed_id={feed_id}")
     finally:
         conn.close()
 
