@@ -96,7 +96,6 @@ const DRAW_STYLES: any[] = [
   },
 ];
 
-const SOURCE_BLOCKAGE = "blockage";
 const SOURCE_ROUTE = "route";
 const SOURCE_DETOUR = "detour";
 const SOURCE_STOPS = "stops";
@@ -143,6 +142,7 @@ export type MapLibreMapHandle = {
   clearBlockage: () => void;
   cancelDrawing: () => void;
   undoLastPoint: () => void;
+  startPolygon: () => void;
   fitToBlockage: () => void;
   fitToRoute: () => void;
   fitToDetour: () => void;
@@ -206,22 +206,6 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
           type: "line",
           source: SOURCE_ROUTE,
           paint: { "line-color": "#2563eb", "line-width": 4 },
-        });
-      }
-
-      if (!map.getSource(SOURCE_BLOCKAGE)) {
-        map.addSource(SOURCE_BLOCKAGE, { type: "geojson", data: emptyFc });
-        map.addLayer({
-          id: "blockage-fill",
-          type: "fill",
-          source: SOURCE_BLOCKAGE,
-          paint: { "fill-color": "#f97316", "fill-opacity": 0.35 },
-        });
-        map.addLayer({
-          id: "blockage-line",
-          type: "line",
-          source: SOURCE_BLOCKAGE,
-          paint: { "line-color": "#dc2626", "line-width": 2 },
         });
       }
 
@@ -316,35 +300,6 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
     };
   }, [onBlockageChange]);
 
-  // Keep Draw in sync with React blockage state (React is the source of truth)
-  useEffect(() => {
-    if (!mapReady) return;
-    const draw = drawRef.current;
-    if (!draw) return;
-    // Suppress API events by default, so this does not loop back into React.
-    draw.deleteAll();
-    if (blockageGeojson) {
-      draw.add({
-        type: "Feature",
-        geometry: blockageGeojson as GeoJSON.Geometry,
-        properties: {},
-      } as GeoJSON.Feature);
-    }
-  }, [mapReady, blockageGeojson]);
-
-  // Blockage source data
-  useEffect(() => {
-    const map = mapRef.current;
-    if (!map || !mapReady) return;
-    const source = map.getSource(SOURCE_BLOCKAGE) as maplibregl.GeoJSONSource | undefined;
-    if (!source) return;
-    if (blockageGeojson) {
-      source.setData({ type: "Feature", geometry: blockageGeojson, properties: {} } as GeoJSON.Feature);
-    } else {
-      source.setData({ type: "FeatureCollection", features: [] });
-    }
-  }, [mapReady, blockageGeojson]);
-
   // Route source data
   useEffect(() => {
     const map = mapRef.current;
@@ -427,6 +382,17 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
       clearBlockage() {
         drawRef.current?.deleteAll();
         onBlockageChange(null);
+      },
+      startPolygon() {
+        const draw = drawRef.current;
+        if (!draw) return;
+        try {
+          // Switch MapboxDraw into polygon drawing mode explicitly.
+          // @ts-expect-error changeMode is available at runtime.
+          draw.changeMode("draw_polygon");
+        } catch (e) {
+          console.error("Failed to start draw_polygon mode", e);
+        }
       },
       cancelDrawing() {
         drawRef.current?.changeMode("simple_select");

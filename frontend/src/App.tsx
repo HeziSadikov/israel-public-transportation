@@ -343,6 +343,9 @@ const App: React.FC = () => {
         <section className="rail-section">
           <h2 className="rail-heading">Blockage</h2>
           <div className="rail-buttons">
+            <button type="button" onClick={() => mapRef.current?.startPolygon()} title="Draw polygon blockage">
+              Draw polygon
+            </button>
             <button type="button" onClick={() => mapRef.current?.clearBlockage()} title="Clear blockage">
               Clear
             </button>
