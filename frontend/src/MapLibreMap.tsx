@@ -265,23 +265,34 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
         });
       }
 
-      // Draw control: polygon and rectangle only
+      // Draw control: polygon only (explicitly activated by the toolbar button)
       const draw = new MapboxDraw({
         displayControlsDefault: false,
         controls: {
           polygon: true,
-          rectangle: true,
           trash: true,
         },
-        defaultMode: "draw_polygon",
         styles: DRAW_STYLES,
       });
-      map.addControl(draw as any, "top-left");
+      // Place controls in the top-right to avoid overlap with the explorer window.
+      map.addControl(draw as any, "top-right");
       drawRef.current = draw;
 
       map.on("draw.create", (e: { features?: GeoJSON.Feature[] }) => {
         console.log("draw.create fired", e);
 
+        let feature = e?.features?.[0];
+        if (!feature && typeof draw.getAll === "function") {
+          const all = draw.getAll();
+          feature = all?.features?.[0];
+        }
+        if (feature?.geometry) {
+          const geom = normalizeBlockageGeometry(feature.geometry);
+          onBlockageChange(geom);
+        }
+      });
+      map.on("draw.update", (e: { features?: GeoJSON.Feature[] }) => {
+        console.log("draw.update fired", e);
         let feature = e?.features?.[0];
         if (!feature && typeof draw.getAll === "function") {
           const all = draw.getAll();
