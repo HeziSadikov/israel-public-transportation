@@ -20,7 +20,10 @@ import psycopg2
 from psycopg2.extras import DictCursor
 
 
-DB_URL = os.getenv("DATABASE_URL", "postgresql://localhost/israel_gtfs")
+# NOTE: On this Windows setup, reading DATABASE_URL from the environment caused
+# a UnicodeDecodeError inside psycopg2 due to non-UTF-8 bytes in the DSN.
+# To keep things simple and robust here, we use an explicit ASCII DSN string.
+DB_URL = "postgresql://postgres@localhost:5432/israel_gtfs"
 
 
 def _get_conn():
@@ -117,8 +120,8 @@ def get_routes_in_polygon(
                     SELECT DISTINCT
                         tiw.route_id,
                         tiw.direction_id,
-                        r.route_short_name,
-                        r.route_long_name,
+                        r.short_name AS route_short_name,
+                        r.long_name AS route_long_name,
                         r.agency_id,
                         MIN(b.first_sec) AS first_time_s,
                         MAX(b.last_sec) AS last_time_s
@@ -136,7 +139,7 @@ def get_routes_in_polygon(
                         ST_GeomFromText(%s, 4326)
                     )
                     GROUP BY tiw.route_id, tiw.direction_id,
-                             r.route_short_name, r.route_long_name, r.agency_id
+                             r.short_name, r.long_name, r.agency_id
                 )
                 SELECT
                     rg.route_id,

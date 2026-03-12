@@ -775,6 +775,14 @@ def detour(req: DetourRequest):
     blockage_geojson = _ensure_geometry(req.blockage_geojson)
     date_str = req.date or datetime.utcnow().strftime("%Y%m%d")
 
+    # Simple debug log so we can see each detour request without retyping.
+    print(
+        f"[detour] route_id={req.route_id!r}, direction_id={req.direction_id!r}, "
+        f"date={date_str}, start_stop_id={req.start_stop_id!r}, "
+        f"end_stop_id={req.end_stop_id!r}",
+        flush=True,
+    )
+
     # Graph must have been built earlier with /graph/build.
     # Try both PostGIS and feed-based cache keys.
     candidate_keys = _graph_cache_keys_for_lookup(
@@ -1018,6 +1026,15 @@ def detour(req: DetourRequest):
     if baseline_travel_time_s is not None and baseline_distance_m is not None:
         detour_delay_s = total_travel_time_s - baseline_travel_time_s
         detour_extra_distance_m = total_distance_m - baseline_distance_m
+
+    print(
+        f"[detour] result route_id={req.route_id!r}, direction_id={req.direction_id!r}, "
+        f"blocked_edges={len(blocked_edges)}, "
+        f"stop_path_len={len(path)}, "
+        f"total_travel_time_s={total_travel_time_s:.1f}, "
+        f"baseline_travel_time_s={baseline_travel_time_s if baseline_travel_time_s is not None else 'N/A'}",
+        flush=True,
+    )
 
     return DetourResponse(
         blocked_edges_count=len(blocked_edges),
@@ -1425,16 +1442,8 @@ def area_routes(req: AreaRoutesQuery):
         raise HTTPException(status_code=400, detail=f"Invalid polygon_geojson: {e}")
 
     try:
-        feed = load_active_feed()
-    except Exception as e:
-        raise HTTPException(
-            status_code=503,
-            detail=f"GTFS feed could not be loaded. Place israel-public-transportation.zip in the project root or run /feed/update. ({e})",
-        )
-
-    try:
         routes_raw = find_routes_in_polygon(
-            feed=feed,
+            feed=None,
             polygon_geojson=polygon_geojson,
             yyyymmdd=req.date,
             start_sec=start_sec,
@@ -1443,6 +1452,10 @@ def area_routes(req: AreaRoutesQuery):
     except HTTPException:
         raise
     except Exception as e:
+        # Log full traceback to help diagnose encoding / PostGIS issues.
+        import traceback
+
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Area search failed: {e}")
 
     def _fmt_time(sec: Optional[int]) -> Optional[str]:
@@ -1456,10 +1469,12 @@ def area_routes(req: AreaRoutesQuery):
 
     results: list[AreaRouteResult] = []
     for r in routes_raw:
+        dir_id_val = r.get("direction_id")
+        dir_id_str = str(dir_id_val) if dir_id_val is not None else None
         results.append(
             AreaRouteResult(
                 route_id=r["route_id"],
-                direction_id=r.get("direction_id"),
+                direction_id=dir_id_str,
                 route_short_name=r.get("route_short_name"),
                 route_long_name=r.get("route_long_name"),
                 agency_id=r.get("agency_id"),
@@ -1525,6 +1540,13 @@ def detours_by_area(req: DetourByAreaRequest):
             detail=f"GTFS feed could not be loaded. Place israel-public-transportation.zip in the project root or run /feed/update. ({e})",
         )
 
+    print(
+        f"[detours/by-area] mode={req.mode}, date={req.date}, "
+        f"time_window={req.start_time}-{req.end_time}, "
+        f"max_routes={req.max_routes}, transfer_radius_m={req.transfer_radius_m}",
+        flush=True,
+    )
+
     if req.mode == DetourByAreaMode.route:
         if not req.route_id:
             raise HTTPException(status_code=400, detail="route_id is required when mode='route'")
@@ -1537,6 +1559,14 @@ def detours_by_area(req: DetourByAreaRequest):
             route_id=req.route_id,
             direction_id=req.direction_id,
             transfer_radius_m=req.transfer_radius_m,
+        )
+        print(
+            f"[detours/by-area] single route_id={result.route_id!r}, "
+            f"direction_id={result.direction_id!r}, "
+            f"blocked_edges={result.blocked_edges_count}, "
+            f"used_transfers={result.used_transfers}, "
+            f"error={result.error!r}",
+            flush=True,
         )
         return DetourByAreaResponse(mode=req.mode, result=result, feed_version=feed.version_id)
 
@@ -1578,6 +1608,13 @@ def detours_by_area(req: DetourByAreaRequest):
             transfer_radius_m=req.transfer_radius_m,
         )
         results.append(res)
+
+    print(
+        f"[detours/by-area] computed {len(results)} route detours "
+        f"for blockage on date={req.date}, "
+        f"time_window={req.start_time}-{req.end_time}",
+        flush=True,
+    )
 
     return DetourByAreaResponse(mode=req.mode, results=results, feed_version=feed.version_id)
 
