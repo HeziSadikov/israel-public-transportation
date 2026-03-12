@@ -29,6 +29,73 @@ const OSM_STYLE: maplibregl.StyleSpecification = {
   layers: [{ id: "osm", type: "raster", source: "osm" }],
 };
 
+// Custom, minimal styles for MapboxDraw that are compatible with MapLibre.
+// We avoid any complex line-dasharray expressions that trigger style errors.
+const DRAW_STYLES: any[] = [
+  // Inactive polygon fill
+  {
+    id: "gl-draw-polygon-fill-inactive",
+    type: "fill",
+    filter: ["all", ["==", "active", "false"], ["==", "$type", "Polygon"]],
+    paint: {
+      "fill-color": "#f97316",
+      "fill-outline-color": "#dc2626",
+      "fill-opacity": 0.2,
+    },
+  },
+  // Active polygon fill
+  {
+    id: "gl-draw-polygon-fill-active",
+    type: "fill",
+    filter: ["all", ["==", "active", "true"], ["==", "$type", "Polygon"]],
+    paint: {
+      "fill-color": "#f97316",
+      "fill-outline-color": "#dc2626",
+      "fill-opacity": 0.4,
+    },
+  },
+  // Active polygon outline
+  {
+    id: "gl-draw-polygon-stroke-active",
+    type: "line",
+    filter: ["all", ["==", "active", "true"], ["==", "$type", "Polygon"]],
+    layout: {
+      "line-cap": "round",
+      "line-join": "round",
+    },
+    paint: {
+      "line-color": "#dc2626",
+      "line-width": 2,
+    },
+  },
+  // Inactive polygon outline
+  {
+    id: "gl-draw-polygon-stroke-inactive",
+    type: "line",
+    filter: ["all", ["==", "active", "false"], ["==", "$type", "Polygon"]],
+    layout: {
+      "line-cap": "round",
+      "line-join": "round",
+    },
+    paint: {
+      "line-color": "#dc2626",
+      "line-width": 2,
+    },
+  },
+  // Vertex points
+  {
+    id: "gl-draw-polygon-vertex",
+    type: "circle",
+    filter: ["all", ["==", "$type", "Point"], ["==", "meta", "vertex"]],
+    paint: {
+      "circle-radius": 4,
+      "circle-color": "#ffffff",
+      "circle-stroke-width": 2,
+      "circle-stroke-color": "#dc2626",
+    },
+  },
+];
+
 const SOURCE_BLOCKAGE = "blockage";
 const SOURCE_ROUTE = "route";
 const SOURCE_DETOUR = "detour";
@@ -207,11 +274,14 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
           trash: true,
         },
         defaultMode: "draw_polygon",
+        styles: DRAW_STYLES,
       });
       map.addControl(draw as any, "top-left");
       drawRef.current = draw;
 
       map.on("draw.create", (e: { features?: GeoJSON.Feature[] }) => {
+        console.log("draw.create fired", e);
+
         let feature = e?.features?.[0];
         if (!feature && typeof draw.getAll === "function") {
           const all = draw.getAll();
