@@ -21,16 +21,54 @@ services:
       timeout: 5s
       retries: 5
 
+  backend:
+    build: .
+    container_name: israel-gtfs-backend
+    depends_on:
+      postgis:
+        condition: service_healthy
+    environment:
+      # Match backend/db_access.py expectation
+      DATABASE_URL: "postgresql://${POSTGRES_USER:-user}:${POSTGRES_PASSWORD:-pass}@postgis:5432/${POSTGRES_DB:-israel_gtfs}"
+      OSM_ENGINE_URL: "http://osrm:5000"
+      VALHALLA_URL: "http://valhalla:8002"
+    ports:
+      - "8000:8000"
+
+  osrm:
+    image: osrm/osrm-backend:latest
+    container_name: osrm-israel
+    command: >
+      osrm-routed
+      --algorithm mld
+      /data/israel.osrm
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./osm:/data
+    restart: unless-stopped
+
+  valhalla:
+    image: ghcr.io/valhalla/valhalla-scripted:latest
+    container_name: valhalla-israel
+    environment:
+      use_tiles_ignore_pbf: "False"
+    ports:
+      - "8002:8002"
+    volumes:
+      - ./osm:/custom_files
+    restart: unless-stopped
+
 volumes:
   postgis_data:
 
 # Usage:
-# 1) Start: docker compose up -d
-# 2) Create schema (run once; requires superuser for CREATE EXTENSION postgis):
-#    docker compose exec postgis psql -U postgres -d israel_gtfs -f /backend/db_postgis_schema.sql
-#    Then grant your app user access to tables if you use a non-superuser.
-# 3) Ingest GTFS:
-#    set DATABASE_URL=postgresql://user:pass@localhost:5432/israel_gtfs  (PowerShell: $env:DATABASE_URL="...")
-#    python -m backend.scripts.ingest_gtfs_postgis --gtfs-zip ./israel-public-transportation.zip --database-url postgresql://user:pass@localhost:5432/israel_gtfs
-#    python -m backend.scripts.build_patterns_postgis --date 20260308 --database-url postgresql://user:pass@localhost:5432/israel_gtfs
-# 4) Run backend with: set DATABASE_URL=postgresql://user:pass@localhost:5432/israel_gtfs && uvicorn app:app --reload --port 8000
+# 1) Place data:
+#    - GTFS zip at ./israel-public-transportation.zip
+#    - OSM extract at ./osm/israel.osm.pbf
+#    - OSRM preprocessed files at ./osm/israel.osrm* (see README for extract/partition/customize)
+# 2) Start stack:
+#    docker compose up --build
+# 3) Create PostGIS schema (once):
+#    docker compose exec postgis psql -U ${POSTGRES_USER:-user} -d ${POSTGRES_DB:-israel_gtfs} -f /backend/db_postgis_schema.sql
+# 4) Ingest GTFS & build patterns (from host or a one-off container) pointing at postgis:5432.

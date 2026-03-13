@@ -2,14 +2,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, date
-from typing import Dict, List, Set
-
-from .gtfs_loader import GTFSFeed
+from typing import Dict, List, Set, Any
 
 
 @dataclass
 class ServiceCalendar:
-    feed: GTFSFeed
+    """
+    Kept for backwards compatibility; now used with dict-like feed objects
+    (e.g. GTFSFeed from PostGIS) rather than a concrete gtfs_loader type.
+    """
+    feed: Any
 
     def active_service_ids_for_date(self, yyyymmdd: str) -> Set[str]:
         """

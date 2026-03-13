@@ -15,8 +15,9 @@ from .config import (
     GTFS_REMOTE_BASE,
     GTFS_REMOTE_FILENAME,
 )
-from .sqlite_db import DB_PATH
-from scripts.import_gtfs_sqlite import import_gtfs_to_sqlite
+from .db_access import DB_URL
+from .scripts.ingest_gtfs_postgis import ingest_gtfs
+from .scripts.build_patterns_postgis import build_patterns
 
 
 @dataclass
@@ -52,13 +53,14 @@ def _save_metadata(meta: Dict[str, Any]) -> None:
 
 def _import_feed(path: Path, version_id: str, date: str, sha256: str) -> FeedVersion:
     """
-    Import the downloaded GTFS zip into the SQLite database and return a FeedVersion
+    Import the downloaded GTFS zip into PostgreSQL/PostGIS and return a FeedVersion
     record describing the new active feed.
-
-    This replaces the old _load_from_path() sanity check with a real import step.
     """
-    # Import into SQLite DB; this will create/replace GTFS tables.
-    import_gtfs_to_sqlite(DB_PATH, path)
+    # 1) Ingest GTFS into PostGIS (creates feed_versions row and marks it active).
+    ingest_gtfs(path, DB_URL, source_url=str(path))
+
+    # 2) Build patterns/pattern_stops for this active feed and date.
+    build_patterns(DB_URL, date)
 
     now = datetime.utcnow().isoformat() + "Z"
     return FeedVersion(
@@ -87,11 +89,26 @@ def update_feed() -> Dict[str, Any]:
     online_ok = False
 
     try:
+        print(f"[feed/update] Downloading GTFS from {url} ...", flush=True)
         with httpx.stream("GET", url, timeout=60.0) as resp:
             resp.raise_for_status()
+            total = int(resp.headers.get("Content-Length") or 0)
+            downloaded = 0
+            next_log = 5 * 1024 * 1024  # log every ~5 MB
             with zip_path.open("wb") as f:
                 for chunk in resp.iter_bytes():
                     f.write(chunk)
+                    downloaded += len(chunk)
+                    if downloaded >= next_log:
+                        mb = downloaded / (1024 * 1024)
+                        if total > 0:
+                            pct = downloaded * 100.0 / total
+                            print(f"[feed/update] Downloaded {mb:.1f} MB ({pct:.1f}%) ...", flush=True)
+                        else:
+                            print(f"[feed/update] Downloaded {mb:.1f} MB ...", flush=True)
+                        next_log += 5 * 1024 * 1024
+        size_mb = zip_path.stat().st_size / (1024 * 1024)
+        print(f"[feed/update] Download complete: {size_mb:.1f} MB saved to {zip_path}", flush=True)
         online_ok = True
     except Exception:
         # Online update failed; fall back to last active
@@ -116,6 +133,7 @@ def update_feed() -> Dict[str, Any]:
         }
 
     # Import and only then switch active (blue/green)
+    print("[feed/update] Importing GTFS into PostGIS and building patterns ...", flush=True)
     feed_version = _import_feed(zip_path, version_id, today, sha256)
     record = {
         "version_id": feed_version.version_id,

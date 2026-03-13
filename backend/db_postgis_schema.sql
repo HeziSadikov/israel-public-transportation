@@ -178,3 +178,25 @@ CREATE TABLE IF NOT EXISTS trip_time_bounds (
     PRIMARY KEY (feed_id, trip_id)
 );
 
+-- Per-route signatures to detect changes between feeds
+CREATE TABLE IF NOT EXISTS route_signatures (
+    feed_id      INT REFERENCES feed_versions(id) ON DELETE CASCADE,
+    route_id     TEXT NOT NULL,
+    direction_id INT,
+    sig_hash     TEXT NOT NULL,
+    PRIMARY KEY (feed_id, route_id, direction_id)
+);
+
+-- Optional cache for precomputed route graphs keyed by route signature
+CREATE TABLE IF NOT EXISTS route_graph_cache (
+    feed_id        INT REFERENCES feed_versions(id) ON DELETE CASCADE,
+    route_id       TEXT NOT NULL,
+    direction_id   INT,
+    date_ymd       INT NOT NULL,
+    pretty_osm     BOOLEAN NOT NULL,
+    route_sig_hash TEXT NOT NULL,
+    graph_blob     BYTEA NOT NULL,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (feed_id, route_id, direction_id, date_ymd, pretty_osm)
+);
+

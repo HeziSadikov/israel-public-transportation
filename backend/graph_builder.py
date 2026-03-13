@@ -2,13 +2,12 @@ from __future__ import annotations
 
 import bisect
 from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional, Sequence, TYPE_CHECKING
+from typing import Dict, List, Tuple, Optional, Sequence, TYPE_CHECKING, Any
 
 import networkx as nx
 from shapely.geometry import LineString
 
-from .gtfs_loader import GTFSFeed
-from .sqlite_db import get_stop_times_for_trip
+from .db_access import get_stop_times_for_trip
 from .pattern_builder import RoutePattern
 from .service_calendar import parse_gtfs_time_to_seconds
 
@@ -81,7 +80,7 @@ class GraphBuildResult:
 
 
 class GraphBuilder:
-    def __init__(self, feed: GTFSFeed):
+    def __init__(self, feed: Any):
         self.feed = feed
         self.stops_by_id: Dict[str, Dict] = {s["stop_id"]: s for s in feed.stops}
 

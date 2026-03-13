@@ -3,10 +3,9 @@ from __future__ import annotations
 import hashlib
 from collections import defaultdict, Counter
 from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional, Set
+from typing import Dict, List, Tuple, Optional, Set, Any
 
-from .gtfs_loader import GTFSFeed
-from .sqlite_db import get_stop_times_for_trip
+from .db_access import get_stop_times_for_trip
 from .service_calendar import ServiceCalendar
 
 
@@ -22,7 +21,7 @@ class RoutePattern:
 
 
 class PatternBuilder:
-    def __init__(self, feed: GTFSFeed):
+    def __init__(self, feed: Any):
         self.feed = feed
         self.calendar = ServiceCalendar(feed)
 

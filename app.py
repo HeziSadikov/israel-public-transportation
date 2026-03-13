@@ -48,19 +48,15 @@ from backend.api_models import (
 )
 from backend.config import GRAPH_CACHE, GRAPH_CACHE_DIR
 from backend.sqlite_db import (
-    search_routes,
-    stops_in_bounds_sqlite,
     get_route_graph_blob,
     save_route_graph_blob,
     get_route_graph_v2,
     get_route_graphs_v2_for_route,
     get_pattern_record,
     get_pattern_stops,
-    get_trip_time_bounds_from_db,
 )
 from backend.area_search import find_routes_in_polygon
 from backend import db_access as db_access_module
-from backend.stop_services import get_stops_in_bounds, get_routes_serving_stop
 from backend.service_calendar import ServiceCalendar
 
 
@@ -128,75 +124,48 @@ def stops_in_bounds(
     """Return stops whose coordinates fall inside the given bounding box (e.g. map view)."""
     if min_lat >= max_lat or min_lon >= max_lon:
         raise HTTPException(status_code=400, detail="Invalid bounds: min must be less than max")
-    # Prefer SQLite if available; fall back to in-memory feed.
+    # PostGIS-backed lookup: active feed's stops table.
     try:
-        stops = stops_in_bounds_sqlite(min_lat, max_lat, min_lon, max_lon, limit)
-        return [StopInBounds(**s) for s in stops]
-    except FileNotFoundError:
-        feed = load_active_feed()
-        stops = get_stops_in_bounds(feed, min_lat, max_lat, min_lon, max_lon, limit=limit)
-        return [StopInBounds(**s) for s in stops]
+        stops = db_access_module.get_stops_in_bounds_pg(
+            min_lat=min_lat,
+            max_lat=max_lat,
+            min_lon=min_lon,
+            max_lon=max_lon,
+            limit=limit,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Could not load stops from PostGIS: {e}")
+    return [StopInBounds(**s) for s in stops]
 
 
 @app.post("/routes/search", response_model=list[RouteInfo])
 def routes_search(req: RouteSearchRequest):
-    q = req.q.strip().lower()
+    q = req.q.strip()
     if not q:
         return []
-    # Prefer SQLite-backed search; fall back to in-memory index if DB missing.
     try:
-        rows = search_routes(q, req.limit)
-        return [
+        rows = db_access_module.search_routes_pg(q, req.limit)
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Could not search routes in PostGIS: {e}")
+    results: list[RouteInfo] = []
+    for row in rows:
+        route_type_val = None
+        if row.get("route_type") is not None and str(row.get("route_type", "")).strip():
+            try:
+                route_type_val = int(row["route_type"])
+            except (ValueError, KeyError, TypeError):
+                route_type_val = None
+        results.append(
             RouteInfo(
                 route_id=row.get("route_id") or "",
                 route_short_name=row.get("route_short_name"),
                 route_long_name=row.get("route_long_name"),
                 agency_id=row.get("agency_id"),
                 agency_name=row.get("agency_name"),
-                route_type=int(row["route_type"]) if row.get("route_type") not in (None, "") else None,
+                route_type=route_type_val,
             )
-            for row in rows
-        ]
-    except FileNotFoundError:
-        # Fallback to existing in-memory index if SQLite DB not present.
-        feed = load_active_feed()
-        agency_name_by_id = {a.get("agency_id"): a.get("agency_name") for a in getattr(feed, "agencies", [])}
-        try:
-            index = get_routes_search_index()
-        except Exception as e:
-            raise HTTPException(status_code=503, detail=f"Could not load routes: {e}") from e
-
-        results: list[RouteInfo] = []
-        for row, search_str in index:
-            if len(results) >= req.limit:
-                break
-            # For numeric-only queries, prefer exact route_id/short_name matches.
-            if q.isdigit():
-                rid = (row.get("route_id") or "").lower()
-                sn = (row.get("route_short_name") or "").lower()
-                if rid != q or sn != q:
-                    continue
-            else:
-                if q not in search_str:
-                    continue
-            route_type_val = None
-            if row.get("route_type") is not None and str(row.get("route_type", "")).strip():
-                try:
-                    route_type_val = int(row["route_type"])
-                except (ValueError, KeyError, TypeError):
-                    pass
-            agency_id = row.get("agency_id")
-            results.append(
-                RouteInfo(
-                    route_id=row.get("route_id") or "",
-                    route_short_name=row.get("route_short_name"),
-                    route_long_name=row.get("route_long_name"),
-                    agency_id=agency_id,
-                    agency_name=agency_name_by_id.get(agency_id),
-                    route_type=route_type_val,
-                )
-            )
-        return results
+        )
+    return results
 
 
 @app.post("/feed/update", response_model=FeedUpdateResponse)
@@ -307,6 +276,42 @@ def graph_build(req: GraphBuildRequest):
                     example_stop_ids=pat.stop_ids[:5],
                     feed_version=feed_version,
                 )
+            # Try PostGIS route_graph_cache keyed by per-route signature.
+            try:
+                sig_hash = db_access_module.compute_route_signature(req.route_id, req.direction_id)
+                cached_blob = db_access_module.get_cached_route_graph_pg(
+                    feed_id=feed_id,
+                    route_id=req.route_id,
+                    direction_id=req.direction_id,
+                    date_ymd=date_str,
+                    pretty_osm=req.pretty_osm,
+                    route_sig_hash=sig_hash,
+                )
+            except Exception:
+                sig_hash = None
+                cached_blob = None
+
+            if cached_blob:
+                try:
+                    cached = pickle.loads(cached_blob)
+                    GRAPH_CACHE[key] = cached
+                    pat: RoutePattern = cached["pattern"]
+                    edge_geoms = cached["edge_geometries"]
+                    used_shape = cached["used_shape"]
+                    used_osm = cached.get("used_osm_snapping", False)
+                    return GraphBuildResponse(
+                        pattern_id=pat.pattern_id,
+                        stop_count=len(pat.stop_ids),
+                        edge_count=len(edge_geoms),
+                        used_shape=used_shape,
+                        used_osm_snapping=used_osm,
+                        example_stop_ids=pat.stop_ids[:5],
+                        feed_version=feed_version,
+                    )
+                except Exception:
+                    # Fall through to rebuild on cache decode errors.
+                    pass
+
             build_result = build_graph_for_pattern_from_postgis(meta, date_str)
             edge_geoms = build_result.edge_geometries
             used_osm = False
@@ -332,6 +337,22 @@ def graph_build(req: GraphBuildRequest):
                 "date": date_str,
             }
             GRAPH_CACHE[key] = cache_entry
+            # Persist to PostGIS graph cache keyed by route signature.
+            if sig_hash:
+                try:
+                    db_access_module.save_route_graph_pg(
+                        feed_id=feed_id,
+                        route_id=req.route_id,
+                        direction_id=req.direction_id,
+                        date_ymd=date_str,
+                        pretty_osm=req.pretty_osm,
+                        route_sig_hash=sig_hash,
+                        graph_blob=pickle.dumps(cache_entry),
+                    )
+                except Exception:
+                    # Cache write failures should not break the request.
+                    pass
+
             pat = build_result.pattern
             return GraphBuildResponse(
                 pattern_id=pat.pattern_id,
@@ -923,103 +944,29 @@ def detour(req: DetourRequest):
             end_stop_id=detour_end,
             blocked_edges=blocked_for_routing,
         )
-        path = [detour_graph_res.graph.nodes[n]["stop_id"] for n in path_nodes]
-        path_geojson = collect_path_geojson(
-            edge_geometries=detour_graph_res.edge_geometries,
-            path=path_nodes,
-        )
-        total_travel_time_s = 0.0
-        total_distance_m = 0.0
-        for i in range(len(path_nodes) - 1):
-            u, v = path_nodes[i], path_nodes[i + 1]
-            edge_data = detour_graph_res.graph.get_edge_data(u, v, default={})
-            total_travel_time_s += float(edge_data.get("travel_time_s", 0.0))
-            total_distance_m += float(edge_data.get("distance_m", 0.0))
-        blocked_edges = detour_blocked
-        blocked_edges_geojson = detour_blocked_geojson
     except Exception:
-        # No path on multi-route GTFS graph. Optionally try OSM (Valhalla) as fallback.
-        if (
-            VALHALLA_URL
-            and blocked_edges
-            and baseline_path
-            and baseline_travel_time_s is not None
-        ):
-            try:
-                i_first: Optional[int] = None
-                i_last: Optional[int] = None
-                for i in range(len(baseline_path) - 1):
-                    uv = (baseline_path[i], baseline_path[i + 1])
-                    if uv in blocked_edges:
-                        if i_first is None:
-                            i_first = i
-                        i_last = i
-                if i_first is not None and i_last is not None:
-                    stop_before = baseline_path[i_first]
-                    stop_after = baseline_path[i_last + 1]
-                    na = graph.nodes.get(stop_before, {})
-                    nb = graph.nodes.get(stop_after, {})
-                    lon_a, lat_a = na.get("lon"), na.get("lat")
-                    lon_b, lat_b = nb.get("lon"), nb.get("lat")
-                    if None not in (lon_a, lat_a, lon_b, lat_b):
-                        osm = route_avoiding_polygon(
-                            float(lon_a), float(lat_a),
-                            float(lon_b), float(lat_b),
-                            blockage_geojson,
-                        )
-                        if osm.success and osm.coordinates:
-                            from shapely.geometry import mapping
-                            path_nodes_osm = (
-                                baseline_path[: i_first + 1] + baseline_path[i_last + 1 :]
-                            )
-                            path = [graph.nodes[n]["stop_id"] for n in path_nodes_osm]
-                            features = []
-                            for i in range(i_first):
-                                u, v = baseline_path[i], baseline_path[i + 1]
-                                eg = edge_geometries.get((u, v))
-                                if eg:
-                                    features.append({
-                                        "type": "Feature",
-                                        "geometry": mapping(eg.linestring),
-                                        "properties": {"from_stop_id": eg.from_stop_id, "to_stop_id": eg.to_stop_id},
-                                    })
-                            features.append({
-                                "type": "Feature",
-                                "geometry": {"type": "LineString", "coordinates": list(osm.coordinates)},
-                                "properties": {"kind": "osm_detour"},
-                            })
-                            for i in range(i_last + 1, len(baseline_path) - 1):
-                                u, v = baseline_path[i], baseline_path[i + 1]
-                                eg = edge_geometries.get((u, v))
-                                if eg:
-                                    features.append({
-                                        "type": "Feature",
-                                        "geometry": mapping(eg.linestring),
-                                        "properties": {"from_stop_id": eg.from_stop_id, "to_stop_id": eg.to_stop_id},
-                                    })
-                            path_geojson = {"type": "FeatureCollection", "features": features}
-                            total_travel_time_s = 0.0
-                            total_distance_m = 0.0
-                            for i in range(i_first):
-                                u, v = baseline_path[i], baseline_path[i + 1]
-                                ed = graph.get_edge_data(u, v, default={})
-                                total_travel_time_s += float(ed.get("travel_time_s", 0.0))
-                                total_distance_m += float(ed.get("distance_m", 0.0))
-                            total_travel_time_s += osm.time_s
-                            total_distance_m += osm.distance_m
-                            for i in range(i_last + 1, len(baseline_path) - 1):
-                                u, v = baseline_path[i], baseline_path[i + 1]
-                                ed = graph.get_edge_data(u, v, default={})
-                                total_travel_time_s += float(ed.get("travel_time_s", 0.0))
-                                total_distance_m += float(ed.get("distance_m", 0.0))
-                            used_osm_detour = True
-            except Exception:
-                pass
-        if not used_osm_detour:
-            raise HTTPException(
-                status_code=409,
-                detail="No detour path found on GTFS routes; try OSM/Valhalla or adjust blockage.",
-            )
+        # Detour must be computable on the GTFS/PostGIS graph; we do not fall back
+        # to a separate road-graph router here so that the chosen path always comes
+        # from the same graph that enforces the blockage.
+        raise HTTPException(
+            status_code=409,
+            detail="No detour path found on GTFS routes; adjust blockage or parameters.",
+        )
+
+    path = [detour_graph_res.graph.nodes[n]["stop_id"] for n in path_nodes]
+    path_geojson = collect_path_geojson(
+        edge_geometries=detour_graph_res.edge_geometries,
+        path=path_nodes,
+    )
+    total_travel_time_s = 0.0
+    total_distance_m = 0.0
+    for i in range(len(path_nodes) - 1):
+        u, v = path_nodes[i], path_nodes[i + 1]
+        edge_data = detour_graph_res.graph.get_edge_data(u, v, default={})
+        total_travel_time_s += float(edge_data.get("travel_time_s", 0.0))
+        total_distance_m += float(edge_data.get("distance_m", 0.0))
+    blocked_edges = detour_blocked
+    blocked_edges_geojson = detour_blocked_geojson
 
     detour_delay_s: Optional[float] = None
     detour_extra_distance_m: Optional[float] = None
@@ -1050,6 +997,249 @@ def detour(req: DetourRequest):
         used_shape=used_shape,
         used_osm_snapping=used_osm_snapping,
         feed_version=feed_version,
+    )
+
+
+@app.post("/detour/osm", response_model=DetourResponse)
+def detour_osm(req: DetourRequest):
+    """
+    Experimental: compute the detour segment on the OSM/Valhalla road graph.
+
+    Flow:
+    - Use the cached single-route GTFS graph to:
+      - compute the baseline stop-to-stop path
+      - detect which baseline edges are blocked by the polygon
+      - locate the last unblocked stop before the blockage and the first after
+    - Ask Valhalla /route with exclude_polygons so the road-level path between
+      those two stops avoids the blockage.
+    - Splice: GTFS edges before + OSM detour polyline + GTFS edges after.
+    """
+    if not VALHALLA_URL or not VALHALLA_URL.strip():
+        raise HTTPException(
+            status_code=503,
+            detail="VALHALLA_URL is not configured; OSM-based detours are unavailable.",
+        )
+
+    blockage_geojson = _ensure_geometry(req.blockage_geojson)
+    date_str = req.date or datetime.utcnow().strftime("%Y%m%d")
+
+    # Graph must have been built earlier with /graph/build.
+    candidate_keys = _graph_cache_keys_for_lookup(
+        req.route_id, req.direction_id, date_str
+    )
+    cache = None
+    for key in candidate_keys:
+        if key in GRAPH_CACHE:
+            cache = GRAPH_CACHE[key]
+            break
+    if cache is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Graph not built yet; call /graph/build first.",
+        )
+
+    graph = cache["graph"]
+    edge_geometries = cache["edge_geometries"]
+    used_shape = cache["used_shape"]
+    used_osm_snapping = cache["used_osm_snapping"]
+    feed_version = cache.get("date", "")
+
+    # Resolve physical stop_ids to node_ids on the single-route graph.
+    start_node = next(
+        (n for n in graph.nodes() if graph.nodes[n].get("stop_id") == req.start_stop_id),
+        None,
+    )
+    end_node = next(
+        (n for n in graph.nodes() if graph.nodes[n].get("stop_id") == req.end_stop_id),
+        None,
+    )
+    if not start_node or not end_node:
+        raise HTTPException(
+            status_code=400,
+            detail="start_stop_id or end_stop_id not found in graph.",
+        )
+
+    # Baseline path on the GTFS graph (no blocking yet).
+    try:
+        baseline_path = astar_route(
+            graph=graph,
+            edge_geometries=edge_geometries,
+            start_stop_id=start_node,
+            end_stop_id=end_node,
+            blocked_edges=set(),
+        )
+    except Exception:
+        raise HTTPException(
+            status_code=409,
+            detail="No baseline path found between the selected stops.",
+        )
+
+    # Identify which edges of the baseline path are blocked by the polygon.
+    blocked_edges, blocked_edges_geojson = compute_blocked_edges(
+        edge_geometries=edge_geometries, blockage_geojson=blockage_geojson
+    )
+    if not blocked_edges:
+        # Nothing on the baseline path is actually blocked; return the baseline GTFS path.
+        path = [graph.nodes[n]["stop_id"] for n in baseline_path]
+        path_geojson = collect_path_geojson(
+            edge_geometries=edge_geometries,
+            path=baseline_path,
+        )
+        total_travel_time_s = 0.0
+        total_distance_m = 0.0
+        for i in range(len(baseline_path) - 1):
+            u, v = baseline_path[i], baseline_path[i + 1]
+            ed = graph.get_edge_data(u, v, default={})
+            total_travel_time_s += float(ed.get("travel_time_s", 0.0))
+            total_distance_m += float(ed.get("distance_m", 0.0))
+        return DetourResponse(
+            blocked_edges_count=0,
+            stop_path=path,
+            path_geojson=path_geojson,
+            blocked_edges_geojson=blocked_edges_geojson,
+            total_travel_time_s=total_travel_time_s,
+            total_distance_m=total_distance_m,
+            baseline_travel_time_s=total_travel_time_s,
+            baseline_distance_m=total_distance_m,
+            detour_delay_s=0.0,
+            detour_extra_distance_m=0.0,
+            used_shape=used_shape,
+            used_osm_snapping=used_osm_snapping,
+            feed_version=str(feed_version),
+        )
+
+    # Find first and last indices on the baseline path that correspond to blocked edges.
+    i_first: Optional[int] = None
+    i_last: Optional[int] = None
+    for i in range(len(baseline_path) - 1):
+        uv = (baseline_path[i], baseline_path[i + 1])
+        if uv in blocked_edges:
+            if i_first is None:
+                i_first = i
+            i_last = i
+    if i_first is None or i_last is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Could not locate a blocked span on the baseline path.",
+        )
+
+    # Stops immediately before and after the blocked span.
+    stop_before = baseline_path[i_first]
+    stop_after = baseline_path[i_last + 1]
+    na = graph.nodes.get(stop_before, {})
+    nb = graph.nodes.get(stop_after, {})
+    lon_a, lat_a = na.get("lon"), na.get("lat")
+    lon_b, lat_b = nb.get("lon"), nb.get("lat")
+    if None in (lon_a, lat_a, lon_b, lat_b):
+        raise HTTPException(
+            status_code=500,
+            detail="Could not resolve coordinates for entry/exit stops of the blocked span.",
+        )
+
+    # Ask Valhalla to compute a detour on the bus/road graph that avoids the blockage polygon.
+    osm = route_avoiding_polygon(
+        float(lon_a),
+        float(lat_a),
+        float(lon_b),
+        float(lat_b),
+        blockage_geojson,
+    )
+    if not osm.success or not osm.coordinates:
+        raise HTTPException(
+            status_code=409,
+            detail="Valhalla could not compute a detour around the blockage.",
+        )
+
+    from shapely.geometry import mapping
+
+    # Splice GTFS edges before + OSM detour segment + GTFS edges after into one FeatureCollection.
+    features = []
+    # GTFS before
+    for i in range(i_first):
+        u, v = baseline_path[i], baseline_path[i + 1]
+        eg = edge_geometries.get((u, v))
+        if eg:
+            features.append(
+                {
+                    "type": "Feature",
+                    "geometry": mapping(eg.linestring),
+                    "properties": {
+                        "from_stop_id": eg.from_stop_id,
+                        "to_stop_id": eg.to_stop_id,
+                    },
+                }
+            )
+    # OSM detour
+    features.append(
+        {
+            "type": "Feature",
+            "geometry": {"type": "LineString", "coordinates": list(osm.coordinates)},
+            "properties": {"kind": "osm_detour"},
+        }
+    )
+    # GTFS after
+    for i in range(i_last + 1, len(baseline_path) - 1):
+        u, v = baseline_path[i], baseline_path[i + 1]
+        eg = edge_geometries.get((u, v))
+        if eg:
+            features.append(
+                {
+                    "type": "Feature",
+                    "geometry": mapping(eg.linestring),
+                    "properties": {
+                        "from_stop_id": eg.from_stop_id,
+                        "to_stop_id": eg.to_stop_id,
+                    },
+                }
+            )
+
+    path_geojson = {"type": "FeatureCollection", "features": features}
+
+    # Accumulate baseline and detour times/distances.
+    baseline_travel_time_s = 0.0
+    baseline_distance_m = 0.0
+    for i in range(len(baseline_path) - 1):
+        u, v = baseline_path[i], baseline_path[i + 1]
+        ed = graph.get_edge_data(u, v, default={})
+        baseline_travel_time_s += float(ed.get("travel_time_s", 0.0))
+        baseline_distance_m += float(ed.get("distance_m", 0.0))
+
+    total_travel_time_s = 0.0
+    total_distance_m = 0.0
+    for i in range(i_first):
+        u, v = baseline_path[i], baseline_path[i + 1]
+        ed = graph.get_edge_data(u, v, default={})
+        total_travel_time_s += float(ed.get("travel_time_s", 0.0))
+        total_distance_m += float(ed.get("distance_m", 0.0))
+    total_travel_time_s += osm.time_s
+    total_distance_m += osm.distance_m
+    for i in range(i_last + 1, len(baseline_path) - 1):
+        u, v = baseline_path[i], baseline_path[i + 1]
+        ed = graph.get_edge_data(u, v, default={})
+        total_travel_time_s += float(ed.get("travel_time_s", 0.0))
+        total_distance_m += float(ed.get("distance_m", 0.0))
+
+    # stop_path excludes the internal pattern-stop ids; return physical stop_ids.
+    path_nodes_osm = baseline_path[: i_first + 1] + baseline_path[i_last + 1 :]
+    stop_path = [graph.nodes[n]["stop_id"] for n in path_nodes_osm]
+
+    detour_delay_s = total_travel_time_s - baseline_travel_time_s
+    detour_extra_distance_m = total_distance_m - baseline_distance_m
+
+    return DetourResponse(
+        blocked_edges_count=len(blocked_edges),
+        stop_path=stop_path,
+        path_geojson=path_geojson,
+        blocked_edges_geojson=blocked_edges_geojson,
+        total_travel_time_s=total_travel_time_s,
+        total_distance_m=total_distance_m,
+        baseline_travel_time_s=baseline_travel_time_s,
+        baseline_distance_m=baseline_distance_m,
+        detour_delay_s=detour_delay_s,
+        detour_extra_distance_m=detour_extra_distance_m,
+        used_shape=used_shape,
+        used_osm_snapping=used_osm_snapping,
+        feed_version=str(feed_version),
     )
 
 
@@ -1215,7 +1405,12 @@ def _compute_route_detour_by_area(
 ) -> DetourByAreaRouteResult:
     # Respect time window: if the route has no active trips in the window,
     # treat it as unaffected for this request.
-    bounds = get_trip_time_bounds_from_db()
+    # Use PostGIS trip_time_bounds to quickly filter routes with no active trips
+    # in the requested window.
+    try:
+        bounds = db_access_module.get_trip_time_bounds_pg()
+    except Exception:
+        bounds = {}
     if bounds:
         svc_cal = ServiceCalendar(feed)
         active_services = svc_cal.active_service_ids_for_date(date_str)
@@ -1629,10 +1824,8 @@ def stop_routes(req: StopRoutesRequest):
             status_code=400,
             detail="end_time must be greater than or equal to start_time",
         )
-    feed = load_active_feed()
     try:
-        routes_raw = get_routes_serving_stop(
-            feed=feed,
+        routes_raw = db_access_module.get_routes_serving_stop_pg(
             stop_id=req.stop_id,
             yyyymmdd=req.date,
             start_sec=start_sec,
