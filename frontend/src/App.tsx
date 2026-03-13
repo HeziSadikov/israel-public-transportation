@@ -87,6 +87,7 @@ const App: React.FC = () => {
   const [detourLoading, setDetourLoading] = useState(false);
   const [detour, setDetour] = useState<DetourResponse | null>(null);
   const [message, setMessage] = useState<string | null>(null);
+  const [useOSMDetour, setUseOSMDetour] = useState(false);
 
   const [explorerOpen, setExplorerOpen] = useState(true);
   const [explorerMinimized, setExplorerMinimized] = useState(false);
@@ -269,6 +270,7 @@ const App: React.FC = () => {
         blockage_geojson: blockageGeojson,
         max_routes: 20,
         transfer_radius_m: 120,
+        use_osm_detour: useOSMDetour,
       };
       if (detourMode === "route" && selectedRoute) {
         body.route_id = selectedRoute.route_id;
@@ -377,6 +379,14 @@ const App: React.FC = () => {
               All
             </label>
           </div>
+          <label style={{ display: "block", marginTop: 8 }}>
+            <input
+              type="checkbox"
+              checked={useOSMDetour}
+              onChange={(e) => setUseOSMDetour(e.target.checked)}
+            />{" "}
+            Use road-network detour (Valhalla)
+          </label>
           <button
             type="button"
             className="btn-compute"

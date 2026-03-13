@@ -1175,6 +1175,7 @@ def _compute_route_detour_by_area(
     route_id: str,
     direction_id: Optional[str],
     transfer_radius_m: float,
+    use_osm_detour: bool,
 ) -> DetourByAreaRouteResult:
     # Respect time window: if the route has no active trips in the window,
     # treat it as unaffected for this request.
@@ -1281,6 +1282,66 @@ def _compute_route_detour_by_area(
 
     start_node = pattern_stop_node_id(pid, stop_before, i_first)
     end_node = pattern_stop_node_id(pid, stop_after, i_last + 1)
+
+    # Optional: use Valhalla OSM detour instead of GTFS multi-route graph.
+    if use_osm_detour and VALHALLA_URL:
+        # Look up stop coordinates from feed.stops.
+        stops_by_id = {s.get("stop_id"): s for s in getattr(feed, "stops", [])}
+        sb = stops_by_id.get(stop_before)
+        sa = stops_by_id.get(stop_after)
+        if sb and sa:
+            try:
+                lat_b = float(sb.get("stop_lat"))
+                lon_b = float(sb.get("stop_lon"))
+                lat_a = float(sa.get("stop_lat"))
+                lon_a = float(sa.get("stop_lon"))
+                osm = route_avoiding_polygon(
+                    lon_b,
+                    lat_b,
+                    lon_a,
+                    lat_a,
+                    blockage_geojson,
+                )
+                if osm.success and osm.coordinates:
+                    from shapely.geometry import mapping as _mapping
+
+                    detour_geojson = {
+                        "type": "FeatureCollection",
+                        "features": [
+                            {
+                                "type": "Feature",
+                                "geometry": {
+                                    "type": "LineString",
+                                    "coordinates": list(osm.coordinates),
+                                },
+                                "properties": {"kind": "osm_detour"},
+                            }
+                        ],
+                    }
+                    replaced_segment_geojson = _build_replaced_segment_geojson(
+                        pattern_id=pid,
+                        stop_ids=stop_ids,
+                        i_first=i_first,
+                        i_last=i_last,
+                        edge_geometries=build_result.edge_geometries,
+                    )
+                    detour_stop_path = [stop_before, stop_after]
+                    return DetourByAreaRouteResult(
+                        route_id=route_id,
+                        direction_id=chosen.direction_id,
+                        pattern_id=chosen.pattern_id,
+                        blocked_edges_count=len(blocked_edges),
+                        stop_before=stop_before,
+                        stop_after=stop_after,
+                        detour_stop_path=detour_stop_path,
+                        detour_geojson=detour_geojson,
+                        replaced_segment_geojson=replaced_segment_geojson,
+                        used_transfers=False,
+                        error=None,
+                    )
+            except Exception:
+                # Fall back to GTFS detour graph below.
+                pass
 
     detour_graph_res = build_detour_graph(
         feed=feed,
@@ -1527,6 +1588,7 @@ def detours_by_area(req: DetourByAreaRequest):
             route_id=req.route_id,
             direction_id=req.direction_id,
             transfer_radius_m=req.transfer_radius_m,
+            use_osm_detour=req.use_osm_detour,
         )
         print(
             f"[detours/by-area] single route_id={result.route_id!r}, "
@@ -1574,6 +1636,7 @@ def detours_by_area(req: DetourByAreaRequest):
             route_id=route_id,
             direction_id=direction_id,
             transfer_radius_m=req.transfer_radius_m,
+            use_osm_detour=req.use_osm_detour,
         )
         results.append(res)
 

@@ -129,6 +129,7 @@ class DetourByAreaRequest(BaseModel):
     blockage_geojson: Dict[str, Any]
     max_routes: int = Field(default=20, ge=1)
     transfer_radius_m: float = Field(default=200.0, ge=10.0, le=1000.0)
+    use_osm_detour: bool = False
 
 
 class DetourByAreaRouteResult(BaseModel):
