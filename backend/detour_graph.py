@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional, Set
+from typing import Dict, List, Tuple, Optional, Set, Any
 
 import networkx as nx
 from shapely.geometry import LineString, shape, mapping
 
-from .gtfs_loader import GTFSFeed
 from .pattern_builder import PatternBuilder, RoutePattern
 from .graph_builder import (
     GraphBuilder,

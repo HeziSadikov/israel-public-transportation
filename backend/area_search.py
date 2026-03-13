@@ -4,13 +4,12 @@ from typing import Dict, List, Any, Optional
 
 from shapely.geometry import shape
 
-from .gtfs_loader import GTFSFeed
 from .service_calendar import ServiceCalendar
 from .db_access import get_routes_in_polygon
 
 
 def find_routes_in_polygon(
-  feed: Optional[GTFSFeed],
+  feed: Optional[Any],
   polygon_geojson: Dict[str, Any],
   yyyymmdd: str,
   start_sec: int,

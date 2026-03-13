@@ -8,8 +8,8 @@ import pickle
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-from backend.gtfs_loader import load_active_feed, get_routes_search_index
 from backend.gtfs_updater import update_feed, get_feed_status
+from backend.feed_postgis import load_active_feed
 from backend.pattern_builder import PatternBuilder, RoutePattern
 from backend.graph_builder import (
     GraphBuilder,
@@ -47,14 +47,6 @@ from backend.api_models import (
     GeocodeResult,
 )
 from backend.config import GRAPH_CACHE, GRAPH_CACHE_DIR
-from backend.sqlite_db import (
-    get_route_graph_blob,
-    save_route_graph_blob,
-    get_route_graph_v2,
-    get_route_graphs_v2_for_route,
-    get_pattern_record,
-    get_pattern_stops,
-)
 from backend.area_search import find_routes_in_polygon
 from backend import db_access as db_access_module
 from backend.service_calendar import ServiceCalendar
@@ -366,8 +358,8 @@ def graph_build(req: GraphBuildRequest):
     except (RuntimeError, Exception):
         pass
 
-    feed = load_active_feed()
-    feed_version = feed.version_id
+    feed = None  # SQLite/GTFS loader removed; always build from PostGIS paths now.
+    feed_version = "postgis-active"
     key = _graph_cache_key(
         feed_version=feed_version,
         route_id=req.route_id,
@@ -393,226 +385,7 @@ def graph_build(req: GraphBuildRequest):
             feed_version=feed_version,
         )
 
-    # 2) Try compact v2 SQLite-backed cache (fast path)
-    requested_direction = req.direction_id or ""
-    v2_row = get_route_graph_v2(
-        feed_version=feed_version,
-        route_id=req.route_id,
-        direction_id=requested_direction,
-        date_ymd=date_str,
-        pretty_osm=req.pretty_osm,
-    )
-
-    # If no exact direction match and no direction was specified by the caller,
-    # fall back to any precomputed direction for this route/date and pick the
-    # most frequent pattern.
-    if v2_row is None and not req.direction_id:
-        candidates = get_route_graphs_v2_for_route(
-            feed_version=feed_version,
-            route_id=req.route_id,
-            date_ymd=date_str,
-            pretty_osm=req.pretty_osm,
-        )
-        if len(candidates) == 1:
-            v2_row = candidates[0]
-        elif len(candidates) > 1:
-            best = None
-            best_freq = -1
-            for row in candidates:
-                pid = row.get("pattern_id") or ""
-                dir_id = row.get("direction_id") or ""
-                meta = get_pattern_record(
-                    feed_version=feed_version,
-                    route_id=req.route_id,
-                    direction_id=dir_id,
-                    date_ymd=date_str,
-                    pattern_id=pid,
-                )
-                freq = int(meta.get("frequency") or 0) if meta else 0
-                if freq > best_freq:
-                    best_freq = freq
-                    best = row
-            if best is not None:
-                v2_row = best
-
-    if v2_row is not None:
-        # Reconstruct lightweight cache entry so /graph/geojson and /detour
-        # can operate without a full rebuild.
-        pattern_id = v2_row.get("pattern_id") or ""
-        edge_count = int(v2_row.get("edge_count") or 0)
-        dir_id = v2_row.get("direction_id") or ""
-
-        # Look up pattern metadata and ordered stops.
-        pat_meta = get_pattern_record(
-            feed_version=feed_version,
-            route_id=req.route_id,
-            direction_id=dir_id,
-            date_ymd=date_str,
-            pattern_id=pattern_id,
-        )
-        if pat_meta is None:
-            # If metadata missing, fall back to slow path.
-            raise HTTPException(status_code=500, detail="Pattern metadata missing in v2 cache.")
-
-        used_shape = bool(pat_meta.get("used_shape"))
-        frequency = int(pat_meta.get("frequency") or 0)
-        repr_trip_id = pat_meta.get("repr_trip_id")
-        repr_shape_id = pat_meta.get("repr_shape_id")
-
-        stops_meta = get_pattern_stops(feed_version=feed_version, pattern_id=pattern_id)
-        stop_ids = [s["stop_id"] for s in stops_meta]
-
-        # Rebuild a minimal RoutePattern object.
-        pattern = RoutePattern(
-            pattern_id=pattern_id,
-            route_id=req.route_id,
-            direction_id=dir_id or None,
-            stop_ids=stop_ids,
-            frequency=frequency,
-            representative_trip_id=repr_trip_id or "",
-            representative_shape_id=repr_shape_id,
-        )
-
-        # Decode adjacency arrays from blobs.
-        from array import array
-
-        u_arr = array("I")
-        v_arr = array("I")
-        w_arr = array("f")
-        u_blob = v2_row.get("u_idx_blob") or b""
-        v_blob = v2_row.get("v_idx_blob") or b""
-        w_blob = v2_row.get("w_s_blob") or b""
-        u_arr.frombytes(u_blob)
-        v_arr.frombytes(v_blob)
-        w_arr.frombytes(w_blob)
-
-        # Build a minimal NetworkX graph so existing detour logic keeps working.
-        import networkx as nx
-        from shapely.geometry import LineString
-
-        g = nx.DiGraph()
-        # Add nodes with coordinates and pattern frequency so A* can slightly
-        # prefer more frequent lines when multiple detours have similar time.
-        for s in stops_meta:
-            sid = s["stop_id"]
-            g.add_node(
-                sid,
-                stop_id=sid,
-                stop_name=s.get("name"),
-                lat=float(s["lat"]),
-                lon=float(s["lon"]),
-                frequency=frequency,
-            )
-
-        # Map stop indices to ids.
-        idx_to_sid = [s["stop_id"] for s in stops_meta]
-
-        edge_geoms: Dict[Tuple[str, str], any] = {}
-        for i in range(min(len(u_arr), len(v_arr), len(w_arr))):
-            ui = u_arr[i]
-            vi = v_arr[i]
-            if ui >= len(idx_to_sid) or vi >= len(idx_to_sid):
-                continue
-            a = idx_to_sid[ui]
-            b = idx_to_sid[vi]
-            w = float(w_arr[i])
-
-            sa = next((s for s in stops_meta if s["stop_id"] == a), None)
-            sb = next((s for s in stops_meta if s["stop_id"] == b), None)
-            if not sa or not sb:
-                continue
-            lat1, lon1 = float(sa["lat"]), float(sa["lon"])
-            lat2, lon2 = float(sb["lat"]), float(sb["lon"])
-
-            # Simple straight-line geometry between stops (adequate for blockage UI
-            # when combined with pattern_polyline for display).
-            geom = LineString([(lon1, lat1), (lon2, lat2)])
-            edge_geoms[(a, b)] = type("EdgeGeometry", (), {"from_stop_id": a, "to_stop_id": b, "linestring": geom})()
-
-            g.add_edge(
-                a,
-                b,
-                weight=w,
-                travel_time_s=w,
-                distance_m=0.0,
-            )
-
-        # Optional snapped pattern geometry. Since v2 no longer stores a full
-        # pattern polyline, we recompute OSM-snapped geometry on demand when
-        # pretty_osm is requested so the route sticks to the actual roads.
-        snapped_geom = None
-        used_osm_snapping = False
-        if req.pretty_osm:
-            try:
-                osm_res = map_match_pattern(
-                    pattern_geom=_merge_edge_geometries(edge_geoms),
-                    edge_geometries=edge_geoms,
-                )
-                used_osm_snapping = osm_res.used_osm
-                snapped_geom = osm_res.snapped_pattern_geom
-                # Replace edge geometries with snapped versions for display.
-                edge_geoms = osm_res.snapped_edges
-            except Exception:
-                # If OSRM/map matching fails, we silently fall back to straight
-                # segments between stops.
-                used_osm_snapping = False
-                snapped_geom = None
-
-        cache_entry = {
-            "graph": g,
-            "edge_geometries": edge_geoms,
-            "pattern": pattern,
-            "used_shape": used_shape,
-            "used_osm_snapping": used_osm_snapping,
-            "snapped_pattern_geom": snapped_geom,
-            "date": date_str,
-        }
-        GRAPH_CACHE[key] = cache_entry
-
-        example_stops = stop_ids[:5]
-        return GraphBuildResponse(
-            pattern_id=pattern_id,
-            stop_count=len(stop_ids),
-            edge_count=edge_count,
-            used_shape=used_shape,
-            used_osm_snapping=bool(v2_row.get("pattern_polyline_osm")),
-            example_stop_ids=example_stops,
-            feed_version=feed_version,
-        )
-
-    # 3) Try legacy SQLite-backed pickled cache
-    try:
-        blob = get_route_graph_blob(
-            feed_version=feed_version,
-            route_id=req.route_id,
-            direction_id=req.direction_id or "",
-            date_ymd=date_str,
-            pretty_osm=req.pretty_osm,
-        )
-    except FileNotFoundError:
-        blob = None
-    if blob:
-        try:
-            cached = pickle.loads(blob)
-            GRAPH_CACHE[key] = cached
-            pat: RoutePattern = cached["pattern"]
-            edge_geoms = cached["edge_geometries"]
-            used_shape = cached["used_shape"]
-            used_osm = cached.get("used_osm_snapping", False)
-            return GraphBuildResponse(
-                pattern_id=pat.pattern_id,
-                stop_count=len(pat.stop_ids),
-                edge_count=len(edge_geoms),
-                used_shape=used_shape,
-                used_osm_snapping=used_osm,
-                example_stop_ids=pat.stop_ids[:5],
-                feed_version=feed_version,
-            )
-        except Exception:
-            # If DB cache is corrupt or incompatible, ignore and rebuild.
-            pass
-
-    # 4) Build from scratch and persist to memory + disk
+    # 2) Build from scratch and persist to memory + PostGIS cache
     patterns_builder = PatternBuilder(feed)
     patterns = patterns_builder.build_patterns_for_route(
         route_id=req.route_id,
