@@ -31,26 +31,32 @@ class PatternBuilder:
         direction_id: Optional[str],
         yyyymmdd: str,
         max_trips: Optional[int] = None,
+        use_all_trips: bool = False,
+        stop_times_preloaded: Optional[Dict[str, List[Dict]]] = None,
     ) -> Dict[str, RoutePattern]:
-        active_services: Set[str] = self.calendar.active_service_ids_for_date(yyyymmdd)
+        if use_all_trips:
+            active_services = None  # no filter: use every trip for this route/direction
+        else:
+            active_services = self.calendar.active_service_ids_for_date(yyyymmdd)
 
         trips = [
             t
             for t in self.feed.trips
             if t.get("route_id") == route_id
             and (direction_id is None or t.get("direction_id") == str(direction_id))
-            and t.get("service_id") in active_services
+            and (active_services is None or t.get("service_id") in active_services)
         ]
 
         if max_trips is not None:
             trips = trips[:max_trips]
 
-        # Build stop_times index only for the relevant trips of this route/date,
-        # using SQLite to fetch stop_times per trip.
-        stop_times_by_trip: Dict[str, List[Dict]] = defaultdict(list)
-        for trip in trips:
-            trip_id = trip["trip_id"]
-            stop_times_by_trip[trip_id] = get_stop_times_for_trip(trip_id)
+        if stop_times_preloaded is not None:
+            stop_times_by_trip = {t["trip_id"]: stop_times_preloaded.get(t["trip_id"], []) for t in trips}
+        else:
+            stop_times_by_trip = {}
+            for trip in trips:
+                trip_id = trip["trip_id"]
+                stop_times_by_trip[trip_id] = get_stop_times_for_trip(trip_id)
 
         patterns: Dict[str, List[Tuple[str, str, Optional[str]]]] = defaultdict(list)
 

@@ -17,7 +17,7 @@ from backend.graph_builder import (
     pattern_stop_node_id,
     parse_pattern_stop_node_id,
 )
-from backend.osm_pretty import map_match_pattern
+from backend.osm_pretty import map_match_pattern, map_match_coordinates
 from backend.router_core import astar_route, collect_path_geojson, compute_blocked_edges
 from backend.detour_graph import build_detour_graph
 from backend.osm_detour import route_avoiding_polygon
@@ -247,206 +247,131 @@ def graph_build(req: GraphBuildRequest):
         meta = db_access_module.get_pattern_for_route(
             req.route_id, dir_param, date_str
         )
-        if meta is not None:
-            feed_version = f"postgis-{feed_id}"
-            key = _graph_cache_key(
+        if meta is None:
+            for fallback_dir in (None, "0", "1"):
+                if fallback_dir == dir_param:
+                    continue
+                meta = db_access_module.get_pattern_for_route(
+                    req.route_id, fallback_dir, date_str
+                )
+                if meta is not None:
+                    break
+        if meta is None:
+            raise HTTPException(
+                status_code=404,
+                detail="No pattern found for this route/date. Run POST /feed/update to build patterns.",
+            )
+        feed_version = f"postgis-{feed_id}"
+        key = _graph_cache_key(
+            feed_version=feed_version,
+            route_id=req.route_id,
+            direction_id=req.direction_id,
+            date=date_str,
+            pretty_osm=req.pretty_osm,
+        )
+        cached = GRAPH_CACHE.get(key)
+        if cached is not None:
+            pat = cached["pattern"]
+            return GraphBuildResponse(
+                pattern_id=pat.pattern_id,
+                stop_count=len(pat.stop_ids),
+                edge_count=len(cached["edge_geometries"]),
+                used_shape=cached["used_shape"],
+                used_osm_snapping=cached.get("used_osm_snapping", False),
+                example_stop_ids=pat.stop_ids[:5],
                 feed_version=feed_version,
+            )
+        # Try PostGIS route_graph_cache keyed by per-route signature.
+        try:
+            sig_hash = db_access_module.compute_route_signature(req.route_id, req.direction_id)
+            cached_blob = db_access_module.get_cached_route_graph_pg(
+                feed_id=feed_id,
                 route_id=req.route_id,
                 direction_id=req.direction_id,
-                date=date_str,
+                date_ymd=date_str,
                 pretty_osm=req.pretty_osm,
+                route_sig_hash=sig_hash,
             )
-            cached = GRAPH_CACHE.get(key)
-            if cached is not None:
+        except Exception:
+            sig_hash = None
+            cached_blob = None
+
+        if cached_blob:
+            try:
+                cached = pickle.loads(cached_blob)
+                GRAPH_CACHE[key] = cached
                 pat = cached["pattern"]
+                edge_geoms = cached["edge_geometries"]
+                used_shape = cached["used_shape"]
+                used_osm = cached.get("used_osm_snapping", False)
                 return GraphBuildResponse(
                     pattern_id=pat.pattern_id,
                     stop_count=len(pat.stop_ids),
-                    edge_count=len(cached["edge_geometries"]),
-                    used_shape=cached["used_shape"],
-                    used_osm_snapping=cached.get("used_osm_snapping", False),
+                    edge_count=len(edge_geoms),
+                    used_shape=used_shape,
+                    used_osm_snapping=used_osm,
                     example_stop_ids=pat.stop_ids[:5],
                     feed_version=feed_version,
                 )
-            # Try PostGIS route_graph_cache keyed by per-route signature.
+            except Exception:
+                pass
+
+        build_result = build_graph_for_pattern_from_postgis(meta, date_str)
+        edge_geoms = build_result.edge_geometries
+        used_osm = False
+        snapped_pattern_geom = None
+        if req.pretty_osm:
             try:
-                sig_hash = db_access_module.compute_route_signature(req.route_id, req.direction_id)
-                cached_blob = db_access_module.get_cached_route_graph_pg(
+                osm_res = map_match_pattern(
+                    pattern_geom=_merge_edge_geometries(edge_geoms),
+                    edge_geometries=edge_geoms,
+                )
+                used_osm = osm_res.used_osm
+                snapped_pattern_geom = osm_res.snapped_pattern_geom
+                edge_geoms = osm_res.snapped_edges
+            except Exception:
+                pass
+        cache_entry = {
+            "graph": build_result.graph,
+            "edge_geometries": edge_geoms,
+            "pattern": build_result.pattern,
+            "used_shape": build_result.used_shape,
+            "used_osm_snapping": used_osm,
+            "snapped_pattern_geom": snapped_pattern_geom,
+            "date": date_str,
+        }
+        GRAPH_CACHE[key] = cache_entry
+        if sig_hash:
+            try:
+                db_access_module.save_route_graph_pg(
                     feed_id=feed_id,
                     route_id=req.route_id,
                     direction_id=req.direction_id,
                     date_ymd=date_str,
                     pretty_osm=req.pretty_osm,
                     route_sig_hash=sig_hash,
+                    graph_blob=pickle.dumps(cache_entry),
                 )
             except Exception:
-                sig_hash = None
-                cached_blob = None
+                pass
 
-            if cached_blob:
-                try:
-                    cached = pickle.loads(cached_blob)
-                    GRAPH_CACHE[key] = cached
-                    pat: RoutePattern = cached["pattern"]
-                    edge_geoms = cached["edge_geometries"]
-                    used_shape = cached["used_shape"]
-                    used_osm = cached.get("used_osm_snapping", False)
-                    return GraphBuildResponse(
-                        pattern_id=pat.pattern_id,
-                        stop_count=len(pat.stop_ids),
-                        edge_count=len(edge_geoms),
-                        used_shape=used_shape,
-                        used_osm_snapping=used_osm,
-                        example_stop_ids=pat.stop_ids[:5],
-                        feed_version=feed_version,
-                    )
-                except Exception:
-                    # Fall through to rebuild on cache decode errors.
-                    pass
-
-            build_result = build_graph_for_pattern_from_postgis(meta, date_str)
-            edge_geoms = build_result.edge_geometries
-            used_osm = False
-            snapped_pattern_geom = None
-            if req.pretty_osm:
-                try:
-                    osm_res = map_match_pattern(
-                        pattern_geom=_merge_edge_geometries(edge_geoms),
-                        edge_geometries=edge_geoms,
-                    )
-                    used_osm = osm_res.used_osm
-                    snapped_pattern_geom = osm_res.snapped_pattern_geom
-                    edge_geoms = osm_res.snapped_edges
-                except Exception:
-                    pass
-            cache_entry = {
-                "graph": build_result.graph,
-                "edge_geometries": edge_geoms,
-                "pattern": build_result.pattern,
-                "used_shape": build_result.used_shape,
-                "used_osm_snapping": used_osm,
-                "snapped_pattern_geom": snapped_pattern_geom,
-                "date": date_str,
-            }
-            GRAPH_CACHE[key] = cache_entry
-            # Persist to PostGIS graph cache keyed by route signature.
-            if sig_hash:
-                try:
-                    db_access_module.save_route_graph_pg(
-                        feed_id=feed_id,
-                        route_id=req.route_id,
-                        direction_id=req.direction_id,
-                        date_ymd=date_str,
-                        pretty_osm=req.pretty_osm,
-                        route_sig_hash=sig_hash,
-                        graph_blob=pickle.dumps(cache_entry),
-                    )
-                except Exception:
-                    # Cache write failures should not break the request.
-                    pass
-
-            pat = build_result.pattern
-            return GraphBuildResponse(
-                pattern_id=pat.pattern_id,
-                stop_count=len(pat.stop_ids),
-                edge_count=len(edge_geoms),
-                used_shape=build_result.used_shape,
-                used_osm_snapping=used_osm,
-                example_stop_ids=pat.stop_ids[:5],
-                feed_version=feed_version,
-            )
-    except (RuntimeError, Exception):
-        pass
-
-    feed = None  # SQLite/GTFS loader removed; always build from PostGIS paths now.
-    feed_version = "postgis-active"
-    key = _graph_cache_key(
-        feed_version=feed_version,
-        route_id=req.route_id,
-        direction_id=req.direction_id,
-        date=date_str,
-        pretty_osm=req.pretty_osm,
-    )
-
-    # 1) Try in-memory cache (skip both pattern building and graph building)
-    cached = GRAPH_CACHE.get(key)
-    if cached is not None:
-        pat: RoutePattern = cached["pattern"]
-        edge_geoms = cached["edge_geometries"]
-        used_shape = cached["used_shape"]
-        used_osm = cached.get("used_osm_snapping", False)
+        pat = build_result.pattern
         return GraphBuildResponse(
             pattern_id=pat.pattern_id,
             stop_count=len(pat.stop_ids),
             edge_count=len(edge_geoms),
-            used_shape=used_shape,
+            used_shape=build_result.used_shape,
             used_osm_snapping=used_osm,
             example_stop_ids=pat.stop_ids[:5],
             feed_version=feed_version,
         )
-
-    # 2) Build from scratch and persist to memory + PostGIS cache
-    patterns_builder = PatternBuilder(feed)
-    patterns = patterns_builder.build_patterns_for_route(
-        route_id=req.route_id,
-        direction_id=req.direction_id,
-        yyyymmdd=date_str,
-        max_trips=req.max_trips,
-    )
-    if not patterns:
-        raise HTTPException(status_code=404, detail="No patterns found for route/date")
-
-    chosen = patterns_builder.pick_most_frequent_pattern(patterns)
-    assert chosen is not None
-    graph_builder = GraphBuilder(feed)
-    build_result = graph_builder.build_graph_for_pattern(chosen)
-
-    used_osm = False
-    snapped_pattern_geom = None
-
-    if req.pretty_osm:
-        osm_res = map_match_pattern(
-            pattern_geom=_merge_edge_geometries(build_result.edge_geometries),
-            edge_geometries=build_result.edge_geometries,
+    except HTTPException:
+        raise
+    except (RuntimeError, Exception) as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Graph build failed: {e!s}",
         )
-        used_osm = osm_res.used_osm
-        snapped_pattern_geom = osm_res.snapped_pattern_geom
-        edge_geoms = osm_res.snapped_edges
-    else:
-        edge_geoms = build_result.edge_geometries
-
-    cache_entry = {
-        "graph": build_result.graph,
-        "edge_geometries": edge_geoms,
-        "pattern": chosen,
-        "used_shape": build_result.used_shape,
-        "used_osm_snapping": used_osm,
-        "snapped_pattern_geom": snapped_pattern_geom,
-        "date": date_str,
-    }
-    GRAPH_CACHE[key] = cache_entry
-    try:
-        save_route_graph_blob(
-            feed_version=feed_version,
-            route_id=req.route_id,
-            direction_id=req.direction_id or "",
-            date_ymd=date_str,
-            pretty_osm=req.pretty_osm,
-            blob=pickle.dumps(cache_entry),
-        )
-    except Exception:
-        # DB cache failures should not break the request.
-        pass
-
-    return GraphBuildResponse(
-        pattern_id=chosen.pattern_id,
-        stop_count=len(chosen.stop_ids),
-        edge_count=len(edge_geoms),
-        used_shape=build_result.used_shape,
-        used_osm_snapping=used_osm,
-        example_stop_ids=chosen.stop_ids[:5],
-        feed_version=feed_version,
-    )
 
 
 def _merge_edge_geometries(edge_geometries: Dict[Tuple[str, str], any]):
@@ -942,11 +867,15 @@ def detour_osm(req: DetourRequest):
                     },
                 }
             )
-    # OSM detour
+    # OSM detour: optionally snap to OSRM road graph so the line matches the rest of the map
+    detour_coords = list(osm.coordinates)
+    snapped = map_match_coordinates(detour_coords)
+    if snapped is not None and len(snapped.coords) >= 2:
+        detour_coords = list(snapped.coords)
     features.append(
         {
             "type": "Feature",
-            "geometry": {"type": "LineString", "coordinates": list(osm.coordinates)},
+            "geometry": {"type": "LineString", "coordinates": detour_coords},
             "properties": {"kind": "osm_detour"},
         }
     )
@@ -1140,6 +1069,82 @@ def _parse_hhmm_to_seconds(value: str) -> int:
         return 0
 
 
+def _segment_line_from_edges(
+    pattern_id: str,
+    stop_ids: List[str],
+    i_first: int,
+    i_last: int,
+    edge_geometries: Dict[Tuple[str, str], any],
+):
+    """Build a single LineString for the route segment from edge i_first-1 through i_last (inclusive)."""
+    from shapely.geometry import LineString
+    from shapely.ops import linemerge
+
+    parts = []
+    for i in range(i_first - 1, i_last + 1):
+        if i + 1 >= len(stop_ids):
+            break
+        node_u = pattern_stop_node_id(pattern_id, stop_ids[i], i)
+        node_v = pattern_stop_node_id(pattern_id, stop_ids[i + 1], i + 1)
+        eg = edge_geometries.get((node_u, node_v))
+        if eg and eg.linestring and len(eg.linestring.coords) >= 2:
+            parts.append(eg.linestring)
+    if not parts:
+        return None
+    merged = linemerge(parts) if len(parts) > 1 else parts[0]
+    if merged.geom_type == "LineString":
+        return merged
+    if merged.geom_type == "MultiLineString" and len(merged.geoms) > 0:
+        return merged.geoms[0]
+    return None
+
+
+def _entry_exit_points_from_geometry(
+    segment_line,
+    blockage_polygon,
+) -> Optional[Tuple[Tuple[float, float], Tuple[float, float]]]:
+    """
+    Get (from_pt, to_pt) where the route line crosses the blockage:
+    from_pt = last point before entering, to_pt = first point after leaving (lon, lat).
+    """
+    if not segment_line or segment_line.is_empty or segment_line.length == 0:
+        return None
+    try:
+        outside = segment_line.difference(blockage_polygon)
+    except Exception:
+        return None
+    if outside.is_empty:
+        return None
+    from shapely.geometry import LineString
+
+    coords_start = list(segment_line.coords)
+    if not coords_start:
+        return None
+    first_route_pt = coords_start[0]
+    last_route_pt = coords_start[-1]
+
+    if outside.geom_type == "LineString":
+        return (outside.coords[0], outside.coords[-1])
+    if outside.geom_type != "MultiLineString" or len(outside.geoms) < 2:
+        return None
+    # Identify which segment is "before" (contains route start) and "after" (contains route end).
+    dist_to_start = [
+        (part, (part.coords[0][0] - first_route_pt[0]) ** 2 + (part.coords[0][1] - first_route_pt[1]) ** 2)
+        for part in outside.geoms if part.coords
+    ]
+    dist_to_end = [
+        (part, (part.coords[-1][0] - last_route_pt[0]) ** 2 + (part.coords[-1][1] - last_route_pt[1]) ** 2)
+        for part in outside.geoms if part.coords
+    ]
+    if not dist_to_start or not dist_to_end:
+        return None
+    before = min(dist_to_start, key=lambda x: x[1])[0]
+    after = min(dist_to_end, key=lambda x: x[1])[0]
+    from_pt = before.coords[-1]
+    to_pt = after.coords[0]
+    return (from_pt, to_pt)
+
+
 def _build_replaced_segment_geojson(
     pattern_id: str,
     stop_ids: list[str],
@@ -1285,16 +1290,37 @@ def _compute_route_detour_by_area(
 
     # Optional: use Valhalla OSM detour instead of GTFS multi-route graph.
     if use_osm_detour and VALHALLA_URL:
-        # Look up stop coordinates from feed.stops.
-        stops_by_id = {s.get("stop_id"): s for s in getattr(feed, "stops", [])}
-        sb = stops_by_id.get(stop_before)
-        sa = stops_by_id.get(stop_after)
-        if sb and sa:
+        from shapely.geometry import shape as _shape
+
+        blockage_geom = _ensure_geometry(blockage_geojson)
+        g_block = _shape(blockage_geom)
+
+        # Prefer geometry-based entry/exit: where the route line crosses the blockage (not stops).
+        segment_line = _segment_line_from_edges(
+            pid, stop_ids, i_first, i_last, build_result.edge_geometries
+        )
+        from_pt = to_pt = None
+        if segment_line:
+            pts = _entry_exit_points_from_geometry(segment_line, g_block)
+            if pts:
+                from_pt, to_pt = pts
+
+        # Fallback: use boundary stops (no walking to "first stop outside").
+        if from_pt is None or to_pt is None:
+            stops_by_id = {s.get("stop_id"): s for s in getattr(feed, "stops", [])}
+            sb = stops_by_id.get(stop_before)
+            sa = stops_by_id.get(stop_after)
+            if sb and sa:
+                try:
+                    from_pt = (float(sb.get("stop_lon")), float(sb.get("stop_lat")))
+                    to_pt = (float(sa.get("stop_lon")), float(sa.get("stop_lat")))
+                except (TypeError, ValueError):
+                    pass
+
+        if from_pt is not None and to_pt is not None:
             try:
-                lat_b = float(sb.get("stop_lat"))
-                lon_b = float(sb.get("stop_lon"))
-                lat_a = float(sa.get("stop_lat"))
-                lon_a = float(sa.get("stop_lon"))
+                lon_b, lat_b = from_pt[0], from_pt[1]
+                lon_a, lat_a = to_pt[0], to_pt[1]
                 osm = route_avoiding_polygon(
                     lon_b,
                     lat_b,
@@ -1303,8 +1329,10 @@ def _compute_route_detour_by_area(
                     blockage_geojson,
                 )
                 if osm.success and osm.coordinates:
-                    from shapely.geometry import mapping as _mapping
-
+                    detour_coords = list(osm.coordinates)
+                    snapped = map_match_coordinates(detour_coords)
+                    if snapped is not None and len(snapped.coords) >= 2:
+                        detour_coords = list(snapped.coords)
                     detour_geojson = {
                         "type": "FeatureCollection",
                         "features": [
@@ -1312,7 +1340,7 @@ def _compute_route_detour_by_area(
                                 "type": "Feature",
                                 "geometry": {
                                     "type": "LineString",
-                                    "coordinates": list(osm.coordinates),
+                                    "coordinates": detour_coords,
                                 },
                                 "properties": {"kind": "osm_detour"},
                             }
@@ -1340,7 +1368,6 @@ def _compute_route_detour_by_area(
                         error=None,
                     )
             except Exception:
-                # Fall back to GTFS detour graph below.
                 pass
 
     detour_graph_res = build_detour_graph(

@@ -441,15 +441,21 @@ def _edge_travel_time_seconds_postgis(
 def build_graph_for_pattern_from_postgis(
     pattern_meta: "PatternMeta",
     date_ymd: str,
+    pattern_stops: Optional[List[Any]] = None,
+    shape_line: Optional[LineString] = None,
+    stop_times: Optional[List[Dict]] = None,
 ) -> GraphBuildResult:
     """
     Build a direction-aware graph from PostGIS data (patterns, pattern_stops, shapes_lines, stop_times).
-    Returns the same GraphBuildResult structure as GraphBuilder.build_graph_for_pattern.
+    When pattern_stops, shape_line, or stop_times are provided, use them instead of DB calls (for bulk precompute).
     """
     from . import db_access
 
     pid = pattern_meta.pattern_id
-    stops = db_access.get_pattern_stops(pid)
+    if pattern_stops is not None:
+        stops = pattern_stops
+    else:
+        stops = db_access.get_pattern_stops(pid)
     stop_ids = [s.stop_id for s in stops]
     n_stops = len(stop_ids)
     if n_stops < 2:
@@ -465,15 +471,15 @@ def build_graph_for_pattern_from_postgis(
         )
         return GraphBuildResult(graph=g, edge_geometries={}, pattern=pattern, used_shape=False)
 
-    shape_line: Optional[LineString] = None
     shape_pts: Optional[List[Tuple[float, float]]] = None
     shape_cum_m: Optional[List[float]] = None
-    if pattern_meta.repr_shape_id:
+    if shape_line is None and pattern_meta.repr_shape_id:
         shape_line = db_access.get_shape_line(pattern_meta.repr_shape_id)
-        if shape_line is not None and len(list(shape_line.coords)) >= 2:
-            shape_pts, shape_cum_m = _line_to_pts_and_cum_m(shape_line)
+    if shape_line is not None and len(list(shape_line.coords)) >= 2:
+        shape_pts, shape_cum_m = _line_to_pts_and_cum_m(shape_line)
 
-    stop_times = db_access.get_stop_times_for_trip(pattern_meta.repr_trip_id)
+    if stop_times is None:
+        stop_times = db_access.get_stop_times_for_trip(pattern_meta.repr_trip_id)
     shape_dists: Dict[str, float] = {}
     for st in stop_times:
         sid = st.get("stop_id")

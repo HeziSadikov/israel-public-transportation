@@ -76,13 +76,13 @@ def _polygon_to_exclude_rings(blockage_geojson: Dict[str, Any]) -> Optional[List
             if ext and len(ext.coords) >= 3:
                 rings.append([[float(x), float(y)] for x, y in ext.coords])
     elif geom.geom_type == "Point":
-        # Buffer point to a small polygon so roads through it are excluded
-        buf = geom.buffer(1e-4)  # ~10 m
+        # Buffer point to a modest polygon so roads through it are excluded
+        buf = geom.buffer(3e-4)  # ~30 m
         if buf.exterior and len(buf.exterior.coords) >= 3:
             rings.append([[float(x), float(y)] for x, y in buf.exterior.coords])
     elif geom.geom_type == "LineString":
-        # Buffer line to a polygon
-        buf = geom.buffer(1e-4)
+        # Buffer line to a polygon (wider so nearby parallel lanes are excluded)
+        buf = geom.buffer(3e-4)
         if buf.exterior and len(buf.exterior.coords) >= 3:
             rings.append([[float(x), float(y)] for x, y in buf.exterior.coords])
     return rings if rings else None

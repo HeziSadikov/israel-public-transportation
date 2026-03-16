@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Tuple, Optional
+from typing import Dict, List, Tuple, Optional
 
 import httpx
 from shapely.geometry import LineString
@@ -58,4 +58,36 @@ def map_match_pattern(
         snapped_edges=edge_geometries,
         used_osm=True,
     )
+
+
+def map_match_coordinates(
+    coordinates: List[Tuple[float, float]],
+    timeout_s: float = 15.0,
+) -> Optional[LineString]:
+    """
+    Map-match a list of (lon, lat) points via OSRM /match so the line snaps
+    to the road graph. Used to prettify Valhalla detour output so it aligns
+    with the same roads used elsewhere in the app.
+    Returns a LineString or None if OSRM is unavailable or fails.
+    """
+    if not coordinates or len(coordinates) < 2:
+        return None
+    if not OSM_ENGINE_URL or not OSM_ENGINE_URL.strip():
+        return None
+    coords_str = ";".join(f"{lon},{lat}" for lon, lat in coordinates)
+    url = f"{OSM_ENGINE_URL.rstrip('/')}/match/v1/driving/{coords_str}"
+    try:
+        resp = httpx.get(
+            url,
+            params={"geometries": "geojson", "overview": "full"},
+            timeout=timeout_s,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if not data.get("matchings"):
+            return None
+        geom = data["matchings"][0]["geometry"]
+        return LineString(geom["coordinates"])
+    except Exception:
+        return None
 

@@ -14,6 +14,9 @@ feed_versions.active indicates the current GTFS feed.
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
+# Optional[str] for direction_id in tuple keys (route_id, direction_id)
+RouteDirKey = Tuple[str, Optional[str]]
+
 import os
 import hashlib
 import json
@@ -257,6 +260,45 @@ def get_pattern_for_route(
             conn.close()
 
 
+def get_patterns_for_feed(feed_id: int, conn=None) -> Dict[RouteDirKey, PatternMeta]:
+    """Return all patterns for the feed keyed by (route_id, direction_id). One query."""
+    close = False
+    if conn is None:
+        conn = _get_conn()
+        close = True
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT pattern_id, route_id, direction_id, repr_trip_id, repr_shape_id,
+                       stop_ids, frequency, used_shape
+                FROM patterns
+                WHERE feed_id = %s
+                """,
+                (feed_id,),
+            )
+            out: Dict[RouteDirKey, PatternMeta] = {}
+            for row in cur.fetchall():
+                key: RouteDirKey = (
+                    row["route_id"],
+                    None if row["direction_id"] is None else str(row["direction_id"]),
+                )
+                out[key] = PatternMeta(
+                    pattern_id=row["pattern_id"],
+                    route_id=row["route_id"],
+                    direction_id=row["direction_id"],
+                    repr_trip_id=row["repr_trip_id"],
+                    repr_shape_id=row["repr_shape_id"],
+                    stop_ids=list(row["stop_ids"] or []),
+                    frequency=int(row["frequency"] or 0),
+                    used_shape=bool(row["used_shape"]),
+                )
+            return out
+    finally:
+        if close:
+            conn.close()
+
+
 @dataclass
 class StopMeta:
     stop_id: str
@@ -298,6 +340,47 @@ def get_pattern_stops(pattern_id: str, conn=None) -> List[StopMeta]:
             conn.close()
 
 
+def get_pattern_stops_bulk(
+    feed_id: int,
+    pattern_ids: List[str],
+    conn=None,
+) -> Dict[str, List[StopMeta]]:
+    """Load pattern_stops for many pattern_ids in one query. Returns pattern_id -> ordered list of StopMeta."""
+    if not pattern_ids:
+        return {}
+    close = False
+    if conn is None:
+        conn = _get_conn()
+        close = True
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT ps.pattern_id, ps.seq, ps.stop_id, s.name, s.lat, s.lon
+                FROM pattern_stops ps
+                JOIN stops s ON s.feed_id = ps.feed_id AND s.stop_id = ps.stop_id
+                WHERE ps.feed_id = %s AND ps.pattern_id = ANY(%s)
+                ORDER BY ps.pattern_id, ps.seq
+                """,
+                (feed_id, pattern_ids),
+            )
+            out: Dict[str, List[StopMeta]] = {}
+            for row in cur.fetchall():
+                pid = row["pattern_id"]
+                out.setdefault(pid, []).append(
+                    StopMeta(
+                        stop_id=row["stop_id"],
+                        name=row["name"],
+                        lat=float(row["lat"]),
+                        lon=float(row["lon"]),
+                    )
+                )
+            return out
+    finally:
+        if close:
+            conn.close()
+
+
 def get_shape_line(shape_id: str, conn=None) -> Optional[Any]:
     """
     Return the LineString geometry for the given shape_id from shapes_lines.
@@ -324,6 +407,45 @@ def get_shape_line(shape_id: str, conn=None) -> Optional[Any]:
             if not row or not row["wkt"]:
                 return None
             return wkt.loads(str(row["wkt"]))
+    finally:
+        if close:
+            conn.close()
+
+
+def get_shape_lines_bulk(
+    feed_id: int,
+    shape_ids: List[str],
+    conn=None,
+) -> Dict[str, Any]:
+    """Load LineString geometry for many shape_ids in one query. Returns shape_id -> LineString or None."""
+    if not shape_ids:
+        return {}
+    from shapely import wkt
+    close = False
+    if conn is None:
+        conn = _get_conn()
+        close = True
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT shape_id, ST_AsText(geom) AS wkt
+                FROM shapes_lines
+                WHERE feed_id = %s AND shape_id = ANY(%s)
+                """,
+                (feed_id, shape_ids),
+            )
+            out: Dict[str, Any] = {}
+            for row in cur.fetchall():
+                sid = row["shape_id"]
+                if row.get("wkt"):
+                    try:
+                        out[sid] = wkt.loads(str(row["wkt"]))
+                    except Exception:
+                        out[sid] = None
+                else:
+                    out[sid] = None
+            return out
     finally:
         if close:
             conn.close()
@@ -363,6 +485,82 @@ def get_stop_times_for_trip(trip_id: str, conn=None) -> List[Dict[str, Any]]:
     finally:
         if close:
             conn.close()
+
+
+def get_stop_times_bulk(
+    feed_id: int,
+    trip_ids: List[str],
+    conn=None,
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Load stop_times for many trip_ids in one query. Returns trip_id -> ordered list of rows."""
+    if not trip_ids:
+        return {}
+    close = False
+    if conn is None:
+        conn = _get_conn()
+        close = True
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT trip_id, stop_id, stop_sequence, arrival_time, departure_time, shape_dist_traveled
+                FROM stop_times
+                WHERE feed_id = %s AND trip_id = ANY(%s)
+                ORDER BY trip_id, stop_sequence
+                """,
+                (feed_id, trip_ids),
+            )
+            out: Dict[str, List[Dict[str, Any]]] = {}
+            for row in cur.fetchall():
+                tid = row["trip_id"]
+                out.setdefault(tid, []).append({
+                    "stop_id": row["stop_id"],
+                    "stop_sequence": row["stop_sequence"],
+                    "arrival_time": row["arrival_time"],
+                    "departure_time": row["departure_time"],
+                    "shape_dist_traveled": row["shape_dist_traveled"],
+                })
+            return out
+    finally:
+        if close:
+            conn.close()
+
+
+def get_all_stop_times_for_feed(
+    feed_id: int,
+    conn=None,
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Load all stop_times for the feed in one query. Returns trip_id -> ordered list of rows. Use for bulk pattern building."""
+    close = False
+    if conn is None:
+        conn = _get_conn()
+        close = True
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT trip_id, stop_id, stop_sequence, arrival_time, departure_time, shape_dist_traveled
+                FROM stop_times
+                WHERE feed_id = %s
+                ORDER BY trip_id, stop_sequence
+                """,
+                (feed_id,),
+            )
+            out: Dict[str, List[Dict[str, Any]]] = {}
+            for row in cur.fetchall():
+                tid = row["trip_id"]
+                out.setdefault(tid, []).append({
+                    "stop_id": row["stop_id"],
+                    "stop_sequence": row["stop_sequence"],
+                    "arrival_time": row["arrival_time"],
+                    "departure_time": row["departure_time"],
+                    "shape_dist_traveled": row["shape_dist_traveled"],
+                })
+            return out
+    finally:
+        if close:
+            conn.close()
+
 
 def get_stops_in_bounds_pg(
     min_lat: float,
@@ -494,132 +692,124 @@ def get_routes_serving_stop_pg(
     max_results: int = 100,
 ) -> List[Dict[str, Any]]:
     """
-    PostGIS-backed version of get_routes_serving_stop:
-    returns routes that serve the given stop in the time window on the given date.
+    Routes that serve the given stop in the time window on the given date.
+    Implemented as a single SQL query (SQL-heavy): active services, time parsing,
+    and aggregation done in Postgres.
     """
-    from backend.service_calendar import parse_gtfs_time_to_seconds
-
+    date_ymd = int(yyyymmdd)
     close = False
     conn = _get_conn()
     close = True
     try:
         feed_id = get_active_feed_id(conn)
-        active_services = set(_get_active_service_ids_for_date_pg(yyyymmdd, conn))
-        if not active_services:
-            return []
-
         with conn.cursor() as cur:
             cur.execute(
                 """
+                WITH dow AS (
+                    SELECT EXTRACT(DOW FROM to_date(%s::text, 'YYYYMMDD'))::int AS d
+                ),
+                calendar_services AS (
+                    SELECT c.service_id
+                    FROM calendar c, dow
+                    WHERE c.feed_id = %s
+                      AND %s BETWEEN c.start_date AND c.end_date
+                      AND (
+                        (d = 0 AND c.sunday = 1)
+                        OR (d = 1 AND c.monday = 1)
+                        OR (d = 2 AND c.tuesday = 1)
+                        OR (d = 3 AND c.wednesday = 1)
+                        OR (d = 4 AND c.thursday = 1)
+                        OR (d = 5 AND c.friday = 1)
+                        OR (d = 6 AND c.saturday = 1)
+                      )
+                ),
+                add_services AS (
+                    SELECT service_id FROM calendar_dates
+                    WHERE feed_id = %s AND date = %s AND exception_type = 1
+                ),
+                remove_services AS (
+                    SELECT service_id FROM calendar_dates
+                    WHERE feed_id = %s AND date = %s AND exception_type = 2
+                ),
+                active_services AS (
+                    (SELECT service_id FROM calendar_services
+                     UNION
+                     SELECT service_id FROM add_services)
+                    EXCEPT
+                    SELECT service_id FROM remove_services
+                ),
+                stop_sec AS (
+                    SELECT
+                        st.trip_id,
+                        t.route_id,
+                        t.direction_id,
+                        (split_part(trim(coalesce(st.departure_time, st.arrival_time, '')), ':', 1)::int * 3600
+                         + split_part(trim(coalesce(st.departure_time, st.arrival_time, '')), ':', 2)::int * 60
+                         + coalesce(nullif(trim(split_part(trim(coalesce(st.departure_time, st.arrival_time, '0:0:0')), ':', 3)), ''), '0')::int
+                        ) AS sec
+                    FROM stop_times st
+                    JOIN trips t ON t.feed_id = st.feed_id AND t.trip_id = st.trip_id
+                    JOIN active_services a ON a.service_id = t.service_id
+                    WHERE st.feed_id = %s
+                      AND st.stop_id = %s
+                      AND length(trim(coalesce(st.departure_time, st.arrival_time, ''))) >= 5
+                ),
+                in_window AS (
+                    SELECT route_id, direction_id, min(sec) AS first_sec, max(sec) AS last_sec
+                    FROM stop_sec
+                    WHERE sec BETWEEN %s AND %s
+                    GROUP BY route_id, direction_id
+                )
                 SELECT
-                  st.trip_id,
-                  st.departure_time,
-                  st.arrival_time,
-                  t.route_id,
-                  t.direction_id,
-                  t.service_id
-                FROM stop_times st
-                JOIN trips t
-                  ON t.feed_id = st.feed_id AND t.trip_id = st.trip_id
-                WHERE st.feed_id = %s
-                  AND st.stop_id = %s
+                    i.route_id,
+                    i.direction_id,
+                    i.first_sec,
+                    i.last_sec,
+                    r.short_name,
+                    r.long_name,
+                    r.agency_id,
+                    a.name AS agency_name
+                FROM in_window i
+                JOIN routes r ON r.feed_id = %s AND r.route_id = i.route_id
+                LEFT JOIN agencies a ON a.feed_id = r.feed_id AND a.agency_id = r.agency_id
+                ORDER BY r.short_name, i.route_id, i.direction_id
+                LIMIT %s
                 """,
-                (feed_id, stop_id),
+                (
+                    yyyymmdd,
+                    feed_id,
+                    date_ymd,
+                    feed_id,
+                    date_ymd,
+                    feed_id,
+                    date_ymd,
+                    feed_id,
+                    stop_id,
+                    start_sec,
+                    end_sec,
+                    feed_id,
+                    max_results,
+                ),
             )
-            rows = [dict(r) for r in cur.fetchall()]
-
-        seen: Dict[Tuple[str, Optional[str]], Dict[str, Any]] = {}
-
-        for st in rows:
-            service_id = st.get("service_id")
-            if service_id not in active_services:
-                continue
-            t_str = (st.get("departure_time") or st.get("arrival_time") or "").strip()
-            if not t_str:
-                continue
-            try:
-                t_sec = parse_gtfs_time_to_seconds(t_str)
-            except Exception:
-                continue
-            if t_sec < start_sec or t_sec > end_sec:
-                continue
-
-            route_id = st.get("route_id")
-            if not route_id:
-                continue
-            dir_val = st.get("direction_id")
+            rows = cur.fetchall()
+        results = []
+        for r in rows:
+            dir_val = r["direction_id"]
             direction_id = None if dir_val is None else str(dir_val)
-            key = (route_id, direction_id)
-
-            if key in seen:
-                entry = seen[key]
-                if t_sec < entry["first_time_sec"]:
-                    entry["first_time_sec"] = t_sec
-                if t_sec > entry["last_time_sec"]:
-                    entry["last_time_sec"] = t_sec
-            else:
-                seen[key] = {
-                    "route_id": route_id,
-                    "direction_id": direction_id,
-                    "first_time_sec": t_sec,
-                    "last_time_sec": t_sec,
-                }
-
-        if not seen:
-            return []
-
-        # Fetch route/agency metadata for the seen routes.
-        route_ids = [k[0] for k in seen.keys()]
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT
-                  r.route_id,
-                  r.short_name,
-                  r.long_name,
-                  r.agency_id,
-                  a.name AS agency_name
-                FROM routes r
-                LEFT JOIN agencies a
-                  ON a.feed_id = r.feed_id AND a.agency_id = r.agency_id
-                WHERE r.feed_id = %s
-                  AND r.route_id = ANY(%s)
-                """,
-                (feed_id, route_ids),
-            )
-            meta_rows = {r["route_id"]: dict(r) for r in cur.fetchall()}
-
-        def _fmt_time(sec: int) -> str:
-            h = sec // 3600
-            m = (sec % 3600) // 60
-            return f"{h:02d}:{m:02d}"
-
-        results: List[Dict[str, Any]] = []
-        for (route_id, direction_id), entry in seen.items():
-            m = meta_rows.get(route_id, {})
-            first_sec = entry["first_time_sec"]
-            last_sec = entry["last_time_sec"]
+            first_sec = int(r["first_sec"])
+            last_sec = int(r["last_sec"])
             results.append(
                 {
-                    "route_id": route_id,
+                    "route_id": r["route_id"],
                     "direction_id": direction_id,
-                    "route_short_name": m.get("short_name"),
-                    "route_long_name": m.get("long_name"),
-                    "agency_id": m.get("agency_id"),
-                    "agency_name": m.get("agency_name"),
-                    "first_time": _fmt_time(first_sec),
-                    "last_time": _fmt_time(last_sec),
+                    "route_short_name": r["short_name"],
+                    "route_long_name": r["long_name"],
+                    "agency_id": r["agency_id"],
+                    "agency_name": r["agency_name"],
+                    "first_time": f"{first_sec // 3600:02d}:{(first_sec % 3600) // 60:02d}",
+                    "last_time": f"{last_sec // 3600:02d}:{(last_sec % 3600) // 60:02d}",
                 }
             )
-            if len(results) >= max_results:
-                break
-
-        results.sort(
-            key=lambda x: (
-                x.get("route_short_name") or x["route_id"],
-                x.get("direction_id") or "",
-            )
-        )
         return results
     finally:
         if close:
@@ -697,6 +887,90 @@ def compute_route_signature(
         }
         raw = json.dumps(payload, sort_keys=True).encode("utf-8")
         return hashlib.sha256(raw).hexdigest()
+    finally:
+        if close:
+            conn.close()
+
+
+def compute_route_signatures_bulk(feed_id: int, conn=None) -> Dict[RouteDirKey, str]:
+    """
+    Compute signature for every (route_id, direction_id) in the feed in 3 queries.
+    Returns (route_id, direction_id) -> sig_hash. Memory-heavy for large feeds.
+    """
+    close = False
+    if conn is None:
+        conn = _get_conn()
+        close = True
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT trip_id, service_id, shape_id, route_id, direction_id FROM trips WHERE feed_id = %s",
+                (feed_id,),
+            )
+            trips_rows = cur.fetchall()
+        # Group trips by (route_id, direction_id)
+        by_key: Dict[RouteDirKey, List[Dict]] = {}
+        for r in trips_rows:
+            key: RouteDirKey = (
+                r["route_id"],
+                None if r["direction_id"] is None else str(r["direction_id"]),
+            )
+            by_key.setdefault(key, []).append({
+                "trip_id": r["trip_id"],
+                "service_id": r["service_id"],
+                "shape_id": r["shape_id"],
+            })
+        for k, lst in by_key.items():
+            lst.sort(key=lambda x: x["trip_id"])
+
+        trip_ids = [r["trip_id"] for r in trips_rows]
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT trip_id, stop_id, stop_sequence
+                FROM stop_times
+                WHERE feed_id = %s AND trip_id = ANY(%s)
+                ORDER BY trip_id, stop_sequence
+                """,
+                (feed_id, trip_ids),
+            )
+            stop_times_rows = cur.fetchall()
+        stop_times_by_trip: Dict[str, List[Dict]] = {}
+        for row in stop_times_rows:
+            stop_times_by_trip.setdefault(row["trip_id"], []).append(dict(row))
+
+        shape_ids = sorted({r["shape_id"] for r in trips_rows if r.get("shape_id")})
+        shapes_rows: List[Dict] = []
+        if shape_ids:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT shape_id, seq, lat, lon
+                    FROM shapes
+                    WHERE feed_id = %s AND shape_id = ANY(%s)
+                    ORDER BY shape_id, seq
+                    """,
+                    (feed_id, shape_ids),
+                )
+                shapes_rows = [dict(r) for r in cur.fetchall()]
+        shapes_by_id: Dict[str, List[Dict]] = {}
+        for s in shapes_rows:
+            shapes_by_id.setdefault(s["shape_id"], []).append(s)
+
+        out: Dict[RouteDirKey, str] = {}
+        for key, trips in by_key.items():
+            trip_ids_k = [t["trip_id"] for t in trips]
+            stop_times = []
+            for tid in trip_ids_k:
+                stop_times.extend(stop_times_by_trip.get(tid, []))
+            shape_ids_k = sorted({t["shape_id"] for t in trips if t.get("shape_id")})
+            shapes = []
+            for sid in shape_ids_k:
+                shapes.extend(shapes_by_id.get(sid, []))
+            payload = {"trips": trips, "stop_times": stop_times, "shapes": shapes}
+            raw = json.dumps(payload, sort_keys=True).encode("utf-8")
+            out[key] = hashlib.sha256(raw).hexdigest()
+        return out
     finally:
         if close:
             conn.close()
@@ -806,6 +1080,40 @@ def get_cached_route_graph_pg(
             conn.close()
 
 
+def get_cached_graphs_bulk(
+    feed_id: int,
+    date_ymd: str,
+    pretty_osm: bool,
+    conn=None,
+) -> Dict[RouteDirKey, Tuple[str, bytes]]:
+    """Load all cached graph blobs for (feed_id, date_ymd, pretty_osm). Returns (route_id, direction_id) -> (sig_hash, blob)."""
+    close = False
+    if conn is None:
+        conn = _get_conn()
+        close = True
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT route_id, direction_id, route_sig_hash, graph_blob
+                FROM route_graph_cache
+                WHERE feed_id = %s AND date_ymd = %s AND pretty_osm = %s
+                """,
+                (feed_id, int(date_ymd), pretty_osm),
+            )
+            out: Dict[RouteDirKey, Tuple[str, bytes]] = {}
+            for row in cur.fetchall():
+                key: RouteDirKey = (
+                    row["route_id"],
+                    None if row["direction_id"] is None else str(row["direction_id"]),
+                )
+                out[key] = (row["route_sig_hash"], bytes(row["graph_blob"]))
+            return out
+    finally:
+        if close:
+            conn.close()
+
+
 def save_route_graph_pg(
     feed_id: int,
     route_id: str,
@@ -858,6 +1166,70 @@ def save_route_graph_pg(
         if close:
             conn.close()
 
+
+
+def get_blocked_edge_keys_pg(
+    edge_geometries: Dict[Tuple[str, str], Any],
+    blockage_geojson: Dict[str, Any],
+    conn=None,
+) -> Optional[set]:
+    """
+    Return set of (node_u, node_v) keys whose edge geometry intersects the blockage polygon.
+    Uses PostGIS for intersection; buffer ~110 m applied to polygon.
+    Returns None on error so caller can fall back to Python STRtree.
+    """
+    if not edge_geometries:
+        return set()
+    try:
+        from shapely.geometry import shape as _shape
+
+        geom = _shape(blockage_geojson)
+        if geom.is_empty:
+            return set()
+        geom = geom.buffer(1e-3)
+        if geom.is_empty:
+            return set()
+        polygon_wkt = geom.wkt
+    except Exception:
+        return None
+    keys = list(edge_geometries.keys())
+    wkts = []
+    for k in keys:
+        eg = edge_geometries.get(k)
+        if eg is not None and getattr(eg, "linestring", None) is not None:
+            wkts.append(eg.linestring.wkt)
+        else:
+            wkts.append("LINESTRING EMPTY")
+    close = False
+    if conn is None:
+        conn = _get_conn()
+        close = True
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                WITH edges AS (
+                    SELECT ordinality AS idx, ST_GeomFromText(wkt, 4326) AS geom
+                    FROM unnest(%s::text[]) WITH ORDINALITY AS t(wkt)
+                    WHERE wkt IS NOT NULL AND wkt != '' AND wkt NOT LIKE '%%EMPTY%%'
+                ),
+                poly AS (
+                    SELECT ST_Buffer(ST_GeomFromText(%s, 4326)::geography, 110)::geometry AS g
+                )
+                SELECT e.idx
+                FROM edges e, poly p
+                WHERE ST_Intersects(e.geom, p.g)
+                """,
+                (wkts, polygon_wkt),
+            )
+            indices = {int(row["idx"]) for row in cur.fetchall()}
+    except Exception:
+        if close:
+            conn.close()
+        return None
+    if close:
+        conn.close()
+    return {keys[i - 1] for i in indices if 1 <= i <= len(keys)}
 
 
 def search_routes_pg(q: str, limit: int) -> List[Dict[str, Any]]:

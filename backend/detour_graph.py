@@ -20,8 +20,8 @@ from . import db_access
 
 # Allow transfers between pattern-stop nodes whose outgoing headings are within this many degrees.
 TRANSFER_HEADING_TOLERANCE_DEG = 90.0
-# Buffer (degrees) for AOI when selecting candidate routes; ~0.003 ≈ few hundred meters at mid-lat.
-AOI_BUFFER_DEG = 0.003
+# Buffer (degrees) for AOI when selecting candidate routes; ~0.01 ≈ ~1 km at mid-lat.
+AOI_BUFFER_DEG = 0.01
 
 
 @dataclass

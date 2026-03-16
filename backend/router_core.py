@@ -115,10 +115,31 @@ def compute_blocked_edges(
     edge_geometries: Dict[Tuple[str, str], EdgeGeometry],
     blockage_geojson: Dict,
 ) -> Tuple[set[Tuple[str, str]], Dict]:
+    from . import db_access
+
+    # Prefer PostGIS for intersection (SQL-heavy path).
+    blocked_sql = db_access.get_blocked_edge_keys_pg(
+        edge_geometries, blockage_geojson
+    )
+    if blocked_sql is not None:
+        blocked = blocked_sql
+        blocked_feats = []
+        for (u, v) in blocked:
+            eg = edge_geometries.get((u, v))
+            if eg and eg.linestring:
+                from_id = getattr(eg, "from_stop_id", u)
+                to_id = getattr(eg, "to_stop_id", v)
+                blocked_feats.append(
+                    {
+                        "type": "Feature",
+                        "geometry": mapping(eg.linestring),
+                        "properties": {"from_stop_id": from_id, "to_stop_id": to_id},
+                    }
+                )
+        return blocked, {"type": "FeatureCollection", "features": blocked_feats}
+
+    # Fallback: STRtree in Python.
     geom = shape(blockage_geojson)
-    # Buffer the blockage so corridor edges that run along or through the drawn
-    # area are reliably detected (~110 m at mid-latitudes); avoids detour path
-    # still crossing the blocked area (e.g. line 16 Holon–Rishon).
     try:
         geom = geom.buffer(1e-3)
     except Exception:
@@ -126,8 +147,6 @@ def compute_blocked_edges(
     if geom.is_empty:
         return set(), {"type": "FeatureCollection", "features": []}
 
-    # Build a spatial index. Shapely 2 STRtree.query(geom) returns indices.
-    # Use predicate="intersects" so we only get edges that actually intersect the polygon.
     lines: List[LineString] = []
     index_to_key: Dict[int, Tuple[str, str]] = {}
     for key, eg in edge_geometries.items():
@@ -139,7 +158,7 @@ def compute_blocked_edges(
     tree = STRtree(lines)
 
     blocked: set[Tuple[str, str]] = set()
-    blocked_feats: List[Dict] = []
+    blocked_feats = []
     try:
         indices = tree.query(geom, predicate="intersects")
     except TypeError:
@@ -168,6 +187,5 @@ def compute_blocked_edges(
                 "properties": {"from_stop_id": from_id, "to_stop_id": to_id},
             }
         )
-    blocked_fc = {"type": "FeatureCollection", "features": blocked_feats}
-    return blocked, blocked_fc
+    return blocked, {"type": "FeatureCollection", "features": blocked_feats}
 

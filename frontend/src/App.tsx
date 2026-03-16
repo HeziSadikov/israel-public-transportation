@@ -269,7 +269,7 @@ const App: React.FC = () => {
         end_time: areaEndTime.trim() || "23:59",
         blockage_geojson: blockageGeojson,
         max_routes: 20,
-        transfer_radius_m: 120,
+        transfer_radius_m: 250,
         use_osm_detour: useOSMDetour,
       };
       if (detourMode === "route" && selectedRoute) {

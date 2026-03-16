@@ -18,6 +18,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timedelta
 from typing import Optional
 
 import psycopg2
@@ -30,6 +31,7 @@ from backend.db_access import (
   compute_route_signature,
   get_route_signature,
   upsert_route_signature,
+  get_all_stop_times_for_feed,
 )
 
 
@@ -218,6 +220,12 @@ def _upsert_patterns_for_feed(cur, feed_id: int, old_feed_id: int | None, yyyymm
   feed = _load_feed_from_postgis(cur, feed_id)
   patterns_builder = PatternBuilder(feed)
 
+  # Load all stop_times for the feed once (one query) so we avoid per-trip DB calls.
+  conn = cur.connection
+  print(f"[patterns] Loading all stop_times for feed_id={feed_id} (one query) ...", flush=True)
+  stop_times_by_trip = get_all_stop_times_for_feed(feed_id, conn)
+  print(f"[patterns] Loaded stop_times for {len(stop_times_by_trip)} trips.", flush=True)
+
   # Clear existing patterns for this feed so we can rebuild deterministically.
   print(f"[patterns] Clearing existing patterns for feed_id={feed_id} ...", flush=True)
   cur.execute("DELETE FROM pattern_stops WHERE feed_id = %s", (feed_id,))
@@ -244,12 +252,12 @@ def _upsert_patterns_for_feed(cur, feed_id: int, old_feed_id: int | None, yyyymm
       direction_ids = {None}
 
     for dir_id in direction_ids:
-      # Compute per-route/direction signature for the new feed.
-      sig_new = compute_route_signature(route_id, dir_id)
+      # Compute per-route/direction signature for the new feed (reuse conn).
+      sig_new = compute_route_signature(route_id, dir_id, conn)
 
       reused = False
       if old_feed_id is not None:
-        sig_old = get_route_signature(old_feed_id, route_id, dir_id)
+        sig_old = get_route_signature(old_feed_id, route_id, dir_id, conn)
         if sig_old is not None and sig_old == sig_new:
           # Route unchanged between feeds: copy existing patterns and pattern_stops
           # from old_feed_id to the new feed.
@@ -316,18 +324,44 @@ def _upsert_patterns_for_feed(cur, feed_id: int, old_feed_id: int | None, yyyymm
           reused = True
 
       if not reused:
-        # Build fresh patterns for this route/direction.
+        # Build fresh patterns for this route/direction. If the build date has no
+        # service for this route (e.g. weekday vs weekend), try the next 7 days
+        # so every route that runs on any day gets a pattern.
         pats = patterns_builder.build_patterns_for_route(
           route_id=route_id,
           direction_id=dir_id,
           yyyymmdd=yyyymmdd,
           max_trips=None,
+          stop_times_preloaded=stop_times_by_trip,
         )
+        if not pats:
+          base = datetime.strptime(yyyymmdd, "%Y%m%d").date()
+          for d in range(1, 8):
+            try_date = (base + timedelta(days=d)).strftime("%Y%m%d")
+            pats = patterns_builder.build_patterns_for_route(
+              route_id=route_id,
+              direction_id=dir_id,
+              yyyymmdd=try_date,
+              max_trips=None,
+              stop_times_preloaded=stop_times_by_trip,
+            )
+            if pats:
+              break
+        if not pats:
+          # Still no pattern (e.g. route only runs outside the 8-day window). Use all trips.
+          pats = patterns_builder.build_patterns_for_route(
+            route_id=route_id,
+            direction_id=dir_id,
+            yyyymmdd=yyyymmdd,
+            max_trips=None,
+            use_all_trips=True,
+            stop_times_preloaded=stop_times_by_trip,
+          )
         for pid, pat in pats.items():
           _insert_pattern(cur, feed_id, pat)
 
       # Record the new signature for this route/direction in the new feed.
-      upsert_route_signature(feed_id, route_id, dir_id, sig_new)
+      upsert_route_signature(feed_id, route_id, dir_id, sig_new, conn)
     processed_routes += 1
     if processed_routes % 50 == 0:
       print(f"[patterns] Processed {processed_routes}/{len(routes)} routes ...", flush=True)
