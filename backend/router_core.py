@@ -7,22 +7,28 @@ from shapely.geometry import mapping, LineString, shape
 from shapely.strtree import STRtree
 
 from .graph_builder import GraphBuildResult, EdgeGeometry
+from .routing_policy import RoutingPolicy, default_routing_policy
 
 
 def astar_route(
     graph: nx.DiGraph,
     edge_geometries: Dict[Tuple[str, str], EdgeGeometry],
-    start_stop_id: str,
-    end_stop_id: str,
+    start_node_id: str,
+    end_node_id: str,
     blocked_edges: Optional[set[Tuple[str, str]]] = None,
+    policy: Optional[RoutingPolicy] = None,
 ) -> List[str]:
     """
     A* routing where edge weights are interpreted as travel time in seconds.
     Any edge in blocked_edges is treated as impassable (infinite cost), so the
     path never uses that road/segment; the router only uses edges that are
     possible to go through.
+
+    `start_node_id` and `end_node_id` are graph node identifiers (pattern-stop
+    node ids), not raw GTFS stop_ids.
     """
     blocked_edges = blocked_edges or set()
+    pol = policy or default_routing_policy()
 
     def weight(u: str, v: str, attrs: Dict[str, Any]) -> float:
         # Never route through a blocked edge: treat as impassable.
@@ -32,29 +38,20 @@ def astar_route(
         # Base edge weight: scheduled travel time in seconds (fallback to generic weight).
         base = float(attrs.get("travel_time_s", attrs.get("weight", 1.0)))
 
-        # Soft per-edge penalty as a proxy for dwell/boarding/etc.
-        per_edge_penalty = 10.0
+        per_edge_penalty = pol.per_edge_penalty_s
 
-        # Additional penalty for transfer edges so we strongly prefer staying
-        # on the same vehicle when possible.
         transfer_penalty = 0.0
         if attrs.get("is_transfer"):
-            transfer_penalty = 240.0  # ~4 minutes equivalent
+            transfer_penalty = pol.transfer_penalty_s
 
-        # Frequency-based bias: prefer more frequent patterns when the graph
-        # carries per-node frequency metadata (trips per day). This is a
-        # modest discount that never dominates absolute time.
         freq_factor = 1.0
         try:
             f1 = float(graph.nodes[u].get("frequency") or 0.0)
             f2 = float(graph.nodes[v].get("frequency") or 0.0)
             freq = max(f1, f2)
             if freq > 0:
-                import math
-
-                # Clamp very high frequencies and apply a gentle discount.
-                freq = min(freq, 60.0)
-                freq_factor = 1.0 / (1.0 + 0.01 * freq)
+                freq = min(freq, pol.frequency_cap)
+                freq_factor = 1.0 / (1.0 + pol.frequency_discount_coef * freq)
         except Exception:
             freq_factor = 1.0
 
@@ -76,15 +73,12 @@ def astar_route(
         c = 2 * asin(sqrt(a))
         dist_m = R * c
 
-        # Assume a conservative max speed of 80 km/h (~22.22 m/s) so the
-        # heuristic never overestimates true travel time.
-        max_speed_m_s = 22.22
-        return dist_m / max_speed_m_s
+        return dist_m / pol.heuristic_max_speed_m_s
 
     return nx.astar_path(
         graph,
-        start_stop_id,
-        end_stop_id,
+        start_node_id,
+        end_node_id,
         heuristic=heuristic,
         weight=lambda u, v, attrs: weight(u, v, attrs),
     )

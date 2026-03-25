@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional, Set, Any
+import os
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Dict, List, Tuple, Optional, Set
 
 import networkx as nx
 from shapely.geometry import LineString, shape, mapping
@@ -14,21 +15,87 @@ from .graph_builder import (
     haversine_meters,
     angle_difference_deg,
 )
-from .service_calendar import ServiceCalendar
 from .area_search import find_routes_in_polygon
 from . import db_access
 
-# Allow transfers between pattern-stop nodes whose outgoing headings are within this many degrees.
-TRANSFER_HEADING_TOLERANCE_DEG = 90.0
-# Buffer (degrees) for AOI when selecting candidate routes; ~0.01 ≈ ~1 km at mid-lat.
-AOI_BUFFER_DEG = 0.01
+if TYPE_CHECKING:
+    from .gtfs_loader import GTFSFeed
+
+
+def _env_float(key: str, default: str) -> float:
+    return float(os.getenv(key, default))
+
+
+# Legacy aliases (same env keys as DetourGraphParams).
+AOI_BUFFER_DEG = _env_float("DETOUR_AOI_BUFFER_DEG", "0.01")
+TRANSFER_HEADING_TOLERANCE_DEG = _env_float("DETOUR_TRANSFER_HEADING_TOLERANCE_DEG", "90")
+
+
+@dataclass(frozen=True)
+class DetourGraphParams:
+    """Explicit search-space tuning for detour graph construction (AOI, transfers)."""
+
+    aoi_buffer_deg: float
+    transfer_heading_tolerance_deg: float
+    transfer_radius_m: float
+    transfer_walk_speed_m_s: float
+    transfer_fixed_penalty_s: float
+
+
+def default_detour_graph_params() -> DetourGraphParams:
+    return DetourGraphParams(
+        aoi_buffer_deg=_env_float("DETOUR_AOI_BUFFER_DEG", "0.01"),
+        transfer_heading_tolerance_deg=_env_float("DETOUR_TRANSFER_HEADING_TOLERANCE_DEG", "90"),
+        transfer_radius_m=_env_float("DETOUR_TRANSFER_RADIUS_M", "200"),
+        transfer_walk_speed_m_s=_env_float("DETOUR_TRANSFER_WALK_SPEED_M_S", "1.3"),
+        transfer_fixed_penalty_s=_env_float("DETOUR_TRANSFER_FIXED_PENALTY_S", "60"),
+    )
+
+
+def _build_nodes_by_stop_id(
+    g: nx.DiGraph,
+    primary_pattern_id: Optional[str],
+) -> Dict[str, List[str]]:
+    """Map GTFS stop_id -> pattern-stop node ids, sorted: primary pattern first, then by node id."""
+
+    by_stop: Dict[str, List[str]] = {}
+    for nid in g.nodes():
+        sid = g.nodes[nid].get("stop_id")
+        if sid is None:
+            continue
+        by_stop.setdefault(str(sid), []).append(nid)
+
+    def sort_key(n: str) -> Tuple[int, str]:
+        pid = g.nodes[n].get("pattern_id")
+        primary_first = 0 if (primary_pattern_id and pid == primary_pattern_id) else 1
+        return (primary_first, n)
+
+    for sid, nids in by_stop.items():
+        by_stop[sid] = sorted(nids, key=sort_key)
+    return by_stop
 
 
 @dataclass
 class DetourGraph:
     graph: nx.DiGraph
     edge_geometries: Dict[Tuple[str, str], EdgeGeometry]
-    primary_pattern_id: Optional[str] = None  # for resolving stop_before/stop_after to node_ids
+    primary_pattern_id: Optional[str] = None
+    nodes_by_stop_id: Dict[str, List[str]] = field(default_factory=dict)
+
+    def resolve_endpoint(self, stop_id: str, *, prefer_primary: bool = True) -> Optional[str]:
+        """
+        Resolve a physical stop_id to one pattern-stop node.
+
+        If prefer_primary is True, prefer a node on primary_pattern_id (deterministic: lexicographically
+        smallest node id among primary-pattern candidates). Otherwise choose the lexicographically
+        smallest node id among all candidates.
+        """
+        nids = self.nodes_by_stop_id.get(stop_id)
+        if not nids:
+            return None
+        if prefer_primary:
+            return nids[0]
+        return min(nids)
 
 
 def _build_route_pattern(
@@ -72,10 +139,10 @@ def _merge_graphs(
 
 def _add_transfer_edges(
     g: nx.DiGraph,
-    max_transfer_m: float = 120.0,
-    walk_speed_m_s: float = 1.3,
-    fixed_penalty_s: float = 60.0,
-    heading_tolerance_deg: float = TRANSFER_HEADING_TOLERANCE_DEG,
+    max_transfer_m: float,
+    walk_speed_m_s: float,
+    fixed_penalty_s: float,
+    heading_tolerance_deg: float,
 ) -> None:
     """
     Add transfer edges only between pattern-stop nodes that are:
@@ -144,31 +211,54 @@ def _add_transfer_edges(
                         )
 
 
+def _merge_from_postgis_bulk(
+    g: nx.DiGraph,
+    edge_geoms: Dict[Tuple[str, str], EdgeGeometry],
+    metas: List[db_access.PatternMeta],
+    date_ymd: str,
+) -> None:
+    """Merge pattern graphs from PostGIS using one bulk stop_times query."""
+    if not metas:
+        return
+    feed_id = db_access.get_active_feed_id()
+    trip_ids = list({m.repr_trip_id for m in metas if m.repr_trip_id})
+    bulk = db_access.get_stop_times_bulk(feed_id, trip_ids) if trip_ids else {}
+    for meta in metas:
+        st = bulk.get(meta.repr_trip_id) if meta.repr_trip_id else None
+        res = build_graph_for_pattern_from_postgis(
+            meta, date_ymd, stop_times=st if st else None
+        )
+        _merge_graphs(g, edge_geoms, res.graph, res.edge_geometries)
+
+
 def build_detour_graph(
     feed: Optional[GTFSFeed],
     date_ymd: str,
     blockage_geojson: Dict,
     primary_route_id: str,
     primary_direction_id: Optional[str],
-    transfer_radius_m: float = 200.0,
     start_sec: Optional[int] = None,
     end_sec: Optional[int] = None,
-    aoi_buffer_deg: float = AOI_BUFFER_DEG,
+    params: Optional[DetourGraphParams] = None,
 ) -> DetourGraph:
     """
     Build a direction-aware detour graph.
 
     - Candidate routes: routes whose shapes intersect a **buffered AOI** around the blockage
       (so nearby parallel corridors and routes that go around the blockage are included).
+      Broad time windows include more routes and increase build cost.
     - Blocking still uses the raw blockage geometry (caller uses blockage_geojson for
       compute_blocked_edges). Here we only use the buffer to select which routes go in the graph.
     - Nodes are pattern-stops; ride edges same-pattern only; transfers heading-compatible.
-    - Prefers PostGIS data layer when an active feed is available; otherwise uses GTFSFeed + SQLite.
+    - When PostGIS can resolve the primary pattern, all merged routes use PostGIS (no GraphBuilder
+      on the detour hot path). Feed + GraphBuilder is only used when PostGIS pattern lookup fails
+      but an in-memory feed is available.
     """
-    # Two geometries: raw blockage for blocking; buffered AOI for candidate route selection.
+    p = params or default_detour_graph_params()
+
     blockage_geom = shape(blockage_geojson)
     try:
-        aoi_geom = blockage_geom.buffer(aoi_buffer_deg)
+        aoi_geom = blockage_geom.buffer(p.aoi_buffer_deg)
     except Exception:
         aoi_geom = blockage_geom
     aoi_geojson = mapping(aoi_geom)
@@ -189,8 +279,6 @@ def build_detour_graph(
     edge_geoms: Dict[Tuple[str, str], EdgeGeometry] = {}
     primary_pattern_id: Optional[str] = None
 
-    # Prefer PostGIS when an active feed exists and we can get patterns from it.
-    # When feed is None (e.g. PostGIS-only env), we must use PostGIS.
     use_postgis = False
     primary_meta = None
     try:
@@ -207,23 +295,22 @@ def build_detour_graph(
 
     if use_postgis and primary_meta is not None:
         primary_pattern_id = primary_meta.pattern_id
-        res = build_graph_for_pattern_from_postgis(primary_meta, date_ymd)
-        _merge_graphs(g, edge_geoms, res.graph, res.edge_geometries)
-
+        metas = [primary_meta]
         for rid in route_ids:
             if rid == primary_route_id:
                 continue
             meta = db_access.get_pattern_for_route(rid, None, date_ymd)
-            if meta is None:
-                continue
-            res = build_graph_for_pattern_from_postgis(meta, date_ymd)
-            _merge_graphs(g, edge_geoms, res.graph, res.edge_geometries)
+            if meta is not None:
+                metas.append(meta)
+        _merge_from_postgis_bulk(g, edge_geoms, metas, date_ymd)
     else:
         if feed is None:
+            idx = _build_nodes_by_stop_id(g, None)
             return DetourGraph(
                 graph=g,
                 edge_geometries=edge_geoms,
                 primary_pattern_id=None,
+                nodes_by_stop_id=idx,
             )
         patterns_builder = PatternBuilder(feed)
         graph_builder = GraphBuilder(feed)
@@ -247,8 +334,10 @@ def build_detour_graph(
 
     _add_transfer_edges(
         g,
-        max_transfer_m=transfer_radius_m,
-        heading_tolerance_deg=TRANSFER_HEADING_TOLERANCE_DEG,
+        max_transfer_m=p.transfer_radius_m,
+        walk_speed_m_s=p.transfer_walk_speed_m_s,
+        fixed_penalty_s=p.transfer_fixed_penalty_s,
+        heading_tolerance_deg=p.transfer_heading_tolerance_deg,
     )
 
     for u, v in g.edges():
@@ -265,9 +354,10 @@ def build_detour_graph(
         line = LineString([(lon1, lat1), (lon2, lat2)])
         edge_geoms[(u, v)] = EdgeGeometry(from_stop_id=sid_u, to_stop_id=sid_v, linestring=line)
 
+    idx = _build_nodes_by_stop_id(g, primary_pattern_id)
     return DetourGraph(
         graph=g,
         edge_geometries=edge_geoms,
         primary_pattern_id=primary_pattern_id,
+        nodes_by_stop_id=idx,
     )
-

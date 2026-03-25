@@ -73,6 +73,10 @@ class DetourRequest(BaseModel):
     start_stop_id: str
     end_stop_id: str
     blockage_geojson: Dict[str, Any]
+    # Optional service window for candidate-route selection (HH:MM or HH:MM:SS).
+    # Omit both for full extended service day (same as historical /detour behavior).
+    start_time: Optional[str] = None
+    end_time: Optional[str] = None
 
 
 class DetourResponse(BaseModel):
