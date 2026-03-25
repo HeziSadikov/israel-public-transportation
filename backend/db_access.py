@@ -1037,13 +1037,15 @@ def get_cached_route_graph_pg(
     feed_id: int,
     route_id: str,
     direction_id: Optional[str],
-    date_ymd: str,
     pretty_osm: bool,
     route_sig_hash: str,
     conn=None,
 ) -> Optional[bytes]:
     """
     Return a cached pickled graph entry from PostGIS route_graph_cache if present.
+
+    The cache is keyed by (feed_id, route_id, direction_id, pretty_osm) and guarded
+    by route_sig_hash. date_ymd is treated as metadata only.
     """
     close = False
     if conn is None:
@@ -1058,7 +1060,6 @@ def get_cached_route_graph_pg(
                 WHERE feed_id = %s
                   AND route_id = %s
                   AND COALESCE(direction_id, -1) = COALESCE(%s::int, -1)
-                  AND date_ymd = %s
                   AND pretty_osm = %s
                   AND route_sig_hash = %s
                 """,
@@ -1066,7 +1067,6 @@ def get_cached_route_graph_pg(
                     feed_id,
                     route_id,
                     int(direction_id) if direction_id is not None else None,
-                    int(date_ymd),
                     pretty_osm,
                     route_sig_hash,
                 ),
@@ -1082,11 +1082,13 @@ def get_cached_route_graph_pg(
 
 def get_cached_graphs_bulk(
     feed_id: int,
-    date_ymd: str,
     pretty_osm: bool,
     conn=None,
 ) -> Dict[RouteDirKey, Tuple[str, bytes]]:
-    """Load all cached graph blobs for (feed_id, date_ymd, pretty_osm). Returns (route_id, direction_id) -> (sig_hash, blob)."""
+    """
+    Load all cached graph blobs for (feed_id, pretty_osm).
+    Returns (route_id, direction_id) -> (sig_hash, blob).
+    """
     close = False
     if conn is None:
         conn = _get_conn()
@@ -1097,9 +1099,9 @@ def get_cached_graphs_bulk(
                 """
                 SELECT route_id, direction_id, route_sig_hash, graph_blob
                 FROM route_graph_cache
-                WHERE feed_id = %s AND date_ymd = %s AND pretty_osm = %s
+                WHERE feed_id = %s AND pretty_osm = %s
                 """,
-                (feed_id, int(date_ymd), pretty_osm),
+                (feed_id, pretty_osm),
             )
             out: Dict[RouteDirKey, Tuple[str, bytes]] = {}
             for row in cur.fetchall():
@@ -1118,14 +1120,17 @@ def save_route_graph_pg(
     feed_id: int,
     route_id: str,
     direction_id: Optional[str],
-    date_ymd: str,
     pretty_osm: bool,
     route_sig_hash: str,
     graph_blob: bytes,
+    date_ymd: Optional[str] = None,
     conn=None,
 ) -> None:
     """
     Save or update a cached pickled graph entry in PostGIS route_graph_cache.
+
+    The logical key is (feed_id, route_id, direction_id, pretty_osm); date_ymd is
+    stored as metadata only when provided.
     """
     close = False
     if conn is None:
@@ -1145,8 +1150,9 @@ def save_route_graph_pg(
                   graph_blob
                 )
                 VALUES (%s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (feed_id, route_id, direction_id, date_ymd, pretty_osm)
+                ON CONFLICT (feed_id, route_id, direction_id, pretty_osm)
                 DO UPDATE SET
+                  date_ymd       = EXCLUDED.date_ymd,
                   route_sig_hash = EXCLUDED.route_sig_hash,
                   graph_blob     = EXCLUDED.graph_blob,
                   created_at     = NOW()
@@ -1155,7 +1161,7 @@ def save_route_graph_pg(
                     feed_id,
                     route_id,
                     int(direction_id) if direction_id is not None else None,
-                    int(date_ymd),
+                    int(date_ymd) if date_ymd is not None else None,
                     pretty_osm,
                     route_sig_hash,
                     psycopg2.Binary(graph_blob),

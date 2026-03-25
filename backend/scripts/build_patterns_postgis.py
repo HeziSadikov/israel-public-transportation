@@ -24,6 +24,7 @@ from typing import Optional
 import psycopg2
 from psycopg2.extras import DictCursor
 
+from backend.logging_utils import log
 from backend.pattern_builder import PatternBuilder, RoutePattern
 from backend.db_access import (
   get_active_feed_id,
@@ -178,28 +179,11 @@ def _load_feed_from_postgis(cur, feed_id: int) -> GTFSFeed:
     for r in cur.fetchall()
   ]
 
-  # Shapes
-  cur.execute(
-    """
-    SELECT shape_id, seq, lat, lon, dist_traveled
-    FROM shapes
-    WHERE feed_id = %s
-    ORDER BY shape_id, seq
-    """,
-    (feed_id,),
-  )
-  shapes = [
-    {
-      "shape_id": r["shape_id"],
-      "shape_pt_sequence": r["seq"],
-      "shape_pt_lat": r["lat"],
-      "shape_pt_lon": r["lon"],
-      "shape_dist_traveled": r["dist_traveled"],
-    }
-    for r in cur.fetchall()
-  ]
+  # For pattern building we don't need full shapes; keep shape_id on trips and let
+  # graph building fetch shapes lazily from PostGIS when needed.
+  shapes = []
 
-  # stop_times are accessed via db_access.get_stop_times_for_trip in PatternBuilder/GraphBuilder,
+  # stop_times are accessed via db_access.get_stop_times_* helpers in PatternBuilder/GraphBuilder,
   # so we do not load them into GTFSFeed.stop_times here.
   # Build a simple dict-like feed object compatible with PatternBuilder/ServiceCalendar.
   feed = type("FeedStub", (), {})()
@@ -216,23 +200,23 @@ def _load_feed_from_postgis(cur, feed_id: int) -> GTFSFeed:
 
 
 def _upsert_patterns_for_feed(cur, feed_id: int, old_feed_id: int | None, yyyymmdd: str) -> None:
-  print(f"[patterns] Loading active GTFS feed from PostGIS for date {yyyymmdd} ...", flush=True)
+  log("patterns", f"Loading active GTFS feed from PostGIS for date {yyyymmdd} ...")
   feed = _load_feed_from_postgis(cur, feed_id)
   patterns_builder = PatternBuilder(feed)
 
   # Load all stop_times for the feed once (one query) so we avoid per-trip DB calls.
   conn = cur.connection
-  print(f"[patterns] Loading all stop_times for feed_id={feed_id} (one query) ...", flush=True)
+  log("patterns", f"Loading all stop_times for feed_id={feed_id} (one query) ...")
   stop_times_by_trip = get_all_stop_times_for_feed(feed_id, conn)
-  print(f"[patterns] Loaded stop_times for {len(stop_times_by_trip)} trips.", flush=True)
+  log("patterns", f"Loaded stop_times for {len(stop_times_by_trip)} trips.")
 
   # Clear existing patterns for this feed so we can rebuild deterministically.
-  print(f"[patterns] Clearing existing patterns for feed_id={feed_id} ...", flush=True)
+  log("patterns", f"Clearing existing patterns for feed_id={feed_id} ...")
   cur.execute("DELETE FROM pattern_stops WHERE feed_id = %s", (feed_id,))
   cur.execute("DELETE FROM patterns WHERE feed_id = %s", (feed_id,))
 
   routes = feed.routes
-  print(f"[patterns] Building patterns for {len(routes)} routes ...", flush=True)
+  log("patterns", f"Building patterns for {len(routes)} routes ...")
   processed_routes = 0
   for r in routes:
     route_id = r.get("route_id")
@@ -261,10 +245,9 @@ def _upsert_patterns_for_feed(cur, feed_id: int, old_feed_id: int | None, yyyymm
         if sig_old is not None and sig_old == sig_new:
           # Route unchanged between feeds: copy existing patterns and pattern_stops
           # from old_feed_id to the new feed.
-          print(
-            f"[patterns] Reusing patterns for route_id={route_id!r}, direction_id={dir_id!r} "
-            f"from old_feed_id={old_feed_id}",
-            flush=True,
+          log(
+            "patterns",
+            f"Reusing patterns for route_id={route_id!r}, direction_id={dir_id!r} from old_feed_id={old_feed_id}",
           )
           # Copy patterns
           cur.execute(
@@ -364,7 +347,7 @@ def _upsert_patterns_for_feed(cur, feed_id: int, old_feed_id: int | None, yyyymm
       upsert_route_signature(feed_id, route_id, dir_id, sig_new, conn)
     processed_routes += 1
     if processed_routes % 50 == 0:
-      print(f"[patterns] Processed {processed_routes}/{len(routes)} routes ...", flush=True)
+      log("patterns", f"Processed {processed_routes}/{len(routes)} routes ...")
 
 
 def _insert_pattern(cur, feed_id: int, pat: RoutePattern) -> None:
@@ -424,7 +407,7 @@ def build_patterns(database_url: Optional[str], date_ymd: str) -> None:
   conn = _connect(database_url)
   conn.autocommit = False
   try:
-    print(f"[patterns] Starting pattern build for date {date_ymd} using {database_url or 'DEFAULT_DB_URL'}", flush=True)
+    log("patterns", f"Starting pattern build for date {date_ymd} using {database_url or 'DEFAULT_DB_URL'}")
     with conn:
       # Use db_access logic to resolve active feed_id inside Postgres.
       feed_id = get_active_feed_id(conn)
@@ -442,11 +425,11 @@ def build_patterns(database_url: Optional[str], date_ymd: str) -> None:
         )
         row = cur.fetchone()
         old_feed_id = int(row[0]) if row else None
-      print(f"[patterns] Active PostGIS feed_id={feed_id}, old_feed_id={old_feed_id}", flush=True)
+      log("patterns", f"Active PostGIS feed_id={feed_id}, old_feed_id={old_feed_id}")
       with conn.cursor() as cur:
         _upsert_patterns_for_feed(cur, feed_id, old_feed_id, date_ymd)
     conn.commit()
-    print("[patterns] Patterns and pattern_stops populated successfully.", flush=True)
+    log("patterns", "Patterns and pattern_stops populated successfully.")
   finally:
     conn.close()
 

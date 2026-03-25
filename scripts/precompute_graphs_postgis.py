@@ -35,11 +35,29 @@ from psycopg2.extras import DictCursor
 from backend.config import GRAPH_CACHE
 from backend.db_access import DB_URL
 from backend.graph_builder import build_graph_for_pattern_from_postgis
+from backend.logging_utils import log
+from backend.osm_pretty import map_match_pattern
 from backend import db_access as db_access_module
 
 
 def _connect(database_url: Optional[str]):
     return psycopg2.connect(database_url or DB_URL, cursor_factory=DictCursor)
+
+
+def _render_progress(done: int, total: int, prefix: str = "") -> None:
+    """Simple in-place ASCII progress bar for long loops."""
+    if total <= 0:
+        return
+    width = 30
+    frac = max(0.0, min(1.0, done / total))
+    filled = int(width * frac)
+    bar = "#" * filled + "-" * (width - filled)
+    pct = int(frac * 100)
+    text = f"{prefix}[{bar}] {pct:3d}% ({done}/{total})"
+    # Carriage return, no newline; flushed so it updates in-place.
+    print("\r" + text, end="", flush=True)
+    if done >= total:
+        print("", flush=True)  # move to next line when finished
 
 
 def _iter_route_directions(conn) -> List[Tuple[str, Optional[str]]]:
@@ -89,6 +107,31 @@ def _build_one(
     return result.pattern, cache_entry
 
 
+def _merge_edge_geometries(edge_geometries: Dict[Tuple[str, str], Any]):
+    """Heuristic: concatenate edges in insertion order into a single LineString."""
+    if not edge_geometries:
+        return None
+    from shapely.geometry import LineString
+
+    parts = []
+    for eg in edge_geometries.values():
+        ls = getattr(eg, "linestring", None)
+        if ls is not None and len(ls.coords) >= 2:
+            parts.append(ls)
+    if not parts:
+        return None
+    if len(parts) == 1:
+        return parts[0]
+    # Simple concatenation of coordinates; good enough for OSRM map-matching input.
+    coords = []
+    for ls in parts:
+        coords.extend(ls.coords)
+    try:
+        return LineString(coords)
+    except Exception:
+        return parts[0]
+
+
 def _build_chunk(
     chunk: List[Tuple[str, Optional[str]]],
     patterns_dict: Dict,
@@ -96,7 +139,6 @@ def _build_chunk(
     shapes_by_sid: Dict,
     stop_times_by_trip: Dict,
     feed_id: int,
-    date_ymd: str,
     sigs_dict: Dict,
     database_url: Optional[str],
 ) -> int:
@@ -119,20 +161,51 @@ def _build_chunk(
             if not stops or len(stops) < 2:
                 continue
             _, cache_entry = _build_one(
-                meta, date_ymd, stops, shape_line, stop_times or []
+                meta, "", stops, shape_line, stop_times or []
             )
             sig_hash = sigs_dict.get((r, d), "")
             try:
+                # 1) Save GTFS-only graph (pretty_osm = False).
                 db_access_module.save_route_graph_pg(
                     feed_id=feed_id,
                     route_id=r,
                     direction_id=d,
-                    date_ymd=date_ymd,
                     pretty_osm=False,
                     route_sig_hash=sig_hash,
                     graph_blob=pickle.dumps(cache_entry),
                     conn=conn_w,
                 )
+                # 2) Try to precompute OSRM-snapped variant (pretty_osm = True).
+                try:
+                    pattern_geom = _merge_edge_geometries(
+                        cache_entry["edge_geometries"]
+                    )
+                    osm_res = map_match_pattern(
+                        pattern_geom=pattern_geom,
+                        edge_geometries=cache_entry["edge_geometries"],
+                    )
+                    if osm_res.used_osm:
+                        pretty_entry = {
+                            "graph": cache_entry["graph"],
+                            "edge_geometries": osm_res.snapped_edges,
+                            "pattern": cache_entry["pattern"],
+                            "used_shape": cache_entry["used_shape"],
+                            "used_osm_snapping": True,
+                            "snapped_pattern_geom": osm_res.snapped_pattern_geom,
+                            "date": None,
+                        }
+                        db_access_module.save_route_graph_pg(
+                            feed_id=feed_id,
+                            route_id=r,
+                            direction_id=d,
+                            pretty_osm=True,
+                            route_sig_hash=sig_hash,
+                            graph_blob=pickle.dumps(pretty_entry),
+                            conn=conn_w,
+                        )
+                except Exception:
+                    # OSRM failure should not break precompute.
+                    pass
                 n += 1
             except Exception:
                 pass
@@ -150,7 +223,6 @@ def main():
         description="Precompute per-route graphs into PostGIS route_graph_cache (bulk + optional parallel)."
     )
     ap.add_argument("--database-url", type=str, default=None)
-    ap.add_argument("--date", type=str, required=True, help="Service date YYYYMMDD")
     ap.add_argument(
         "--workers",
         type=int,
@@ -168,27 +240,26 @@ def main():
     conn = _connect(args.database_url)
     try:
         feed_id = db_access_module.get_active_feed_id(conn)
-        date_ymd = args.date
-        print(f"[precompute_graphs] feed_id={feed_id}, date={date_ymd}", flush=True)
+        log("precompute_graphs", f"feed_id={feed_id}")
 
         pairs = _iter_route_directions(conn)
         total = len(pairs)
-        print(f"[precompute_graphs] {total} (route_id, direction_id) pairs.", flush=True)
+        log("precompute_graphs", f"{total} (route_id, direction_id) pairs.")
 
         # 1) All patterns for feed (one query)
         patterns = db_access_module.get_patterns_for_feed(feed_id, conn)
-        print(f"[precompute_graphs] Loaded {len(patterns)} patterns.", flush=True)
+        log("precompute_graphs", f"Loaded {len(patterns)} patterns.")
 
-        # 2) Existing cache for this date (one query)
+        # 2) Existing cache for this feed (one query, GTFS-only).
         cache = db_access_module.get_cached_graphs_bulk(
-            feed_id, date_ymd, False, conn
+            feed_id, False, conn
         )
-        print(f"[precompute_graphs] Loaded {len(cache)} cached graphs.", flush=True)
+        log("precompute_graphs", f"Loaded {len(cache)} cached graphs (GTFS).")
 
         # 3) Signatures for all route/direction in one go (3 queries)
-        print("[precompute_graphs] Computing route signatures in bulk ...", flush=True)
+        log("precompute_graphs", "Computing route signatures in bulk ...")
         sigs = db_access_module.compute_route_signatures_bulk(feed_id, conn)
-        print(f"[precompute_graphs] Computed {len(sigs)} signatures.", flush=True)
+        log("precompute_graphs", f"Computed {len(sigs)} signatures.")
 
         # Pairs that need building: have pattern, (not in cache or sig mismatch)
         to_build: List[Tuple[str, Optional[str]]] = []
@@ -203,13 +274,13 @@ def main():
 
         no_pattern_count = sum(1 for (r, d) in pairs if (r, d) not in patterns)
         reused_count = len(patterns) - len(to_build)
-        print(
-            f"[precompute_graphs] To build: {len(to_build)}, already cached: {reused_count}, no pattern: {no_pattern_count}",
-            flush=True,
+        log(
+            "precompute_graphs",
+            f"To build: {len(to_build)}, already cached: {reused_count}, no_pattern: {no_pattern_count}",
         )
 
         if not to_build:
-            print("[precompute_graphs] Nothing to build.", flush=True)
+            log("precompute_graphs", "Nothing to build.")
             return
 
         # 4) Bulk load pattern_stops, shape lines, stop_times for to_build
@@ -222,7 +293,7 @@ def main():
         shape_ids = list(dict.fromkeys(shape_ids))
         trip_ids = [patterns[(r, d)].repr_trip_id for (r, d) in to_build]
 
-        print("[precompute_graphs] Bulk loading pattern_stops, shapes, stop_times ...", flush=True)
+        log("precompute_graphs", "Bulk loading pattern_stops, shapes, stop_times ...")
         stops_by_pid = db_access_module.get_pattern_stops_bulk(feed_id, pattern_ids, conn)
         shapes_by_sid = db_access_module.get_shape_lines_bulk(feed_id, shape_ids, conn)
         stop_times_by_trip = db_access_module.get_stop_times_bulk(feed_id, trip_ids, conn)
@@ -231,7 +302,8 @@ def main():
         workers = max(1, int(args.workers))
         built = 0
         if workers <= 1:
-            for i, (r, d) in enumerate(to_build):
+            total_build = len(to_build)
+            for i, (r, d) in enumerate(to_build, start=1):
                 meta = patterns[(r, d)]
                 pid = meta.pattern_id
                 stops = stops_by_pid.get(pid)
@@ -247,6 +319,7 @@ def main():
                     meta, date_ymd, stops, shape_line, stop_times or []
                 )
                 sig_hash = sigs.get((r, d), "")
+                # 1) Save GTFS-only graph.
                 key = f"postgis-{feed_id}|{r}|{d or ''}|{date_ymd}|gtfs"
                 GRAPH_CACHE[key] = cache_entry
                 try:
@@ -260,19 +333,60 @@ def main():
                         graph_blob=pickle.dumps(cache_entry),
                         conn=conn,
                     )
+                    # 2) Try to precompute OSRM-snapped graph.
+                    try:
+                        pattern_geom = _merge_edge_geometries(
+                            cache_entry["edge_geometries"]
+                        )
+                        osm_res = map_match_pattern(
+                            pattern_geom=pattern_geom,
+                            edge_geometries=cache_entry["edge_geometries"],
+                        )
+                        if osm_res.used_osm:
+                            pretty_entry = {
+                                "graph": cache_entry["graph"],
+                                "edge_geometries": osm_res.snapped_edges,
+                                "pattern": cache_entry["pattern"],
+                                "used_shape": cache_entry["used_shape"],
+                                "used_osm_snapping": True,
+                                "snapped_pattern_geom": osm_res.snapped_pattern_geom,
+                                "date": cache_entry["date"],
+                            }
+                            key_osm = (
+                                f"postgis-{feed_id}|{r}|{d or ''}|{date_ymd}|osm"
+                            )
+                            GRAPH_CACHE[key_osm] = pretty_entry
+                            db_access_module.save_route_graph_pg(
+                                feed_id=feed_id,
+                                route_id=r,
+                                direction_id=d,
+                                date_ymd=date_ymd,
+                                pretty_osm=True,
+                                route_sig_hash=sig_hash,
+                                graph_blob=pickle.dumps(pretty_entry),
+                                conn=conn,
+                            )
+                    except Exception:
+                        pass
                 except Exception:
                     pass
                 built += 1
                 progress_every = max(1, int(args.progress_every))
-                if built % progress_every == 0 or (i + 1) == len(to_build):
-                    print(
-                        f"[precompute_graphs] Processed {i + 1}/{len(to_build)} (built={built})",
-                        flush=True,
+                if built % progress_every == 0 or i == total_build:
+                    _render_progress(
+                        built,
+                        total_build,
+                        prefix="[precompute_graphs] Build ",
+                    )
+                    log(
+                        "precompute_graphs",
+                        f"Processed {i}/{total_build} (built={built})",
                     )
         else:
             from concurrent.futures import ProcessPoolExecutor, as_completed
 
-            chunk_size = (len(to_build) + workers - 1) // workers
+            total_build = len(to_build)
+            chunk_size = (total_build + workers - 1) // workers
             chunks = [
                 to_build[i : i + chunk_size]
                 for i in range(0, len(to_build), chunk_size)
@@ -297,15 +411,20 @@ def main():
                 for fut in as_completed(futures):
                     built += fut.result()
                     completed += 1
-                    print(
-                        f"[precompute_graphs] Chunk {completed}/{len(chunks)} done (built so far: {built})",
-                        flush=True,
+                    _render_progress(
+                        built,
+                        total_build,
+                        prefix="[precompute_graphs] Build (parallel) ",
                     )
-            print(f"[precompute_graphs] Parallel build done. Total built: {built}.", flush=True)
+                    log(
+                        "precompute_graphs",
+                        f"Chunk {completed}/{len(chunks)} done (built so far: {built})",
+                    )
+            log("precompute_graphs", f"Parallel build done. Total built: {built}.")
 
-        print(
-            f"[precompute_graphs] Done. built={built}, reused={reused_count}, no_pattern={no_pattern_count}",
-            flush=True,
+        log(
+            "precompute_graphs",
+            f"Done. built={built}, reused={reused_count}, no_pattern={no_pattern_count}",
         )
     finally:
         conn.close()

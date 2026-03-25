@@ -12,6 +12,9 @@ class ServiceCalendar:
     (e.g. GTFSFeed from PostGIS) rather than a concrete gtfs_loader type.
     """
     feed: Any
+    # Simple per-date memoization to avoid recomputing active service sets for the
+    # same yyyymmdd repeatedly (useful for bulk pattern builds).
+    _cache: Dict[str, Set[str]] = None  # type: ignore[assignment]
 
     def active_service_ids_for_date(self, yyyymmdd: str) -> Set[str]:
         """
@@ -23,14 +26,24 @@ class ServiceCalendar:
         - When calendar is missing or empty, fall back to all service_ids that
           appear in trips (avoids "no patterns found" when calendar is incomplete).
         """
+        if self._cache is None:
+            self._cache = {}
+        if yyyymmdd in self._cache:
+            return self._cache[yyyymmdd].copy()
+
         # Use real calendar when available (precision + often fewer trips considered).
         calendar = getattr(self.feed, "calendar", None)
         if calendar is not None and len(calendar) > 0:
-            return self._active_from_calendar(yyyymmdd)
+            active = self._active_from_calendar(yyyymmdd)
+            self._cache[yyyymmdd] = set(active)
+            return active
 
         # Fallback for feeds without calendar: all service_ids that appear in trips.
         if hasattr(self.feed, "trips") and self.feed.trips:
-            return {t["service_id"] for t in self.feed.trips if t.get("service_id")}
+            active = {t["service_id"] for t in self.feed.trips if t.get("service_id")}
+            self._cache[yyyymmdd] = set(active)
+            return active
+        self._cache[yyyymmdd] = set()
         return set()
 
     def _active_from_calendar(self, yyyymmdd: str) -> Set[str]:

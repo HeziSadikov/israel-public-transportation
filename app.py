@@ -281,14 +281,13 @@ def graph_build(req: GraphBuildRequest):
                 example_stop_ids=pat.stop_ids[:5],
                 feed_version=feed_version,
             )
-        # Try PostGIS route_graph_cache keyed by per-route signature.
+        # Try PostGIS route_graph_cache keyed by per-route signature (date-agnostic).
         try:
             sig_hash = db_access_module.compute_route_signature(req.route_id, req.direction_id)
             cached_blob = db_access_module.get_cached_route_graph_pg(
                 feed_id=feed_id,
                 route_id=req.route_id,
                 direction_id=req.direction_id,
-                date_ymd=date_str,
                 pretty_osm=req.pretty_osm,
                 route_sig_hash=sig_hash,
             )
@@ -347,10 +346,10 @@ def graph_build(req: GraphBuildRequest):
                     feed_id=feed_id,
                     route_id=req.route_id,
                     direction_id=req.direction_id,
-                    date_ymd=date_str,
                     pretty_osm=req.pretty_osm,
                     route_sig_hash=sig_hash,
                     graph_blob=pickle.dumps(cache_entry),
+                    date_ymd=date_str,
                 )
             except Exception:
                 pass
@@ -1596,11 +1595,13 @@ def detours_by_area(req: DetourByAreaRequest):
             detail=f"GTFS feed could not be loaded. Place israel-public-transportation.zip in the project root or run /feed/update. ({e})",
         )
 
-    print(
-        f"[detours/by-area] mode={req.mode}, date={req.date}, "
+    from backend.logging_utils import log as _log_detours
+
+    _log_detours(
+        "detours/by-area",
+        f"mode={req.mode}, date={req.date}, "
         f"time_window={req.start_time}-{req.end_time}, "
         f"max_routes={req.max_routes}, transfer_radius_m={req.transfer_radius_m}",
-        flush=True,
     )
 
     if req.mode == DetourByAreaMode.route:
@@ -1617,13 +1618,13 @@ def detours_by_area(req: DetourByAreaRequest):
             transfer_radius_m=req.transfer_radius_m,
             use_osm_detour=req.use_osm_detour,
         )
-        print(
-            f"[detours/by-area] single route_id={result.route_id!r}, "
+        _log_detours(
+            "detours/by-area",
+            f"single route_id={result.route_id!r}, "
             f"direction_id={result.direction_id!r}, "
             f"blocked_edges={result.blocked_edges_count}, "
             f"used_transfers={result.used_transfers}, "
             f"error={result.error!r}",
-            flush=True,
         )
         return DetourByAreaResponse(mode=req.mode, result=result, feed_version=feed.version_id)
 
@@ -1667,11 +1668,11 @@ def detours_by_area(req: DetourByAreaRequest):
         )
         results.append(res)
 
-    print(
-        f"[detours/by-area] computed {len(results)} route detours "
+    _log_detours(
+        "detours/by-area",
+        f"computed {len(results)} route detours "
         f"for blockage on date={req.date}, "
         f"time_window={req.start_time}-{req.end_time}",
-        flush=True,
     )
 
     return DetourByAreaResponse(mode=req.mode, results=results, feed_version=feed.version_id)

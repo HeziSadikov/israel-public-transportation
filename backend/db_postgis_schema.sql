@@ -192,11 +192,12 @@ CREATE TABLE IF NOT EXISTS route_graph_cache (
     feed_id        INT REFERENCES feed_versions(id) ON DELETE CASCADE,
     route_id       TEXT NOT NULL,
     direction_id   INT,
-    date_ymd       INT NOT NULL,
+    -- date_ymd is now metadata-only (\"last built for\"), not part of the logical key.
+    date_ymd       INT,
     pretty_osm     BOOLEAN NOT NULL,
     route_sig_hash TEXT NOT NULL,
     graph_blob     BYTEA NOT NULL,
     created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (feed_id, route_id, direction_id, date_ymd, pretty_osm)
+    PRIMARY KEY (feed_id, route_id, direction_id, pretty_osm)
 );
 

@@ -9,6 +9,7 @@ from typing import Optional, Dict, Any
 
 import httpx
 
+from .logging_utils import log, now_ts
 from .config import (
     GTFS_DATA_DIR,
     FEED_METADATA_PATH,
@@ -89,7 +90,7 @@ def update_feed() -> Dict[str, Any]:
     online_ok = False
 
     try:
-        print(f"[feed/update] Downloading GTFS from {url} ...", flush=True)
+        log("feed/update", f"Downloading GTFS from {url} ...")
         with httpx.stream("GET", url, timeout=60.0) as resp:
             resp.raise_for_status()
             total = int(resp.headers.get("Content-Length") or 0)
@@ -103,12 +104,12 @@ def update_feed() -> Dict[str, Any]:
                         mb = downloaded / (1024 * 1024)
                         if total > 0:
                             pct = downloaded * 100.0 / total
-                            print(f"[feed/update] Downloaded {mb:.1f} MB ({pct:.1f}%) ...", flush=True)
+                            log("feed/update", f"Downloaded {mb:.1f} MB ({pct:.1f}%) ...")
                         else:
-                            print(f"[feed/update] Downloaded {mb:.1f} MB ...", flush=True)
+                            log("feed/update", f"Downloaded {mb:.1f} MB ...")
                         next_log += 5 * 1024 * 1024
         size_mb = zip_path.stat().st_size / (1024 * 1024)
-        print(f"[feed/update] Download complete: {size_mb:.1f} MB saved to {zip_path}", flush=True)
+        log("feed/update", f"Download complete: {size_mb:.1f} MB saved to {zip_path}")
         online_ok = True
     except Exception:
         # Online update failed; fall back to last active
@@ -133,7 +134,7 @@ def update_feed() -> Dict[str, Any]:
         }
 
     # Import and only then switch active (blue/green)
-    print("[feed/update] Importing GTFS into PostGIS and building patterns ...", flush=True)
+    log("feed/update", "Importing GTFS into PostGIS and building patterns ...")
     feed_version = _import_feed(zip_path, version_id, today, sha256)
     record = {
         "version_id": feed_version.version_id,
