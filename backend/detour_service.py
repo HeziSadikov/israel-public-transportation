@@ -7,7 +7,14 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import networkx as nx
 
-from .detour_graph import DetourGraphParams, build_detour_graph, default_detour_graph_params
+from .detour_graph import (
+    DetourGraphParams,
+    DetourGraphBuildError,
+    PATTERN_DATA_MISSING,
+    POSTGIS_UNAVAILABLE,
+    build_detour_graph,
+    default_detour_graph_params,
+)
 from .graph_builder import EdgeGeometry
 from .router_core import astar_route, collect_path_geojson, compute_blocked_edges
 from .routing_policy import RoutingPolicy, default_routing_policy
@@ -106,16 +113,32 @@ def compute_detour(inp: DetourComputeInput) -> DetourComputeResult:
         baseline_travel_time_s = None
         baseline_distance_m = None
 
-    detour_graph_res = build_detour_graph(
-        feed=inp.feed,
-        date_ymd=inp.date_str,
-        blockage_geojson=inp.blockage_geojson,
-        primary_route_id=inp.route_id,
-        primary_direction_id=inp.direction_id,
-        start_sec=inp.start_sec,
-        end_sec=inp.end_sec,
-        params=dparams,
-    )
+    try:
+        detour_graph_res = build_detour_graph(
+            feed=inp.feed,
+            date_ymd=inp.date_str,
+            blockage_geojson=inp.blockage_geojson,
+            primary_route_id=inp.route_id,
+            primary_direction_id=inp.direction_id,
+            start_sec=inp.start_sec,
+            end_sec=inp.end_sec,
+            params=dparams,
+        )
+    except DetourGraphBuildError as e:
+        if e.code == POSTGIS_UNAVAILABLE:
+            raise DetourComputeError(
+                503,
+                "PostGIS is unavailable for detour computation.",
+            ) from e
+        if e.code == PATTERN_DATA_MISSING:
+            raise DetourComputeError(
+                409,
+                "Required pattern data is missing for detour computation.",
+            ) from e
+        raise DetourComputeError(
+            409,
+            "Detour graph build failed.",
+        ) from e
 
     detour_blocked, detour_blocked_geojson = compute_blocked_edges(
         edge_geometries=detour_graph_res.edge_geometries,

@@ -4,6 +4,13 @@ import os
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
+
+def parse_bool_env(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
 # Local GTFS zip for offline/dev
 LOCAL_GTFS_ZIP = BASE_DIR / "israel-public-transportation.zip"
 
@@ -30,6 +37,7 @@ OSM_ENGINE_URL = os.getenv("OSM_ENGINE_URL", "http://localhost:5000")
 # If set, /detour will use Valhalla to route around the blocked area on the road network.
 # Example: http://localhost:8002 (Valhalla default port)
 VALHALLA_URL = os.getenv("VALHALLA_URL", "")
+DETOUR_ALLOW_FEED_FALLBACK = parse_bool_env("DETOUR_ALLOW_FEED_FALLBACK", False)
 
 # PostgreSQL/PostGIS: backend/db_access.py reads DATABASE_URL for area search, graph build, detours.
 # Example: postgresql://user:pass@localhost:5432/israel_gtfs

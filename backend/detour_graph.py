@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Dict, List, Tuple, Optional, Set
 
@@ -17,9 +18,22 @@ from .graph_builder import (
 )
 from .area_search import find_routes_in_polygon
 from . import db_access
+from .config import DETOUR_ALLOW_FEED_FALLBACK
 
 if TYPE_CHECKING:
     from .gtfs_loader import GTFSFeed
+
+
+logger = logging.getLogger(__name__)
+
+POSTGIS_UNAVAILABLE = "postgis_unavailable"
+PATTERN_DATA_MISSING = "pattern_data_missing"
+
+
+class DetourGraphBuildError(Exception):
+    def __init__(self, code: str, message: str) -> None:
+        self.code = code
+        super().__init__(message)
 
 
 def _env_float(key: str, default: str) -> float:
@@ -281,6 +295,7 @@ def build_detour_graph(
 
     use_postgis = False
     primary_meta = None
+    postgis_error: Optional[Exception] = None
     try:
         db_access.get_active_feed_id()
         dir_param = str(primary_direction_id) if primary_direction_id is not None else None
@@ -288,8 +303,8 @@ def build_detour_graph(
             primary_route_id, dir_param, date_ymd
         )
         use_postgis = primary_meta is not None
-    except (RuntimeError, Exception):
-        pass
+    except (RuntimeError, Exception) as exc:
+        postgis_error = exc
     if feed is None and primary_meta is not None:
         use_postgis = True
 
@@ -304,6 +319,16 @@ def build_detour_graph(
                 metas.append(meta)
         _merge_from_postgis_bulk(g, edge_geoms, metas, date_ymd)
     else:
+        if postgis_error is not None and not (DETOUR_ALLOW_FEED_FALLBACK and feed is not None):
+            raise DetourGraphBuildError(
+                POSTGIS_UNAVAILABLE,
+                "PostGIS is unavailable for detour graph build.",
+            ) from postgis_error
+        if primary_meta is None and not (DETOUR_ALLOW_FEED_FALLBACK and feed is not None):
+            raise DetourGraphBuildError(
+                PATTERN_DATA_MISSING,
+                "Primary route pattern data is missing in PostGIS for detour graph build.",
+            )
         if feed is None:
             idx = _build_nodes_by_stop_id(g, None)
             return DetourGraph(
@@ -312,6 +337,16 @@ def build_detour_graph(
                 primary_pattern_id=None,
                 nodes_by_stop_id=idx,
             )
+        reason_code = POSTGIS_UNAVAILABLE if postgis_error is not None else PATTERN_DATA_MISSING
+        logger.warning(
+            "detour_graph_feed_fallback",
+            extra={
+                "route_id": primary_route_id,
+                "date": date_ymd,
+                "reason_code": reason_code,
+                "fallback_used": True,
+            },
+        )
         patterns_builder = PatternBuilder(feed)
         graph_builder = GraphBuilder(feed)
 
