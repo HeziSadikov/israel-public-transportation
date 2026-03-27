@@ -381,6 +381,134 @@ def get_pattern_stops_bulk(
             conn.close()
 
 
+def get_pattern_nodes_bulk(
+    pattern_ids: List[str],
+    conn=None,
+) -> List[Dict[str, Any]]:
+    """
+    Load precomputed pattern-stop occurrence nodes from PostGIS.
+
+    Returns rows suitable for assembling the local detour nx.DiGraph with:
+    - node_id, pattern_id, stop_id, stop_sequence
+    - lat/lon
+    - out_heading_deg and frequency (used for transfer compatibility + A* weighting)
+    """
+    if not pattern_ids:
+        return []
+    close = False
+    if conn is None:
+        conn = _get_conn()
+        close = True
+    try:
+        feed_id = get_active_feed_id(conn)
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    node_id,
+                    pattern_id,
+                    route_id,
+                    direction_id,
+                    stop_id,
+                    stop_sequence,
+                    lat,
+                    lon,
+                    out_heading_deg,
+                    frequency
+                FROM pattern_nodes
+                WHERE feed_id = %s
+                  AND pattern_id = ANY(%s)
+                """,
+                (feed_id, pattern_ids),
+            )
+            return [
+                {
+                    "node_id": r["node_id"],
+                    "pattern_id": r["pattern_id"],
+                    "route_id": r["route_id"],
+                    "direction_id": None if r.get("direction_id") is None else str(r.get("direction_id")),
+                    "stop_id": r["stop_id"],
+                    "stop_sequence": int(r["stop_sequence"]),
+                    "lat": float(r["lat"]),
+                    "lon": float(r["lon"]),
+                    "out_heading_deg": None if r.get("out_heading_deg") is None else float(r.get("out_heading_deg")),
+                    "frequency": None if r.get("frequency") is None else int(r.get("frequency")),
+                }
+                for r in cur.fetchall()
+            ]
+    finally:
+        if close:
+            conn.close()
+
+
+def get_pattern_edges_bulk(
+    pattern_ids: List[str],
+    conn=None,
+) -> List[Dict[str, Any]]:
+    """
+    Load precomputed directed ride edges for pattern_ids from PostGIS.
+
+    Edge geometries are returned as Shapely LineStrings so the caller can:
+    - build edge_geometries for blocked-edge intersection + GeoJSON
+    - set A* weights: travel_time_s + distance_m
+    """
+    if not pattern_ids:
+        return []
+    # Local import: shapely is only required when precomputed ride-network is used.
+    from shapely import wkt as _wkt
+
+    close = False
+    if conn is None:
+        conn = _get_conn()
+        close = True
+    try:
+        feed_id = get_active_feed_id(conn)
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    pattern_id,
+                    from_node_id,
+                    to_node_id,
+                    from_stop_id,
+                    to_stop_id,
+                    travel_time_s,
+                    distance_m,
+                    ST_AsText(geom) AS wkt
+                FROM pattern_edges
+                WHERE feed_id = %s
+                  AND pattern_id = ANY(%s)
+                """,
+                (feed_id, pattern_ids),
+            )
+            rows = cur.fetchall()
+            out: List[Dict[str, Any]] = []
+            for r in rows:
+                line = None
+                wkt_txt = r.get("wkt")
+                if wkt_txt:
+                    try:
+                        line = _wkt.loads(str(wkt_txt))
+                    except Exception:
+                        line = None
+                out.append(
+                    {
+                        "pattern_id": r["pattern_id"],
+                        "from_node_id": r["from_node_id"],
+                        "to_node_id": r["to_node_id"],
+                        "from_stop_id": r["from_stop_id"],
+                        "to_stop_id": r["to_stop_id"],
+                        "travel_time_s": None if r.get("travel_time_s") is None else float(r.get("travel_time_s")),
+                        "distance_m": None if r.get("distance_m") is None else float(r.get("distance_m")),
+                        "linestring": line,
+                    }
+                )
+            return out
+    finally:
+        if close:
+            conn.close()
+
+
 def get_shape_line(shape_id: str, conn=None) -> Optional[Any]:
     """
     Return the LineString geometry for the given shape_id from shapes_lines.

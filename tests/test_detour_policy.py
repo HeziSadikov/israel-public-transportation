@@ -16,6 +16,7 @@ from backend.detour_graph import (
 )
 from backend.detour_service import DetourComputeError, DetourComputeInput, compute_detour
 from backend.graph_builder import EdgeGeometry
+import backend.graph_builder as graph_builder_mod
 
 
 def _tiny_graph(u: str = "a", v: str = "b", sid_u: str = "S1", sid_v: str = "S2") -> tuple[nx.DiGraph, dict]:
@@ -195,3 +196,113 @@ def test_compute_detour_threads_window_uses_resolver_and_detour_blocked(monkeypa
     assert captured["astar_calls"][0]["blocked_edges"] == set()
     # detour call: blocked set comes only from detour graph computation
     assert captured["astar_calls"][1]["blocked_edges"] == {("d1", "d2")}
+
+
+def test_build_detour_graph_postgis_uses_precomputed_tables(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Smoke/regression:
+    When PostGIS is available, `build_detour_graph` must assemble the local graph from
+    precomputed `pattern_nodes` / `pattern_edges` instead of rebuilding per-pattern graphs.
+    """
+    import backend.detour_graph as dg
+
+    # If legacy on-demand per-pattern graph building is called, we want the test to fail.
+    def _fail_build_graph_for_pattern(*_args, **_kwargs):
+        raise AssertionError("build_graph_for_pattern_from_postgis must not be called")
+
+    monkeypatch.setattr(graph_builder_mod, "build_graph_for_pattern_from_postgis", _fail_build_graph_for_pattern)
+
+    monkeypatch.setattr(dg, "DETOUR_ALLOW_FEED_FALLBACK", False)
+
+    # Candidate routes returned by AOI lookup (keep it small).
+    monkeypatch.setattr(
+        dg, "find_routes_in_polygon", lambda **_kwargs: [{"route_id": "R2", "direction_id": "0"}]
+    )
+
+    # PostGIS available + pattern lookup succeeds for primary and secondary route.
+    monkeypatch.setattr(dg.db_access, "get_active_feed_id", lambda *_args, **_kwargs: 1)
+
+    def _fake_get_pattern_for_route(route_id: str, direction_id: str | None, date_ymd: str):
+        # Pattern id must be deterministic per route/direction for node selection.
+        did = direction_id if direction_id is not None else "none"
+        return SimpleNamespace(pattern_id=f"pat_{route_id}_{did}")
+
+    monkeypatch.setattr(dg.db_access, "get_pattern_for_route", _fake_get_pattern_for_route)
+
+    # Provide a minimal precomputed ride graph for two patterns.
+    from shapely.geometry import LineString
+
+    def _fake_get_pattern_nodes_bulk(pattern_ids: list[str], *_args, **_kwargs):
+        out = []
+        for pid in pattern_ids:
+            # Two stops per pattern: S1 -> S2
+            n1 = f"{pid}:S1:0"
+            n2 = f"{pid}:S2:1"
+            out.extend(
+                [
+                    {
+                        "node_id": n1,
+                        "pattern_id": pid,
+                        "route_id": "R1",
+                        "direction_id": "0",
+                        "stop_id": "S1",
+                        "stop_sequence": 0,
+                        "lat": 32.0,
+                        "lon": 34.8,
+                        "out_heading_deg": 90.0,
+                        "frequency": 10,
+                    },
+                    {
+                        "node_id": n2,
+                        "pattern_id": pid,
+                        "route_id": "R1",
+                        "direction_id": "0",
+                        "stop_id": "S2",
+                        "stop_sequence": 1,
+                        "lat": 32.0005,
+                        "lon": 34.8005,
+                        "out_heading_deg": 90.0,
+                        "frequency": 10,
+                    },
+                ]
+            )
+        return out
+
+    def _fake_get_pattern_edges_bulk(pattern_ids: list[str], *_args, **_kwargs):
+        out = []
+        ls = LineString([(34.8, 32.0), (34.8005, 32.0005)])
+        for pid in pattern_ids:
+            out.append(
+                {
+                    "pattern_id": pid,
+                    "from_node_id": f"{pid}:S1:0",
+                    "to_node_id": f"{pid}:S2:1",
+                    "from_stop_id": "S1",
+                    "to_stop_id": "S2",
+                    "travel_time_s": 60.0,
+                    "distance_m": 1000.0,
+                    "linestring": ls,
+                }
+            )
+        return out
+
+    monkeypatch.setattr(dg.db_access, "get_pattern_nodes_bulk", _fake_get_pattern_nodes_bulk)
+    monkeypatch.setattr(dg.db_access, "get_pattern_edges_bulk", _fake_get_pattern_edges_bulk)
+
+    res = dg.build_detour_graph(
+        feed=object(),
+        date_ymd="20260101",
+        blockage_geojson={"type": "Point", "coordinates": [34.8, 32.0]},
+        primary_route_id="R1",
+        primary_direction_id="0",
+        start_sec=None,
+        end_sec=None,
+    )
+
+    assert res.primary_pattern_id == "pat_R1_0"
+    # Both patterns should be present (rides + potential transfers).
+    assert "pat_R1_0:S1:0" in res.graph.nodes
+    assert "pat_R1_0:S2:1" in res.graph.nodes
+    assert ("pat_R1_0:S1:0", "pat_R1_0:S2:1") in res.edge_geometries

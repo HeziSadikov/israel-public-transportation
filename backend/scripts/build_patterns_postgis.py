@@ -25,6 +25,7 @@ import psycopg2
 from psycopg2.extras import DictCursor
 
 from backend.logging_utils import log
+from backend.graph_builder import build_graph_for_pattern_from_postgis
 from backend.pattern_builder import PatternBuilder, RoutePattern
 from backend.db_access import (
   get_active_feed_id,
@@ -33,6 +34,10 @@ from backend.db_access import (
   get_route_signature,
   upsert_route_signature,
   get_all_stop_times_for_feed,
+  PatternMeta,
+  get_pattern_stops_bulk,
+  get_stop_times_bulk,
+  get_shape_lines_bulk,
 )
 
 
@@ -214,6 +219,9 @@ def _upsert_patterns_for_feed(cur, feed_id: int, old_feed_id: int | None, yyyymm
   log("patterns", f"Clearing existing patterns for feed_id={feed_id} ...")
   cur.execute("DELETE FROM pattern_stops WHERE feed_id = %s", (feed_id,))
   cur.execute("DELETE FROM patterns WHERE feed_id = %s", (feed_id,))
+  # Clear precomputed ride network derived tables.
+  cur.execute("DELETE FROM pattern_nodes WHERE feed_id = %s", (feed_id,))
+  cur.execute("DELETE FROM pattern_edges WHERE feed_id = %s", (feed_id,))
 
   routes = feed.routes
   log("patterns", f"Building patterns for {len(routes)} routes ...")
@@ -348,6 +356,209 @@ def _upsert_patterns_for_feed(cur, feed_id: int, old_feed_id: int | None, yyyymm
     processed_routes += 1
     if processed_routes % 50 == 0:
       log("patterns", f"Processed {processed_routes}/{len(routes)} routes ...")
+
+  _build_pattern_ride_network(cur=cur, feed_id=feed_id, yyyymmdd=yyyymmdd)
+
+
+def _build_pattern_ride_network(cur, feed_id: int, yyyymmdd: str) -> None:
+  """
+  Populate `pattern_nodes` + `pattern_edges` for all patterns in the given feed_id.
+
+  Phase 1 strategy: derive ride nodes/edges from the authoritative `patterns` +
+  `pattern_stops` tables by calling `build_graph_for_pattern_from_postgis(...)`
+  for each pattern, then inserting the resulting nx graph into PostGIS.
+  """
+  from psycopg2.extras import execute_values
+
+  log("patterns", f"Building precomputed ride network for feed_id={feed_id} ...")
+
+  # Load all patterns (global list) then bulk load their dependencies.
+  cur.execute(
+    """
+    SELECT
+      pattern_id,
+      route_id,
+      direction_id,
+      repr_trip_id,
+      repr_shape_id,
+      stop_ids,
+      frequency,
+      used_shape
+    FROM patterns
+    WHERE feed_id = %s
+    """,
+    (feed_id,),
+  )
+  pattern_rows = cur.fetchall()
+  if not pattern_rows:
+    log("patterns", f"No patterns found for feed_id={feed_id}; ride network remains empty.")
+    return
+
+  pattern_ids: list[str] = [r["pattern_id"] for r in pattern_rows]
+  repr_trip_ids: list[str] = sorted({r.get("repr_trip_id") for r in pattern_rows if r.get("repr_trip_id")})
+  repr_shape_ids: list[str] = sorted({r.get("repr_shape_id") for r in pattern_rows if r.get("repr_shape_id")})
+
+  conn = cur.connection
+  pattern_stops_by_id = get_pattern_stops_bulk(feed_id=feed_id, pattern_ids=pattern_ids, conn=conn)
+  stop_times_by_trip = get_stop_times_bulk(feed_id=feed_id, trip_ids=repr_trip_ids, conn=conn)
+  shape_lines_by_id = get_shape_lines_bulk(feed_id=feed_id, shape_ids=repr_shape_ids, conn=conn)
+
+  nodes_inserted = 0
+  edges_inserted = 0
+
+  # Insert nodes/edges per pattern to keep memory bounded.
+  for idx, row in enumerate(pattern_rows):
+    pid = row["pattern_id"]
+
+    stops = pattern_stops_by_id.get(pid, [])
+    if len(stops) < 2:
+      continue
+
+    repr_trip_id = row.get("repr_trip_id")
+    repr_shape_id = row.get("repr_shape_id")
+
+    pattern_meta = PatternMeta(
+      pattern_id=pid,
+      route_id=row["route_id"],
+      direction_id=row.get("direction_id"),
+      repr_trip_id=repr_trip_id,
+      repr_shape_id=repr_shape_id,
+      stop_ids=[s.stop_id for s in stops],
+      frequency=int(row.get("frequency") or 0),
+      used_shape=bool(row.get("used_shape")),
+    )
+
+    shape_line = shape_lines_by_id.get(repr_shape_id) if repr_shape_id else None
+    stop_times = stop_times_by_trip.get(repr_trip_id) if repr_trip_id else None
+
+    # Build the authoritative local ride graph for this pattern.
+    res = build_graph_for_pattern_from_postgis(
+      pattern_meta=pattern_meta,
+      date_ymd=yyyymmdd,
+      pattern_stops=stops,
+      shape_line=shape_line,
+      stop_times=stop_times,
+    )
+
+    # -------------------------
+    # Insert pattern_nodes
+    # -------------------------
+    node_rows = []
+    for node_id, nd in res.graph.nodes(data=True):
+      lat = float(nd["lat"])
+      lon = float(nd["lon"])
+      out_heading = nd.get("out_heading_deg")
+      out_heading_f = None if out_heading is None else float(out_heading)
+      freq = nd.get("frequency")
+      freq_i = None if freq is None else int(freq)
+
+      direction_val = nd.get("direction_id")
+      direction_int = None
+      if direction_val not in (None, ""):
+        try:
+          direction_int = int(direction_val)
+        except (TypeError, ValueError):
+          direction_int = None
+
+      node_rows.append(
+        (
+          feed_id,
+          node_id,
+          pid,
+          nd["route_id"],
+          direction_int,
+          nd["stop_id"],
+          int(nd["stop_sequence"]),
+          lat,
+          lon,
+          out_heading_f,
+          freq_i,
+          # store WKT and let PostGIS cast to geography in the insert template
+          f"POINT({lon} {lat})",
+        )
+      )
+
+    if node_rows:
+      execute_values(
+        cur,
+        """
+        INSERT INTO pattern_nodes (
+          feed_id,
+          node_id,
+          pattern_id,
+          route_id,
+          direction_id,
+          stop_id,
+          stop_sequence,
+          lat,
+          lon,
+          out_heading_deg,
+          frequency,
+          geom
+        )
+        VALUES %s
+        """,
+        node_rows,
+        page_size=5000,
+        template="(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,ST_GeomFromText(%s,4326)::geography)",
+      )
+      nodes_inserted += len(node_rows)
+
+    # -------------------------
+    # Insert pattern_edges
+    # -------------------------
+    edge_rows = []
+    for u, v, ed in res.graph.edges(data=True):
+      eg = res.edge_geometries.get((u, v))
+      if eg is None or eg.linestring is None:
+        continue
+
+      travel_time_s = ed.get("travel_time_s", ed.get("weight"))
+      distance_m = ed.get("distance_m", 0.0)
+      edge_rows.append(
+        (
+          feed_id,
+          pid,
+          u,
+          v,
+          eg.from_stop_id,
+          eg.to_stop_id,
+          float(travel_time_s) if travel_time_s is not None else None,
+          float(distance_m) if distance_m is not None else None,
+          eg.linestring.wkt,
+        )
+      )
+
+    if edge_rows:
+      execute_values(
+        cur,
+        """
+        INSERT INTO pattern_edges (
+          feed_id,
+          pattern_id,
+          from_node_id,
+          to_node_id,
+          from_stop_id,
+          to_stop_id,
+          travel_time_s,
+          distance_m,
+          geom
+        )
+        VALUES %s
+        """,
+        edge_rows,
+        page_size=5000,
+        template="(%s,%s,%s,%s,%s,%s,%s,%s,ST_GeomFromText(%s,4326))",
+      )
+      edges_inserted += len(edge_rows)
+
+    if (idx + 1) % 50 == 0:
+      log("patterns", f"Ride network build progress: {idx + 1}/{len(pattern_rows)} patterns ...")
+
+  log(
+    "patterns",
+    f"Ride network build finished for feed_id={feed_id}. nodes={nodes_inserted}, edges={edges_inserted}",
+  )
 
 
 def _insert_pattern(cur, feed_id: int, pat: RoutePattern) -> None:

@@ -11,7 +11,6 @@ from shapely.geometry import LineString, shape, mapping
 from .pattern_builder import PatternBuilder, RoutePattern
 from .graph_builder import (
     GraphBuilder,
-    build_graph_for_pattern_from_postgis,
     EdgeGeometry,
     haversine_meters,
     angle_difference_deg,
@@ -231,18 +230,73 @@ def _merge_from_postgis_bulk(
     metas: List[db_access.PatternMeta],
     date_ymd: str,
 ) -> None:
-    """Merge pattern graphs from PostGIS using one bulk stop_times query."""
+    # Backward-compatible alias: date_ymd is metadata-only for this precomputed
+    # local ride-network build in Phase 1.
+    _merge_from_postgis_precomputed(g, edge_geoms, metas)
+
+
+def _merge_from_postgis_precomputed(
+    g: nx.DiGraph,
+    edge_geoms: Dict[Tuple[str, str], EdgeGeometry],
+    metas: List[db_access.PatternMeta],
+) -> None:
+    """Merge precomputed ride-network subgraph for these patterns."""
     if not metas:
         return
-    feed_id = db_access.get_active_feed_id()
-    trip_ids = list({m.repr_trip_id for m in metas if m.repr_trip_id})
-    bulk = db_access.get_stop_times_bulk(feed_id, trip_ids) if trip_ids else {}
-    for meta in metas:
-        st = bulk.get(meta.repr_trip_id) if meta.repr_trip_id else None
-        res = build_graph_for_pattern_from_postgis(
-            meta, date_ymd, stop_times=st if st else None
+
+    pattern_ids = [m.pattern_id for m in metas if m.pattern_id]
+    if not pattern_ids:
+        return
+
+    nodes = db_access.get_pattern_nodes_bulk(pattern_ids)
+    edges = db_access.get_pattern_edges_bulk(pattern_ids)
+
+    # Nodes
+    for nd in nodes:
+        nid = nd["node_id"]
+        if nid in g:
+            continue
+        g.add_node(
+            nid,
+            pattern_id=nd["pattern_id"],
+            route_id=nd["route_id"],
+            direction_id=nd["direction_id"],
+            stop_id=nd["stop_id"],
+            stop_sequence=nd["stop_sequence"],
+            stop_name=None,
+            lat=float(nd["lat"]),
+            lon=float(nd["lon"]),
+            out_heading_deg=nd["out_heading_deg"],
+            frequency=nd["frequency"],
         )
-        _merge_graphs(g, edge_geoms, res.graph, res.edge_geometries)
+
+    # Ride edges
+    for ed in edges:
+        u = ed["from_node_id"]
+        v = ed["to_node_id"]
+        if u not in g or v not in g:
+            # Defensive: should not happen, but avoid malformed inserts breaking request.
+            continue
+        travel_time_s = ed.get("travel_time_s")
+        distance_m = ed.get("distance_m")
+        if travel_time_s is None:
+            continue
+        weight = float(travel_time_s)
+        g.add_edge(
+            u,
+            v,
+            weight=weight,
+            travel_time_s=weight,
+            distance_m=0.0 if distance_m is None else float(distance_m),
+        )
+
+        linestring = ed.get("linestring")
+        if linestring is not None:
+            edge_geoms[(u, v)] = EdgeGeometry(
+                from_stop_id=ed["from_stop_id"],
+                to_stop_id=ed["to_stop_id"],
+                linestring=linestring,
+            )
 
 
 def build_detour_graph(
@@ -264,9 +318,10 @@ def build_detour_graph(
     - Blocking still uses the raw blockage geometry (caller uses blockage_geojson for
       compute_blocked_edges). Here we only use the buffer to select which routes go in the graph.
     - Nodes are pattern-stops; ride edges same-pattern only; transfers heading-compatible.
-    - When PostGIS can resolve the primary pattern, all merged routes use PostGIS (no GraphBuilder
-      on the detour hot path). Feed + GraphBuilder is only used when PostGIS pattern lookup fails
-      but an in-memory feed is available.
+    - When PostGIS can resolve the primary pattern, all merged routes use PostGIS precomputed
+      ride-network tables (`pattern_nodes` + `pattern_edges`) to assemble the local graph
+      (no per-pattern GraphBuilder work on the detour hot path). Feed + GraphBuilder is only used
+      when PostGIS pattern lookup fails but an in-memory feed is available.
     """
     p = params or default_detour_graph_params()
 
@@ -317,7 +372,7 @@ def build_detour_graph(
             meta = db_access.get_pattern_for_route(rid, None, date_ymd)
             if meta is not None:
                 metas.append(meta)
-        _merge_from_postgis_bulk(g, edge_geoms, metas, date_ymd)
+        _merge_from_postgis_precomputed(g, edge_geoms, metas)
     else:
         if postgis_error is not None and not (DETOUR_ALLOW_FEED_FALLBACK and feed is not None):
             raise DetourGraphBuildError(

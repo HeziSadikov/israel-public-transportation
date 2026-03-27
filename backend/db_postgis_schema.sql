@@ -201,3 +201,52 @@ CREATE TABLE IF NOT EXISTS route_graph_cache (
     PRIMARY KEY (feed_id, route_id, direction_id, pretty_osm)
 );
 
+-- ---------------------------------------------------------------------------
+-- Precomputed directional ride network (pattern_nodes / pattern_edges)
+-- ---------------------------------------------------------------------------
+
+-- Each node is a pattern-stop occurrence (pattern-stop node), unique per
+-- (pattern_id, stop_id, stop_sequence). This matches router graph semantics:
+-- node_id = f"{pattern_id}:{stop_id}:{stop_sequence}" from pattern_stop_node_id().
+CREATE TABLE IF NOT EXISTS pattern_nodes (
+    feed_id           INT REFERENCES feed_versions(id) ON DELETE CASCADE,
+    node_id           TEXT NOT NULL,
+    pattern_id       TEXT NOT NULL,
+    route_id         TEXT NOT NULL,
+    direction_id     INT,
+    stop_id          TEXT NOT NULL,
+    stop_sequence    INT NOT NULL,
+    lat              DOUBLE PRECISION NOT NULL,
+    lon              DOUBLE PRECISION NOT NULL,
+    out_heading_deg  DOUBLE PRECISION,
+    frequency        INT,
+    geom              GEOGRAPHY(POINT, 4326),
+    PRIMARY KEY (feed_id, node_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pattern_nodes_feed_pattern
+    ON pattern_nodes(feed_id, pattern_id);
+
+CREATE INDEX IF NOT EXISTS idx_pattern_nodes_geom
+    ON pattern_nodes USING GIST (geom);
+
+CREATE TABLE IF NOT EXISTS pattern_edges (
+    feed_id           INT REFERENCES feed_versions(id) ON DELETE CASCADE,
+    pattern_id       TEXT NOT NULL,
+    from_node_id     TEXT NOT NULL,
+    to_node_id       TEXT NOT NULL,
+    from_stop_id     TEXT NOT NULL,
+    to_stop_id       TEXT NOT NULL,
+    travel_time_s    DOUBLE PRECISION,
+    distance_m       DOUBLE PRECISION,
+    geom              GEOMETRY(LineString, 4326),
+    PRIMARY KEY (feed_id, pattern_id, from_node_id, to_node_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pattern_edges_feed_pattern
+    ON pattern_edges(feed_id, pattern_id);
+
+CREATE INDEX IF NOT EXISTS idx_pattern_edges_geom
+    ON pattern_edges USING GIST (geom);
+
+
