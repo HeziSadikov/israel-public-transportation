@@ -5,6 +5,7 @@ from datetime import datetime
 from typing import Dict, List, Tuple, Optional
 import hashlib
 import pickle
+import time
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -48,13 +49,27 @@ from backend.api_models import (
     DetourByAreaMode,
     GeocodeResult,
 )
-from backend.config import GRAPH_CACHE, GRAPH_CACHE_DIR
+from backend.config import (
+    GRAPH_CACHE,
+    GRAPH_CACHE_DIR,
+    GRAPH_WARMUP_ENABLED,
+    GRAPH_WARMUP_TIMEOUT_S,
+    GRAPH_WARMUP_PROFILES,
+)
 from backend.area_search import find_routes_in_polygon
 from backend import db_access as db_access_module
-from backend.service_calendar import ServiceCalendar
+from backend.service_calendar import ServiceCalendar, resolve_service_profile
 
 
 app = FastAPI(title="Israel GTFS Detour Router")
+GRAPH_WARMUP_STATUS: Dict[str, object] = {
+    "last_started_at": None,
+    "last_finished_at": None,
+    "last_duration_s": None,
+    "loaded_gtfs": 0,
+    "loaded_osm": 0,
+    "errors": 0,
+}
 
 app.add_middleware(
     CORSMiddleware,
@@ -68,6 +83,60 @@ app.add_middleware(
 @app.get("/health")
 def health():
     return {"status": "ok", "time": datetime.utcnow().isoformat() + "Z"}
+
+
+def _run_graph_cache_warmup(profiles: Optional[List[str]] = None) -> Dict[str, object]:
+    started = time.time()
+    GRAPH_WARMUP_STATUS["last_started_at"] = datetime.utcnow().isoformat() + "Z"
+    GRAPH_WARMUP_STATUS["errors"] = 0
+    loaded_gtfs = 0
+    loaded_osm = 0
+    profile_keys = profiles or list(GRAPH_WARMUP_PROFILES)
+    try:
+        feed_id = db_access_module.get_active_feed_id()
+        feed_version = f"postgis-{feed_id}"
+        pairs = db_access_module.get_route_direction_pairs(feed_id)
+        cached_gtfs = db_access_module.get_cached_graphs_bulk(feed_id, False)
+        cached_osm = db_access_module.get_cached_graphs_bulk(feed_id, True)
+        timeout_s = max(1, int(GRAPH_WARMUP_TIMEOUT_S))
+        for route_id, direction_id in pairs:
+            if time.time() - started > timeout_s:
+                break
+            row_gtfs = cached_gtfs.get((route_id, direction_id))
+            if row_gtfs:
+                try:
+                    entry = pickle.loads(row_gtfs[1])
+                    for p in profile_keys:
+                        key = _graph_cache_key(feed_version, route_id, direction_id, p, False)
+                        GRAPH_CACHE[key] = entry
+                    loaded_gtfs += 1
+                except Exception:
+                    GRAPH_WARMUP_STATUS["errors"] = int(GRAPH_WARMUP_STATUS["errors"] or 0) + 1
+            row_osm = cached_osm.get((route_id, direction_id))
+            if row_osm:
+                try:
+                    entry = pickle.loads(row_osm[1])
+                    for p in profile_keys:
+                        key = _graph_cache_key(feed_version, route_id, direction_id, p, True)
+                        GRAPH_CACHE[key] = entry
+                    loaded_osm += 1
+                except Exception:
+                    GRAPH_WARMUP_STATUS["errors"] = int(GRAPH_WARMUP_STATUS["errors"] or 0) + 1
+    except Exception:
+        GRAPH_WARMUP_STATUS["errors"] = int(GRAPH_WARMUP_STATUS["errors"] or 0) + 1
+    finished = time.time()
+    GRAPH_WARMUP_STATUS["last_finished_at"] = datetime.utcnow().isoformat() + "Z"
+    GRAPH_WARMUP_STATUS["last_duration_s"] = round(finished - started, 3)
+    GRAPH_WARMUP_STATUS["loaded_gtfs"] = loaded_gtfs
+    GRAPH_WARMUP_STATUS["loaded_osm"] = loaded_osm
+    return dict(GRAPH_WARMUP_STATUS)
+
+
+@app.on_event("startup")
+def startup_graph_warmup():
+    if not GRAPH_WARMUP_ENABLED:
+        return
+    _run_graph_cache_warmup()
 
 
 @app.get("/geocode", response_model=list[GeocodeResult])
@@ -183,6 +252,24 @@ def _graph_cache_key(
     feed_version: str,
     route_id: str,
     direction_id: str | None,
+    profile_key: str,
+    pretty_osm: bool,
+) -> str:
+    return "|".join(
+        [
+            feed_version,
+            route_id,
+            direction_id or "",
+            f"profile:{profile_key}",
+            "osm" if pretty_osm else "gtfs",
+        ]
+    )
+
+
+def _legacy_graph_cache_key(
+    feed_version: str,
+    route_id: str,
+    direction_id: str | None,
     date: str,
     pretty_osm: bool,
 ) -> str:
@@ -203,24 +290,38 @@ def _graph_cache_keys_for_lookup(
     date_str: str,
 ) -> list[str]:
     """Return candidate cache keys to try (PostGIS first, then feed version if loaded)."""
+    profile_key = resolve_service_profile(date_str)
     keys = []
     try:
         feed_id = db_access_module.get_active_feed_id()
         keys.append(
-            _graph_cache_key(f"postgis-{feed_id}", route_id, direction_id, date_str, False)
+            _graph_cache_key(f"postgis-{feed_id}", route_id, direction_id, profile_key, False)
         )
         keys.append(
-            _graph_cache_key(f"postgis-{feed_id}", route_id, direction_id, date_str, True)
+            _graph_cache_key(f"postgis-{feed_id}", route_id, direction_id, profile_key, True)
+        )
+        # Transition compatibility for older date-fragmented keys.
+        keys.append(
+            _legacy_graph_cache_key(f"postgis-{feed_id}", route_id, direction_id, date_str, False)
+        )
+        keys.append(
+            _legacy_graph_cache_key(f"postgis-{feed_id}", route_id, direction_id, date_str, True)
         )
     except (RuntimeError, Exception):
         pass
     try:
         feed = load_active_feed()
         keys.append(
-            _graph_cache_key(feed.version_id, route_id, direction_id, date_str, False)
+            _graph_cache_key(feed.version_id, route_id, direction_id, profile_key, False)
         )
         keys.append(
-            _graph_cache_key(feed.version_id, route_id, direction_id, date_str, True)
+            _graph_cache_key(feed.version_id, route_id, direction_id, profile_key, True)
+        )
+        keys.append(
+            _legacy_graph_cache_key(feed.version_id, route_id, direction_id, date_str, False)
+        )
+        keys.append(
+            _legacy_graph_cache_key(feed.version_id, route_id, direction_id, date_str, True)
         )
     except Exception:
         pass
@@ -241,6 +342,7 @@ def _graph_cache_file_path(cache_key: str, feed_version: str):
 @app.post("/graph/build", response_model=GraphBuildResponse)
 def graph_build(req: GraphBuildRequest):
     date_str = req.date or datetime.utcnow().strftime("%Y%m%d")
+    profile_key = resolve_service_profile(date_str)
 
     # Prefer PostGIS when an active feed is available and we have a pattern for this route.
     try:
@@ -268,7 +370,7 @@ def graph_build(req: GraphBuildRequest):
             feed_version=feed_version,
             route_id=req.route_id,
             direction_id=req.direction_id,
-            date=date_str,
+            profile_key=profile_key,
             pretty_osm=req.pretty_osm,
         )
         cached = GRAPH_CACHE.get(key)
@@ -301,6 +403,16 @@ def graph_build(req: GraphBuildRequest):
             try:
                 cached = pickle.loads(cached_blob)
                 GRAPH_CACHE[key] = cached
+                # Backward-compatible alias key (date-shaped) during transition.
+                GRAPH_CACHE[
+                    _legacy_graph_cache_key(
+                        feed_version=feed_version,
+                        route_id=req.route_id,
+                        direction_id=req.direction_id,
+                        date=date_str,
+                        pretty_osm=req.pretty_osm,
+                    )
+                ] = cached
                 pat = cached["pattern"]
                 edge_geoms = cached["edge_geometries"]
                 used_shape = cached["used_shape"]
@@ -342,6 +454,15 @@ def graph_build(req: GraphBuildRequest):
             "date": date_str,
         }
         GRAPH_CACHE[key] = cache_entry
+        GRAPH_CACHE[
+            _legacy_graph_cache_key(
+                feed_version=feed_version,
+                route_id=req.route_id,
+                direction_id=req.direction_id,
+                date=date_str,
+                pretty_osm=req.pretty_osm,
+            )
+        ] = cache_entry
         if sig_hash:
             try:
                 db_access_module.save_route_graph_pg(
@@ -927,6 +1048,28 @@ def graph_geojson(
         )
 
     return {"type": "FeatureCollection", "features": features}
+
+
+@app.get("/graph/cache/status")
+def graph_cache_status():
+    return {
+        "entries": len(GRAPH_CACHE),
+        "profiles": list(GRAPH_WARMUP_PROFILES),
+        "warmup": dict(GRAPH_WARMUP_STATUS),
+    }
+
+
+@app.post("/graph/cache/warmup")
+def graph_cache_warmup(profiles: Optional[str] = None):
+    selected = None
+    if profiles:
+        selected = [p.strip() for p in str(profiles).split(",") if p.strip()]
+    res = _run_graph_cache_warmup(selected)
+    return {
+        "ok": True,
+        "entries": len(GRAPH_CACHE),
+        "warmup": res,
+    }
 
 
 def _parse_hhmm_to_seconds(value: str) -> int:

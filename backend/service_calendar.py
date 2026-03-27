@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, date
-from typing import Dict, List, Set, Any
+from typing import Dict, Set, Any, Optional
 
 
 @dataclass
@@ -97,4 +97,50 @@ def parse_gtfs_time_to_seconds(t: str) -> int:
     h, m, s = map(int, parts)
     # Allow 24-27 hour values for Israel GTFS
     return h * 3600 + m * 60 + s
+
+
+def default_profile_for_date(yyyymmdd: str) -> str:
+    """
+    Resolve a baseline service profile from day-of-week.
+    """
+    d = datetime.strptime(yyyymmdd, "%Y%m%d").date()
+    dow = d.weekday()  # Mon=0 ... Sun=6
+    if dow == 4:
+        return "friday"
+    if dow == 5:
+        return "saturday"
+    if dow == 6:
+        return "sunday"
+    return "weekday"
+
+
+def date_has_calendar_exception(yyyymmdd: str, feed: Optional[Any] = None) -> bool:
+    """
+    Return True when calendar_dates has any exception for this date.
+    """
+    if feed is not None:
+        for row in getattr(feed, "calendar_dates", []) or []:
+            if str(row.get("date", "")) == str(yyyymmdd):
+                return True
+        return False
+    # DB fallback (PostGIS path).
+    try:
+        from . import db_access
+
+        return db_access.has_calendar_exception_for_date(yyyymmdd)
+    except Exception:
+        return False
+
+
+def resolve_service_profile(yyyymmdd: str, feed: Optional[Any] = None) -> str:
+    """
+    Return profile key used for graph cache routing.
+
+    - Normal days -> weekday/friday/saturday/sunday
+    - Special/holiday (calendar_dates exception exists) -> special:YYYYMMDD
+    """
+    base = default_profile_for_date(yyyymmdd)
+    if date_has_calendar_exception(yyyymmdd, feed=feed):
+        return f"special:{yyyymmdd}"
+    return base
 

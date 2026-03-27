@@ -1190,6 +1190,70 @@ def get_routes_serving_stop_pg(
             conn.close()
 
 
+def has_calendar_exception_for_date(
+    yyyymmdd: str,
+    conn=None,
+) -> bool:
+    """
+    Return True when calendar_dates contains at least one exception row
+    for the active feed and service date.
+    """
+    close = False
+    if conn is None:
+        conn = _get_conn()
+        close = True
+    try:
+        feed_id = get_active_feed_id(conn)
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT 1
+                FROM calendar_dates
+                WHERE feed_id = %s
+                  AND date = %s
+                LIMIT 1
+                """,
+                (feed_id, int(yyyymmdd)),
+            )
+            return cur.fetchone() is not None
+    finally:
+        if close:
+            conn.close()
+
+
+def get_route_direction_pairs(feed_id: int, conn=None) -> List[RouteDirKey]:
+    """
+    Return all distinct (route_id, direction_id) for a feed.
+    """
+    close = False
+    if conn is None:
+        conn = _get_conn()
+        close = True
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT DISTINCT route_id, direction_id
+                FROM trips
+                WHERE feed_id = %s
+                ORDER BY route_id, direction_id
+                """,
+                (feed_id,),
+            )
+            out: List[RouteDirKey] = []
+            for row in cur.fetchall():
+                out.append(
+                    (
+                        row["route_id"],
+                        None if row["direction_id"] is None else str(row["direction_id"]),
+                    )
+                )
+            return out
+    finally:
+        if close:
+            conn.close()
+
+
 def compute_route_signature(
     route_id: str,
     direction_id: Optional[str],

@@ -111,11 +111,24 @@ From the project root, with `DATABASE_URL` set (or pass `--database-url`):
 # Ingest GTFS zip into PostGIS
 python -m backend.scripts.ingest_gtfs_postgis --gtfs-zip ./israel-public-transportation.zip --database-url "postgresql://user:pass@localhost:5432/israel_gtfs"
 
-# Precompute route patterns for a service date (YYYYMMDD)
+# Precompute route patterns (bootstrap date still required by builder)
 python -m backend.scripts.build_patterns_postgis --date 20260308 --database-url "postgresql://user:pass@localhost:5432/israel_gtfs"
+
+# Precompute route graph cache incrementally (signature-gated; skips unchanged routes)
+python -m scripts.precompute_graphs_postgis --workers 4
 ```
 
 After ingest, the new feed is marked active. Run the backend with `DATABASE_URL` set; `/graph/build` and area/detour endpoints will use PostGIS.
+
+Warmup behavior:
+- Startup warmup is enabled by default and hydrates in-memory graph cache from PostGIS cache.
+- Configure with:
+  - `GRAPH_WARMUP_ENABLED=true|false`
+  - `GRAPH_WARMUP_TIMEOUT_S=300`
+  - `GRAPH_WARMUP_PROFILES=weekday,friday,saturday,sunday`
+- Operational endpoints:
+  - `GET /graph/cache/status`
+  - `POST /graph/cache/warmup?profiles=weekday,friday`
 
 **Manage / CI**
 

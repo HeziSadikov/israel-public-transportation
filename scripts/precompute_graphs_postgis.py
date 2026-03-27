@@ -8,20 +8,17 @@ and optional parallel graph building to run much faster than per-route queries.
 
 Usage (from project root):
 
-    python -m scripts.precompute_graphs_postgis --date 20260315
+    python -m scripts.precompute_graphs_postgis
 
 Faster (use 4 workers for graph building):
 
-    python -m scripts.precompute_graphs_postgis --date 20260315 --workers 4
+    python -m scripts.precompute_graphs_postgis --workers 4
 
 Optional:
 
-    python -m scripts.precompute_graphs_postgis --date 20260315 \\
+    python -m scripts.precompute_graphs_postgis \\
+        --profiles weekday,friday,saturday,sunday \\
         --database-url postgresql://user:pass@localhost:5432/israel_gtfs
-
-To save progress to a file (so you don't lose messages):
-
-    python -m scripts.precompute_graphs_postgis --date 20260315 2>&1 | tee precompute.log
 """
 
 import argparse
@@ -82,7 +79,6 @@ def _iter_route_directions(conn) -> List[Tuple[str, Optional[str]]]:
 
 def _build_one(
     meta: Any,
-    date_ymd: str,
     stops: Optional[List],
     shape_line: Optional[Any],
     stop_times: Optional[List],
@@ -90,7 +86,7 @@ def _build_one(
     """Build graph for one pattern; returns (pattern, cache_entry dict)."""
     result = build_graph_for_pattern_from_postgis(
         meta,
-        date_ymd,
+        "",
         pattern_stops=stops,
         shape_line=shape_line,
         stop_times=stop_times,
@@ -102,7 +98,7 @@ def _build_one(
         "used_shape": result.used_shape,
         "used_osm_snapping": False,
         "snapped_pattern_geom": None,
-        "date": date_ymd,
+        "date": None,
     }
     return result.pattern, cache_entry
 
@@ -160,9 +156,7 @@ def _build_chunk(
             stop_times = stop_times_by_trip.get(meta.repr_trip_id)
             if not stops or len(stops) < 2:
                 continue
-            _, cache_entry = _build_one(
-                meta, "", stops, shape_line, stop_times or []
-            )
+            _, cache_entry = _build_one(meta, stops, shape_line, stop_times or [])
             sig_hash = sigs_dict.get((r, d), "")
             try:
                 # 1) Save GTFS-only graph (pretty_osm = False).
@@ -224,6 +218,12 @@ def main():
     )
     ap.add_argument("--database-url", type=str, default=None)
     ap.add_argument(
+        "--profiles",
+        type=str,
+        default="weekday,friday,saturday,sunday",
+        help="Comma-separated service profiles to prewarm in in-memory cache keys.",
+    )
+    ap.add_argument(
         "--workers",
         type=int,
         default=1,
@@ -236,6 +236,9 @@ def main():
         help="Print progress every N graphs (default 50)",
     )
     args = ap.parse_args()
+    profiles = [p.strip() for p in str(args.profiles).split(",") if p.strip()]
+    if not profiles:
+        profiles = ["weekday", "friday", "saturday", "sunday"]
 
     conn = _connect(args.database_url)
     try:
@@ -315,19 +318,18 @@ def main():
                 stop_times = stop_times_by_trip.get(meta.repr_trip_id)
                 if not stops or len(stops) < 2:
                     continue
-                _, cache_entry = _build_one(
-                    meta, date_ymd, stops, shape_line, stop_times or []
-                )
+                _, cache_entry = _build_one(meta, stops, shape_line, stop_times or [])
                 sig_hash = sigs.get((r, d), "")
                 # 1) Save GTFS-only graph.
-                key = f"postgis-{feed_id}|{r}|{d or ''}|{date_ymd}|gtfs"
-                GRAPH_CACHE[key] = cache_entry
+                for profile_key in profiles:
+                    key = f"postgis-{feed_id}|{r}|{d or ''}|profile:{profile_key}|gtfs"
+                    GRAPH_CACHE[key] = cache_entry
                 try:
                     db_access_module.save_route_graph_pg(
                         feed_id=feed_id,
                         route_id=r,
                         direction_id=d,
-                        date_ymd=date_ymd,
+                        date_ymd=None,
                         pretty_osm=False,
                         route_sig_hash=sig_hash,
                         graph_blob=pickle.dumps(cache_entry),
@@ -350,17 +352,18 @@ def main():
                                 "used_shape": cache_entry["used_shape"],
                                 "used_osm_snapping": True,
                                 "snapped_pattern_geom": osm_res.snapped_pattern_geom,
-                                "date": cache_entry["date"],
+                                "date": None,
                             }
-                            key_osm = (
-                                f"postgis-{feed_id}|{r}|{d or ''}|{date_ymd}|osm"
-                            )
-                            GRAPH_CACHE[key_osm] = pretty_entry
+                            for profile_key in profiles:
+                                key_osm = (
+                                    f"postgis-{feed_id}|{r}|{d or ''}|profile:{profile_key}|osm"
+                                )
+                                GRAPH_CACHE[key_osm] = pretty_entry
                             db_access_module.save_route_graph_pg(
                                 feed_id=feed_id,
                                 route_id=r,
                                 direction_id=d,
-                                date_ymd=date_ymd,
+                                date_ymd=None,
                                 pretty_osm=True,
                                 route_sig_hash=sig_hash,
                                 graph_blob=pickle.dumps(pretty_entry),
@@ -401,7 +404,6 @@ def main():
                         shapes_by_sid,
                         stop_times_by_trip,
                         feed_id,
-                        date_ymd,
                         sigs,
                         args.database_url or DB_URL,
                     )
@@ -424,7 +426,7 @@ def main():
 
         log(
             "precompute_graphs",
-            f"Done. built={built}, reused={reused_count}, no_pattern={no_pattern_count}",
+            f"Done. built={built}, skipped_unchanged={reused_count}, no_pattern={no_pattern_count}, profiles={profiles}",
         )
     finally:
         conn.close()

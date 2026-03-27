@@ -21,6 +21,11 @@ def parse_int_env(name: str, default: int) -> int:
     except Exception:
         return default
 
+
+def parse_csv_env(name: str, default_csv: str) -> list[str]:
+    raw = os.getenv(name, default_csv)
+    return [p.strip() for p in str(raw).split(",") if p.strip()]
+
 # Local GTFS zip for offline/dev
 LOCAL_GTFS_ZIP = BASE_DIR / "israel-public-transportation.zip"
 
@@ -49,6 +54,12 @@ OSM_ENGINE_URL = os.getenv("OSM_ENGINE_URL", "http://localhost:5000")
 VALHALLA_URL = os.getenv("VALHALLA_URL", "")
 DETOUR_ALLOW_FEED_FALLBACK = parse_bool_env("DETOUR_ALLOW_FEED_FALLBACK", False)
 DETOUR_TOP_K_PATTERNS = max(1, parse_int_env("DETOUR_TOP_K_PATTERNS", 2))
+GRAPH_WARMUP_ENABLED = parse_bool_env("GRAPH_WARMUP_ENABLED", True)
+GRAPH_WARMUP_TIMEOUT_S = max(10, parse_int_env("GRAPH_WARMUP_TIMEOUT_S", 300))
+GRAPH_WARMUP_PROFILES = parse_csv_env(
+    "GRAPH_WARMUP_PROFILES",
+    "weekday,friday,saturday,sunday",
+)
 
 # PostgreSQL/PostGIS: backend/db_access.py reads DATABASE_URL for area search, graph build, detours.
 # Example: postgresql://user:pass@localhost:5432/israel_gtfs
