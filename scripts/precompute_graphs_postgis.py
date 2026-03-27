@@ -41,6 +41,71 @@ def _connect(database_url: Optional[str]):
     return psycopg2.connect(database_url or DB_URL, cursor_factory=DictCursor)
 
 
+def _build_preview_payload(cache_entry: Dict[str, Any]) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    from shapely.geometry import mapping, Point
+
+    pattern = cache_entry["pattern"]
+    graph = cache_entry.get("graph")
+    edge_geometries = cache_entry["edge_geometries"]
+    snapped_pattern_geom = cache_entry.get("snapped_pattern_geom")
+    stop_features: List[Dict[str, Any]] = []
+    stops_list: List[Dict[str, Any]] = []
+    if graph is not None:
+        by_stop: Dict[str, Dict[str, Any]] = {}
+        for _nid, node_data in graph.nodes(data=True):
+            sid = node_data.get("stop_id")
+            if sid is None:
+                continue
+            key = str(sid)
+            if key not in by_stop:
+                by_stop[key] = node_data
+        for idx, sid in enumerate(pattern.stop_ids):
+            d = by_stop.get(str(sid))
+            if not d:
+                continue
+            lat, lon = d.get("lat"), d.get("lon")
+            if lat is None or lon is None:
+                continue
+            stop_name = d.get("stop_name")
+            pt = Point(float(lon), float(lat))
+            stop_features.append(
+                {
+                    "type": "Feature",
+                    "geometry": mapping(pt),
+                    "properties": {"stop_id": sid, "name": stop_name},
+                }
+            )
+            stops_list.append(
+                {
+                    "stop_id": str(sid),
+                    "name": stop_name,
+                    "lat": float(lat),
+                    "lon": float(lon),
+                    "sequence": idx,
+                }
+            )
+
+    edge_features = []
+    for (_u, _v), eg in edge_geometries.items():
+        edge_features.append(
+            {
+                "type": "Feature",
+                "geometry": mapping(eg.linestring),
+                "properties": {"from_stop_id": eg.from_stop_id, "to_stop_id": eg.to_stop_id},
+            }
+        )
+    features = stop_features + edge_features
+    if snapped_pattern_geom is not None:
+        features.append(
+            {
+                "type": "Feature",
+                "geometry": mapping(snapped_pattern_geom),
+                "properties": {"kind": "pattern_snapped"},
+            }
+        )
+    return {"type": "FeatureCollection", "features": features}, stops_list
+
+
 def _render_progress(done: int, total: int, prefix: str = "") -> None:
     """Simple in-place ASCII progress bar for long loops."""
     if total <= 0:
@@ -99,7 +164,12 @@ def _build_one(
         "used_osm_snapping": False,
         "snapped_pattern_geom": None,
         "date": None,
+        "preview_geojson": None,
+        "preview_stops": None,
     }
+    preview_geojson, preview_stops = _build_preview_payload(cache_entry)
+    cache_entry["preview_geojson"] = preview_geojson
+    cache_entry["preview_stops"] = preview_stops
     return result.pattern, cache_entry
 
 
@@ -187,7 +257,12 @@ def _build_chunk(
                             "used_osm_snapping": True,
                             "snapped_pattern_geom": osm_res.snapped_pattern_geom,
                             "date": None,
+                            "preview_geojson": None,
+                            "preview_stops": None,
                         }
+                        preview_geojson, preview_stops = _build_preview_payload(pretty_entry)
+                        pretty_entry["preview_geojson"] = preview_geojson
+                        pretty_entry["preview_stops"] = preview_stops
                         db_access_module.save_route_graph_pg(
                             feed_id=feed_id,
                             route_id=r,
@@ -353,7 +428,12 @@ def main():
                                 "used_osm_snapping": True,
                                 "snapped_pattern_geom": osm_res.snapped_pattern_geom,
                                 "date": None,
+                                "preview_geojson": None,
+                                "preview_stops": None,
                             }
+                            preview_geojson, preview_stops = _build_preview_payload(pretty_entry)
+                            pretty_entry["preview_geojson"] = preview_geojson
+                            pretty_entry["preview_stops"] = preview_stops
                             for profile_key in profiles:
                                 key_osm = (
                                     f"postgis-{feed_id}|{r}|{d or ''}|profile:{profile_key}|osm"

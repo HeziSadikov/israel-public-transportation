@@ -130,6 +130,18 @@ Warmup behavior:
   - `GET /graph/cache/status`
   - `POST /graph/cache/warmup?profiles=weekday,friday`
 
+Benchmark helper:
+- Compare first-call vs warm-cache `/graph/build` latency:
+  - `python -m scripts.benchmark_graph_latency --route-id 36594 --direction-id 1 --date 20260327 --runs 10`
+- Compare single-call route preview latency (`/graph/preview`):
+  - `python -m scripts.benchmark_graph_latency --endpoint preview --route-id 36594 --direction-id 1 --date 20260327 --runs 10`
+  - Optional prewarm before timing:
+    - `python -m scripts.benchmark_graph_latency --route-id 36594 --direction-id 1 --date 20260327 --runs 10 --trigger-warmup`
+  - `python -m scripts.benchmark_graph_latency --endpoint preview --route-id 36594 --direction-id 1 --date 20260327 --runs 10 --trigger-warmup`
+
+For realistic latency checks, avoid `--reload`:
+- `py -m uvicorn app:app --port 8000`
+
 **Manage / CI**
 
 - Schema: `backend/db_postgis_schema.sql`

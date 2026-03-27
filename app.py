@@ -7,7 +7,7 @@ import hashlib
 import pickle
 import time
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 
 from backend.gtfs_updater import update_feed, get_feed_status
@@ -71,6 +71,84 @@ GRAPH_WARMUP_STATUS: Dict[str, object] = {
     "errors": 0,
 }
 
+
+def _build_preview_payload_from_cache_entry(cache: Dict) -> Dict[str, object]:
+    """
+    Build route preview payload (geojson + ordered stops) from a cache entry.
+    """
+    if cache.get("preview_geojson") is not None and cache.get("preview_stops") is not None:
+        return {
+            "route_geojson": cache.get("preview_geojson"),
+            "stops": cache.get("preview_stops"),
+        }
+    from shapely.geometry import mapping, Point
+
+    pattern = cache["pattern"]
+    edge_geometries = cache["edge_geometries"]
+    snapped_pattern_geom = cache.get("snapped_pattern_geom")
+    graph = cache.get("graph")
+
+    stop_features = []
+    stops_list = []
+    if graph is not None:
+        by_stop: Dict[str, Dict] = {}
+        for _nid, node_data in graph.nodes(data=True):
+            sid = node_data.get("stop_id")
+            if sid is None:
+                continue
+            key = str(sid)
+            # Keep first seen node per stop_id (stable enough for preview).
+            if key not in by_stop:
+                by_stop[key] = node_data
+        for idx, sid in enumerate(pattern.stop_ids):
+            d = by_stop.get(str(sid))
+            if not d:
+                continue
+            lat, lon = d.get("lat"), d.get("lon")
+            if lat is None or lon is None:
+                continue
+            stop_name = d.get("stop_name")
+            pt = Point(float(lon), float(lat))
+            stop_features.append(
+                {
+                    "type": "Feature",
+                    "geometry": mapping(pt),
+                    "properties": {"stop_id": sid, "name": stop_name},
+                }
+            )
+            stops_list.append(
+                {
+                    "stop_id": str(sid),
+                    "name": stop_name,
+                    "lat": float(lat),
+                    "lon": float(lon),
+                    "sequence": idx,
+                }
+            )
+
+    edge_features = []
+    for (_u, _v), eg in edge_geometries.items():
+        edge_features.append(
+            {
+                "type": "Feature",
+                "geometry": mapping(eg.linestring),
+                "properties": {"from_stop_id": eg.from_stop_id, "to_stop_id": eg.to_stop_id},
+            }
+        )
+    features = stop_features + edge_features
+    if snapped_pattern_geom is not None:
+        features.append(
+            {
+                "type": "Feature",
+                "geometry": mapping(snapped_pattern_geom),
+                "properties": {"kind": "pattern_snapped"},
+            }
+        )
+    route_geojson = {"type": "FeatureCollection", "features": features}
+    cache["preview_geojson"] = route_geojson
+    cache["preview_stops"] = stops_list
+    return {"route_geojson": route_geojson, "stops": stops_list}
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -92,6 +170,10 @@ def _run_graph_cache_warmup(profiles: Optional[List[str]] = None) -> Dict[str, o
     loaded_gtfs = 0
     loaded_osm = 0
     profile_keys = profiles or list(GRAPH_WARMUP_PROFILES)
+    print(
+        f"[graph/cache/warmup] start profiles={profile_keys}, timeout_s={GRAPH_WARMUP_TIMEOUT_S}",
+        flush=True,
+    )
     try:
         feed_id = db_access_module.get_active_feed_id()
         feed_version = f"postgis-{feed_id}"
@@ -122,20 +204,28 @@ def _run_graph_cache_warmup(profiles: Optional[List[str]] = None) -> Dict[str, o
                     loaded_osm += 1
                 except Exception:
                     GRAPH_WARMUP_STATUS["errors"] = int(GRAPH_WARMUP_STATUS["errors"] or 0) + 1
-    except Exception:
+    except Exception as e:
+        print(f"[graph/cache/warmup] fatal_error={e!s}", flush=True)
         GRAPH_WARMUP_STATUS["errors"] = int(GRAPH_WARMUP_STATUS["errors"] or 0) + 1
     finished = time.time()
     GRAPH_WARMUP_STATUS["last_finished_at"] = datetime.utcnow().isoformat() + "Z"
     GRAPH_WARMUP_STATUS["last_duration_s"] = round(finished - started, 3)
     GRAPH_WARMUP_STATUS["loaded_gtfs"] = loaded_gtfs
     GRAPH_WARMUP_STATUS["loaded_osm"] = loaded_osm
+    print(
+        f"[graph/cache/warmup] done duration_s={GRAPH_WARMUP_STATUS['last_duration_s']}, "
+        f"loaded_gtfs={loaded_gtfs}, loaded_osm={loaded_osm}, errors={GRAPH_WARMUP_STATUS['errors']}",
+        flush=True,
+    )
     return dict(GRAPH_WARMUP_STATUS)
 
 
 @app.on_event("startup")
 def startup_graph_warmup():
     if not GRAPH_WARMUP_ENABLED:
+        print("[graph/cache/warmup] startup skipped (GRAPH_WARMUP_ENABLED=false)", flush=True)
         return
+    print("[graph/cache/warmup] startup trigger", flush=True)
     _run_graph_cache_warmup()
 
 
@@ -340,7 +430,9 @@ def _graph_cache_file_path(cache_key: str, feed_version: str):
 
 
 @app.post("/graph/build", response_model=GraphBuildResponse)
-def graph_build(req: GraphBuildRequest):
+def graph_build(req: GraphBuildRequest, response: Response):
+    t0 = time.perf_counter()
+    cache_hit = "none"
     date_str = req.date or datetime.utcnow().strftime("%Y%m%d")
     profile_key = resolve_service_profile(date_str)
 
@@ -375,7 +467,15 @@ def graph_build(req: GraphBuildRequest):
         )
         cached = GRAPH_CACHE.get(key)
         if cached is not None:
+            cache_hit = "memory"
             pat = cached["pattern"]
+            elapsed = (time.perf_counter() - t0) * 1000.0
+            response.headers["X-Elapsed-Ms"] = f"{elapsed:.1f}"
+            response.headers["X-Cache-Hit"] = cache_hit
+            print(
+                f"[graph/build] route_id={req.route_id} dir={req.direction_id} hit={cache_hit} elapsed_ms={elapsed:.1f}",
+                flush=True,
+            )
             return GraphBuildResponse(
                 pattern_id=pat.pattern_id,
                 stop_count=len(pat.stop_ids),
@@ -401,6 +501,7 @@ def graph_build(req: GraphBuildRequest):
 
         if cached_blob:
             try:
+                cache_hit = "db"
                 cached = pickle.loads(cached_blob)
                 GRAPH_CACHE[key] = cached
                 # Backward-compatible alias key (date-shaped) during transition.
@@ -417,6 +518,13 @@ def graph_build(req: GraphBuildRequest):
                 edge_geoms = cached["edge_geometries"]
                 used_shape = cached["used_shape"]
                 used_osm = cached.get("used_osm_snapping", False)
+                elapsed = (time.perf_counter() - t0) * 1000.0
+                response.headers["X-Elapsed-Ms"] = f"{elapsed:.1f}"
+                response.headers["X-Cache-Hit"] = cache_hit
+                print(
+                    f"[graph/build] route_id={req.route_id} dir={req.direction_id} hit={cache_hit} elapsed_ms={elapsed:.1f}",
+                    flush=True,
+                )
                 return GraphBuildResponse(
                     pattern_id=pat.pattern_id,
                     stop_count=len(pat.stop_ids),
@@ -452,6 +560,8 @@ def graph_build(req: GraphBuildRequest):
             "used_osm_snapping": used_osm,
             "snapped_pattern_geom": snapped_pattern_geom,
             "date": date_str,
+            "preview_geojson": None,
+            "preview_stops": None,
         }
         GRAPH_CACHE[key] = cache_entry
         GRAPH_CACHE[
@@ -478,6 +588,13 @@ def graph_build(req: GraphBuildRequest):
                 pass
 
         pat = build_result.pattern
+        elapsed = (time.perf_counter() - t0) * 1000.0
+        response.headers["X-Elapsed-Ms"] = f"{elapsed:.1f}"
+        response.headers["X-Cache-Hit"] = "built"
+        print(
+            f"[graph/build] route_id={req.route_id} dir={req.direction_id} hit=built elapsed_ms={elapsed:.1f}",
+            flush=True,
+        )
         return GraphBuildResponse(
             pattern_id=pat.pattern_id,
             stop_count=len(pat.stop_ids),
@@ -490,6 +607,9 @@ def graph_build(req: GraphBuildRequest):
     except HTTPException:
         raise
     except (RuntimeError, Exception) as e:
+        elapsed = (time.perf_counter() - t0) * 1000.0
+        response.headers["X-Elapsed-Ms"] = f"{elapsed:.1f}"
+        response.headers["X-Cache-Hit"] = cache_hit
         raise HTTPException(
             status_code=500,
             detail=f"Graph build failed: {e!s}",
@@ -514,6 +634,7 @@ def _merge_edge_geometries(edge_geometries: Dict[Tuple[str, str], any]):
 
 @app.get("/graph/stops", response_model=GraphStopsResponse)
 def graph_stops(
+    response: Response,
     route_id: str,
     direction_id: str | None = None,
     pattern_id: str | None = None,
@@ -528,6 +649,8 @@ def graph_stops(
       2. Otherwise, fall back to rebuilding patterns for the given date.
     Stops are resolved from feed when available, else from PostGIS via db_access.
     """
+    t0 = time.perf_counter()
+    cache_hit = "none"
     try:
         feed = load_active_feed()
     except Exception:
@@ -535,20 +658,24 @@ def graph_stops(
 
     # 1) Try to reuse an existing cached graph pattern first.
     cached_pattern: RoutePattern | None = None
+    cached_entry = None
     if pattern_id:
         for entry in GRAPH_CACHE.values():
             pat: RoutePattern = entry.get("pattern")
             if pat and pat.route_id == route_id and pat.pattern_id == pattern_id:
                 cached_pattern = pat
+                cached_entry = entry
                 break
     else:
         for entry in GRAPH_CACHE.values():
             pat: RoutePattern = entry.get("pattern")
             if pat and pat.route_id == route_id:
                 cached_pattern = pat
+                cached_entry = entry
                 break
 
     if cached_pattern is not None:
+        cache_hit = "memory_pattern"
         chosen = cached_pattern
     else:
         if feed is None:
@@ -572,6 +699,21 @@ def graph_stops(
         else:
             chosen = patterns_builder.pick_most_frequent_pattern(patterns)
             assert chosen is not None
+
+    if cached_entry is not None and cached_entry.get("preview_stops") is not None:
+        preview_stops = cached_entry.get("preview_stops") or []
+        out = GraphStopsResponse(
+            pattern_id=chosen.pattern_id,
+            stops=[GraphStopsResponseStop(**s) for s in preview_stops],
+        )
+        elapsed = (time.perf_counter() - t0) * 1000.0
+        response.headers["X-Elapsed-Ms"] = f"{elapsed:.1f}"
+        response.headers["X-Cache-Hit"] = "preview"
+        print(
+            f"[graph/stops] route_id={route_id} dir={direction_id} hit=preview elapsed_ms={elapsed:.1f}",
+            flush=True,
+        )
+        return out
 
     res_stops: list[GraphStopsResponseStop] = []
     if feed is not None:
@@ -608,6 +750,13 @@ def graph_stops(
                 detail="Could not load stop details from PostGIS.",
             )
 
+    elapsed = (time.perf_counter() - t0) * 1000.0
+    response.headers["X-Elapsed-Ms"] = f"{elapsed:.1f}"
+    response.headers["X-Cache-Hit"] = cache_hit
+    print(
+        f"[graph/stops] route_id={route_id} dir={direction_id} hit={cache_hit} elapsed_ms={elapsed:.1f}",
+        flush=True,
+    )
     return GraphStopsResponse(pattern_id=chosen.pattern_id, stops=res_stops)
 
 
@@ -949,6 +1098,7 @@ def detour_osm(req: DetourRequest):
 
 @app.get("/graph/geojson")
 def graph_geojson(
+    response: Response,
     route_id: str,
     direction_id: str | None = None,
     pattern_id: str | None = None,
@@ -958,6 +1108,7 @@ def graph_geojson(
     """
     Optional endpoint returning full route pattern polyline and stops for display.
     """
+    t0 = time.perf_counter()
     date_str = date or datetime.utcnow().strftime("%Y%m%d")
     candidate_keys = _graph_cache_keys_for_lookup(route_id, direction_id, date_str)
     want_osm = "osm" if pretty_osm else "gtfs"
@@ -978,6 +1129,16 @@ def graph_geojson(
             detail="Graph not built yet; call /graph/build first.",
         )
 
+    if cache.get("preview_geojson") is not None:
+        elapsed = (time.perf_counter() - t0) * 1000.0
+        response.headers["X-Elapsed-Ms"] = f"{elapsed:.1f}"
+        response.headers["X-Cache-Hit"] = "preview"
+        print(
+            f"[graph/geojson] route_id={route_id} dir={direction_id} hit=preview elapsed_ms={elapsed:.1f}",
+            flush=True,
+        )
+        return cache.get("preview_geojson")
+
     from shapely.geometry import mapping, Point
 
     pattern = cache["pattern"]
@@ -987,15 +1148,20 @@ def graph_geojson(
 
     # Build stop features from graph nodes (works for both PostGIS and feed-backed cache).
     stop_features = []
+    preview_stops = []
     if graph is not None:
-        for sid in pattern.stop_ids:
-            node = next(
-                (n for n, d in graph.nodes(data=True) if d.get("stop_id") == sid),
-                None,
-            )
-            if node is None:
+        by_stop: Dict[str, Dict] = {}
+        for _nid, node_data in graph.nodes(data=True):
+            sid = node_data.get("stop_id")
+            if sid is None:
                 continue
-            d = graph.nodes[node]
+            k = str(sid)
+            if k not in by_stop:
+                by_stop[k] = node_data
+        for sid in pattern.stop_ids:
+            d = by_stop.get(str(sid))
+            if d is None:
+                continue
             lat, lon = d.get("lat"), d.get("lon")
             if lat is None or lon is None:
                 continue
@@ -1005,6 +1171,15 @@ def graph_geojson(
                     "type": "Feature",
                     "geometry": mapping(pt),
                     "properties": {"stop_id": sid, "name": d.get("stop_name")},
+                }
+            )
+            preview_stops.append(
+                {
+                    "stop_id": str(sid),
+                    "name": d.get("stop_name"),
+                    "lat": float(lat),
+                    "lon": float(lon),
+                    "sequence": len(preview_stops),
                 }
             )
     else:
@@ -1047,7 +1222,76 @@ def graph_geojson(
             }
         )
 
-    return {"type": "FeatureCollection", "features": features}
+    out = {"type": "FeatureCollection", "features": features}
+    cache["preview_geojson"] = out
+    if preview_stops:
+        cache["preview_stops"] = preview_stops
+    elapsed = (time.perf_counter() - t0) * 1000.0
+    response.headers["X-Elapsed-Ms"] = f"{elapsed:.1f}"
+    response.headers["X-Cache-Hit"] = "assembled"
+    print(
+        f"[graph/geojson] route_id={route_id} dir={direction_id} hit=assembled elapsed_ms={elapsed:.1f}",
+        flush=True,
+    )
+    return out
+
+
+@app.get("/graph/preview")
+def graph_preview(
+    response: Response,
+    route_id: str,
+    direction_id: str | None = None,
+    date: str | None = None,
+    pretty_osm: bool = False,
+):
+    """
+    Single-call selection payload for instant map preview:
+    pattern_id + route_geojson + ordered stops.
+    """
+    t0 = time.perf_counter()
+    date_str = date or datetime.utcnow().strftime("%Y%m%d")
+    # Ensure cache entry exists (prefer warm/cached path inside graph_build).
+    _ = graph_build(
+        GraphBuildRequest(
+            route_id=route_id,
+            direction_id=direction_id,
+            date=date_str,
+            pretty_osm=pretty_osm,
+        ),
+        response,
+    )
+    candidate_keys = _graph_cache_keys_for_lookup(route_id, direction_id, date_str)
+    want_osm = "osm" if pretty_osm else "gtfs"
+    cache = None
+    fallback_cache = None
+    for key in candidate_keys:
+        if key in GRAPH_CACHE:
+            if want_osm in key:
+                cache = GRAPH_CACHE[key]
+                break
+            if fallback_cache is None:
+                fallback_cache = GRAPH_CACHE[key]
+    if cache is None:
+        cache = fallback_cache
+    if not cache:
+        raise HTTPException(status_code=400, detail="Graph not built yet; call /graph/build first.")
+
+    preview = _build_preview_payload_from_cache_entry(cache)
+    pat = cache["pattern"]
+    elapsed = (time.perf_counter() - t0) * 1000.0
+    response.headers["X-Elapsed-Ms"] = f"{elapsed:.1f}"
+    response.headers["X-Cache-Hit"] = "preview"
+    print(
+        f"[graph/preview] route_id={route_id} dir={direction_id} elapsed_ms={elapsed:.1f}",
+        flush=True,
+    )
+    return {
+        "pattern_id": pat.pattern_id,
+        "stops": preview["stops"],
+        "route_geojson": preview["route_geojson"],
+        "used_osm_snapping": bool(cache.get("used_osm_snapping", False)),
+        "feed_version": str(cache.get("date") or ""),
+    }
 
 
 @app.get("/graph/cache/status")
@@ -1064,6 +1308,7 @@ def graph_cache_warmup(profiles: Optional[str] = None):
     selected = None
     if profiles:
         selected = [p.strip() for p in str(profiles).split(",") if p.strip()]
+    print(f"[graph/cache/warmup] manual trigger profiles={selected}", flush=True)
     res = _run_graph_cache_warmup(selected)
     return {
         "ok": True,

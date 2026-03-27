@@ -14,13 +14,11 @@ type StopInfo = {
   sequence: number;
 };
 
-type GraphBuildResponse = {
+type GraphPreviewResponse = {
   pattern_id: string;
-  stop_count: number;
-  edge_count: number;
-  used_shape: boolean;
+  stops: StopInfo[];
+  route_geojson: GeoJSON.FeatureCollection;
   used_osm_snapping: boolean;
-  example_stop_ids: string[];
   feed_version: string;
 };
 
@@ -107,42 +105,57 @@ const App: React.FC = () => {
   const [pinPosition, setPinPosition] = useState<[number, number] | null>(null);
 
   const mapRef = useRef<MapLibreMapHandle | null>(null);
+  const latestRouteLoadIdRef = useRef(0);
 
   const center: [number, number] = [31.5, 35.0];
 
   const loadRouteOnMap = async (routeId: string, directionId?: string | null) => {
+    const loadId = ++latestRouteLoadIdRef.current;
     setRouteLoading(true);
-    setMessage(null);
-    setRouteGeojson(null);
+    setMessage("Loading route preview...");
     setStops([]);
     setPatternId(null);
     try {
-      const buildRes = await axios.post<GraphBuildResponse>(`${API_BASE}/graph/build`, {
+      const previewParams: Record<string, string | boolean> = {
         route_id: routeId,
-        direction_id: directionId ?? undefined,
-        date: areaDate,
-        pretty_osm: prettyOSM,
-      });
-      const pid = buildRes.data.pattern_id;
-      setPatternId(pid);
-      const stopsParams: Record<string, string> = { route_id: routeId, pattern_id: pid, date: areaDate };
-      if (directionId != null && directionId !== "") (stopsParams as any).direction_id = directionId;
-      const stopsRes = await axios.get(`${API_BASE}/graph/stops`, { params: stopsParams });
-      const body = stopsRes.data as { pattern_id: string; stops: StopInfo[] };
-      setStops(body.stops);
-      const geoParams: Record<string, string | boolean> = {
-        route_id: routeId,
-        pattern_id: pid,
         date: areaDate,
         pretty_osm: prettyOSM,
       };
-      if (directionId != null && directionId !== "") (geoParams as any).direction_id = directionId;
-      const geoRes = await axios.get<GeoJSON.FeatureCollection>(`${API_BASE}/graph/geojson`, { params: geoParams });
-      setRouteGeojson(geoRes.data);
+      if (directionId != null && directionId !== "") (previewParams as any).direction_id = directionId;
+      const t0 = performance.now();
+      const previewRes = await axios.get<GraphPreviewResponse>(`${API_BASE}/graph/preview`, {
+        params: previewParams,
+      });
+      const t1 = performance.now();
+      if (loadId !== latestRouteLoadIdRef.current) return;
+      const preview = previewRes.data;
+      setPatternId(preview.pattern_id);
+      setRouteGeojson(preview.route_geojson);
+      setStops(preview.stops || []);
+      // Include backend-timing headers when available.
+      const backendMs = Number(previewRes.headers?.["x-elapsed-ms"] || 0);
+      const frontendMs = t1 - t0;
+      console.info(
+        `[route/preview] route_id=${routeId} direction_id=${directionId ?? ""} frontend_ms=${frontendMs.toFixed(
+          1
+        )} backend_ms=${backendMs.toFixed(1)} cache_hit=${previewRes.headers?.["x-cache-hit"] ?? "n/a"}`
+      );
+      setMessage(
+        `Route loaded: frontend ${frontendMs.toFixed(0)}ms, backend ${backendMs.toFixed(0)}ms (${preview.stops?.length ?? 0} stops)`
+      );
+      requestAnimationFrame(() => {
+        const tPaint = performance.now();
+        console.info(`[route/preview] paint_after_ms=${(tPaint - t0).toFixed(1)}`);
+      });
+      setTimeout(() => {
+        if (loadId === latestRouteLoadIdRef.current) setMessage(null);
+      }, 2500);
     } catch (err) {
+      if (loadId !== latestRouteLoadIdRef.current) return;
       console.error(err);
       setMessage("Could not load route. Check backend.");
     } finally {
+      if (loadId !== latestRouteLoadIdRef.current) return;
       setRouteLoading(false);
     }
   };
