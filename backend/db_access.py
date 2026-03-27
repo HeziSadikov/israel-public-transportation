@@ -203,6 +203,232 @@ class PatternMeta:
     stop_ids: List[str]
     frequency: int
     used_shape: bool
+    active_trip_count: Optional[int] = None
+    selection_source: Optional[str] = None
+
+
+def _to_int_direction(direction_id: Optional[str]) -> Optional[int]:
+    if direction_id is None:
+        return None
+    try:
+        return int(direction_id)
+    except Exception:
+        return None
+
+
+def get_top_patterns_for_routes(
+    route_ids: List[str],
+    date_ymd: str,
+    start_sec: int,
+    end_sec: int,
+    k_per_route_dir: int = 2,
+    direction_filter_by_route: Optional[Dict[str, Optional[str]]] = None,
+    include_fallback: bool = True,
+    conn=None,
+) -> Dict[RouteDirKey, List[PatternMeta]]:
+    """
+    Return Top-K patterns per (route_id, direction_id) for the active feed.
+
+    Primary ranking uses strict service-day + time-window activity:
+      1) active_trip_count DESC
+      2) frequency DESC
+      3) pattern_id ASC
+
+    If no strict match exists for a route/direction and include_fallback=True,
+    fallback picks by frequency ordering from all patterns on that route/direction.
+    """
+    if not route_ids:
+        return {}
+    k = max(1, int(k_per_route_dir or 1))
+    close = False
+    if conn is None:
+        conn = _get_conn()
+        close = True
+    try:
+        feed_id = get_active_feed_id(conn)
+        wanted_routes = set(route_ids)
+        dir_filter_int: Dict[str, Optional[int]] = {}
+        if direction_filter_by_route:
+            for rid, did in direction_filter_by_route.items():
+                dir_filter_int[rid] = _to_int_direction(did)
+
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                WITH dow AS (
+                    SELECT EXTRACT(DOW FROM to_date(%s::text, 'YYYYMMDD'))::int AS d
+                ),
+                calendar_services AS (
+                    SELECT c.service_id
+                    FROM calendar c, dow
+                    WHERE c.feed_id = %s
+                      AND %s BETWEEN c.start_date AND c.end_date
+                      AND (
+                        (d = 0 AND c.sunday = 1)
+                        OR (d = 1 AND c.monday = 1)
+                        OR (d = 2 AND c.tuesday = 1)
+                        OR (d = 3 AND c.wednesday = 1)
+                        OR (d = 4 AND c.thursday = 1)
+                        OR (d = 5 AND c.friday = 1)
+                        OR (d = 6 AND c.saturday = 1)
+                      )
+                ),
+                add_services AS (
+                    SELECT service_id
+                    FROM calendar_dates
+                    WHERE feed_id = %s
+                      AND date = %s
+                      AND exception_type = 1
+                ),
+                remove_services AS (
+                    SELECT service_id
+                    FROM calendar_dates
+                    WHERE feed_id = %s
+                      AND date = %s
+                      AND exception_type = 2
+                ),
+                active_services AS (
+                    (SELECT service_id FROM calendar_services
+                     UNION
+                     SELECT service_id FROM add_services)
+                    EXCEPT
+                    SELECT service_id FROM remove_services
+                ),
+                trips_in_window AS (
+                    SELECT t.trip_id, t.route_id, t.direction_id
+                    FROM trips t
+                    JOIN active_services a
+                      ON a.service_id = t.service_id
+                    JOIN trip_time_bounds b
+                      ON b.feed_id = t.feed_id AND b.trip_id = t.trip_id
+                    WHERE t.feed_id = %s
+                      AND t.route_id = ANY(%s)
+                      AND b.last_sec >= %s
+                      AND b.first_sec <= %s
+                ),
+                trip_stop_chains AS (
+                    SELECT
+                        tw.trip_id,
+                        tw.route_id,
+                        tw.direction_id,
+                        ARRAY_AGG(st.stop_id ORDER BY st.stop_sequence)::text[] AS stop_ids
+                    FROM trips_in_window tw
+                    JOIN stop_times st
+                      ON st.feed_id = %s AND st.trip_id = tw.trip_id
+                    GROUP BY tw.trip_id, tw.route_id, tw.direction_id
+                ),
+                strict_counts AS (
+                    SELECT
+                        p.pattern_id,
+                        COUNT(*)::int AS active_trip_count
+                    FROM patterns p
+                    JOIN trip_stop_chains tsc
+                      ON tsc.route_id = p.route_id
+                     AND COALESCE(tsc.direction_id, -1) = COALESCE(p.direction_id, -1)
+                     AND tsc.stop_ids = p.stop_ids
+                    WHERE p.feed_id = %s
+                      AND p.route_id = ANY(%s)
+                    GROUP BY p.pattern_id
+                )
+                SELECT
+                    p.pattern_id,
+                    p.route_id,
+                    p.direction_id,
+                    p.repr_trip_id,
+                    p.repr_shape_id,
+                    p.stop_ids,
+                    p.frequency,
+                    p.used_shape,
+                    COALESCE(sc.active_trip_count, 0) AS active_trip_count
+                FROM patterns p
+                LEFT JOIN strict_counts sc
+                  ON sc.pattern_id = p.pattern_id
+                WHERE p.feed_id = %s
+                  AND p.route_id = ANY(%s)
+                ORDER BY
+                    p.route_id,
+                    p.direction_id NULLS FIRST,
+                    COALESCE(sc.active_trip_count, 0) DESC,
+                    p.frequency DESC NULLS LAST,
+                    p.pattern_id ASC
+                """,
+                (
+                    date_ymd,
+                    feed_id,
+                    int(date_ymd),
+                    feed_id,
+                    int(date_ymd),
+                    feed_id,
+                    int(date_ymd),
+                    feed_id,
+                    route_ids,
+                    start_sec,
+                    end_sec,
+                    feed_id,
+                    feed_id,
+                    route_ids,
+                    feed_id,
+                    route_ids,
+                ),
+            )
+            rows = cur.fetchall()
+
+        by_key_all: Dict[RouteDirKey, List[PatternMeta]] = {}
+        by_key_strict: Dict[RouteDirKey, List[PatternMeta]] = {}
+        for row in rows:
+            rid = row["route_id"]
+            if rid not in wanted_routes:
+                continue
+            did_str = None if row["direction_id"] is None else str(row["direction_id"])
+            if rid in dir_filter_int:
+                wanted_did = dir_filter_int[rid]
+                if wanted_did is not None and row["direction_id"] != wanted_did:
+                    continue
+            key: RouteDirKey = (rid, did_str)
+            meta = PatternMeta(
+                pattern_id=row["pattern_id"],
+                route_id=rid,
+                direction_id=row["direction_id"],
+                repr_trip_id=row["repr_trip_id"],
+                repr_shape_id=row["repr_shape_id"],
+                stop_ids=list(row["stop_ids"] or []),
+                frequency=int(row["frequency"] or 0),
+                used_shape=bool(row["used_shape"]),
+                active_trip_count=int(row["active_trip_count"] or 0),
+            )
+            by_key_all.setdefault(key, []).append(meta)
+            if (meta.active_trip_count or 0) > 0:
+                strict_meta = PatternMeta(
+                    pattern_id=meta.pattern_id,
+                    route_id=meta.route_id,
+                    direction_id=meta.direction_id,
+                    repr_trip_id=meta.repr_trip_id,
+                    repr_shape_id=meta.repr_shape_id,
+                    stop_ids=meta.stop_ids,
+                    frequency=meta.frequency,
+                    used_shape=meta.used_shape,
+                    active_trip_count=meta.active_trip_count,
+                    selection_source="strict",
+                )
+                by_key_strict.setdefault(key, []).append(strict_meta)
+
+        selected: Dict[RouteDirKey, List[PatternMeta]] = {}
+        keys = sorted(set(by_key_all.keys()) | set(by_key_strict.keys()))
+        for key in keys:
+            strict_list = by_key_strict.get(key, [])
+            if strict_list:
+                selected[key] = strict_list[:k]
+                continue
+            if include_fallback:
+                fallback = by_key_all.get(key, [])[:k]
+                for m in fallback:
+                    m.selection_source = "fallback"
+                if fallback:
+                    selected[key] = fallback
+        return selected
+    finally:
+        if close:
+            conn.close()
 
 
 def get_pattern_for_route(
@@ -215,6 +441,24 @@ def get_pattern_for_route(
     For now this returns the most frequent pattern row for the active feed and route/direction.
     The date_ymd is accepted for future date-aware filtering but currently unused.
     """
+    # For explicit direction, delegate to Top-K selector (K=1) with broad window.
+    if direction_id is not None:
+        picked = get_top_patterns_for_routes(
+            route_ids=[route_id],
+            date_ymd=date_ymd,
+            start_sec=0,
+            end_sec=27 * 3600,
+            k_per_route_dir=1,
+            direction_filter_by_route={route_id: direction_id},
+            include_fallback=True,
+            conn=conn,
+        )
+        key: RouteDirKey = (route_id, direction_id)
+        one = picked.get(key) or []
+        if one:
+            return one[0]
+
+    # Compatibility path for direction=None (and as a final fallback).
     close = False
     if conn is None:
         conn = _get_conn()
@@ -254,6 +498,8 @@ def get_pattern_for_route(
                 stop_ids=list(row["stop_ids"] or []),
                 frequency=int(row["frequency"] or 0),
                 used_shape=bool(row["used_shape"]),
+                active_trip_count=None,
+                selection_source="fallback",
             )
     finally:
         if close:

@@ -221,15 +221,16 @@ def test_build_detour_graph_postgis_uses_precomputed_tables(
         dg, "find_routes_in_polygon", lambda **_kwargs: [{"route_id": "R2", "direction_id": "0"}]
     )
 
-    # PostGIS available + pattern lookup succeeds for primary and secondary route.
+    # PostGIS available + Top-K selection returns primary and secondary patterns.
     monkeypatch.setattr(dg.db_access, "get_active_feed_id", lambda *_args, **_kwargs: 1)
-
-    def _fake_get_pattern_for_route(route_id: str, direction_id: str | None, date_ymd: str):
-        # Pattern id must be deterministic per route/direction for node selection.
-        did = direction_id if direction_id is not None else "none"
-        return SimpleNamespace(pattern_id=f"pat_{route_id}_{did}")
-
-    monkeypatch.setattr(dg.db_access, "get_pattern_for_route", _fake_get_pattern_for_route)
+    monkeypatch.setattr(
+        dg.db_access,
+        "get_top_patterns_for_routes",
+        lambda **_kwargs: {
+            ("R1", "0"): [SimpleNamespace(pattern_id="pat_R1_0")],
+            ("R2", "0"): [SimpleNamespace(pattern_id="pat_R2_0")],
+        },
+    )
 
     # Provide a minimal precomputed ride graph for two patterns.
     from shapely.geometry import LineString
@@ -306,3 +307,37 @@ def test_build_detour_graph_postgis_uses_precomputed_tables(
     assert "pat_R1_0:S1:0" in res.graph.nodes
     assert "pat_R1_0:S2:1" in res.graph.nodes
     assert ("pat_R1_0:S1:0", "pat_R1_0:S2:1") in res.edge_geometries
+
+
+def test_build_detour_graph_threads_topk_and_window(monkeypatch: pytest.MonkeyPatch) -> None:
+    import backend.detour_graph as dg
+
+    captured: dict = {}
+    monkeypatch.setattr(dg, "DETOUR_ALLOW_FEED_FALLBACK", False)
+    monkeypatch.setattr(dg, "DETOUR_TOP_K_PATTERNS", 2)
+    monkeypatch.setattr(dg, "find_routes_in_polygon", lambda **_kwargs: [{"route_id": "R2", "direction_id": "1"}])
+    monkeypatch.setattr(dg.db_access, "get_active_feed_id", lambda *_args, **_kwargs: 1)
+
+    def _fake_selector(**kwargs):
+        captured["kwargs"] = kwargs
+        return {("R1", "0"): [SimpleNamespace(pattern_id="pat_R1_0")]}
+
+    monkeypatch.setattr(dg.db_access, "get_top_patterns_for_routes", _fake_selector)
+    monkeypatch.setattr(dg.db_access, "get_pattern_nodes_bulk", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(dg.db_access, "get_pattern_edges_bulk", lambda *_args, **_kwargs: [])
+
+    dg.build_detour_graph(
+        feed=object(),
+        date_ymd="20260101",
+        blockage_geojson={"type": "Point", "coordinates": [34.8, 32.0]},
+        primary_route_id="R1",
+        primary_direction_id="0",
+        start_sec=3600,
+        end_sec=7200,
+    )
+
+    selector_args = captured["kwargs"]
+    assert selector_args["k_per_route_dir"] == 2
+    assert selector_args["start_sec"] == 3600
+    assert selector_args["end_sec"] == 7200
+    assert selector_args["direction_filter_by_route"] == {"R1": "0"}

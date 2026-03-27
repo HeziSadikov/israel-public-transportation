@@ -17,7 +17,7 @@ from .graph_builder import (
 )
 from .area_search import find_routes_in_polygon
 from . import db_access
-from .config import DETOUR_ALLOW_FEED_FALLBACK
+from .config import DETOUR_ALLOW_FEED_FALLBACK, DETOUR_TOP_K_PATTERNS
 
 if TYPE_CHECKING:
     from .gtfs_loader import GTFSFeed
@@ -350,13 +350,29 @@ def build_detour_graph(
 
     use_postgis = False
     primary_meta = None
+    selected_by_key: Dict[Tuple[str, Optional[str]], List[db_access.PatternMeta]] = {}
     postgis_error: Optional[Exception] = None
     try:
         db_access.get_active_feed_id()
         dir_param = str(primary_direction_id) if primary_direction_id is not None else None
-        primary_meta = db_access.get_pattern_for_route(
-            primary_route_id, dir_param, date_ymd
+        direction_filter = {}
+        if dir_param is not None:
+            direction_filter[primary_route_id] = dir_param
+        selected_by_key = db_access.get_top_patterns_for_routes(
+            route_ids=sorted(route_ids),
+            date_ymd=date_ymd,
+            start_sec=day_start,
+            end_sec=day_end,
+            k_per_route_dir=DETOUR_TOP_K_PATTERNS,
+            direction_filter_by_route=direction_filter or None,
+            include_fallback=True,
         )
+        primary_key = (primary_route_id, dir_param)
+        primary_list = selected_by_key.get(primary_key, [])
+        if not primary_list:
+            any_primary = [m for (rid, _), ms in selected_by_key.items() if rid == primary_route_id for m in ms]
+            primary_list = any_primary
+        primary_meta = primary_list[0] if primary_list else None
         use_postgis = primary_meta is not None
     except (RuntimeError, Exception) as exc:
         postgis_error = exc
@@ -365,12 +381,13 @@ def build_detour_graph(
 
     if use_postgis and primary_meta is not None:
         primary_pattern_id = primary_meta.pattern_id
-        metas = [primary_meta]
-        for rid in route_ids:
-            if rid == primary_route_id:
-                continue
-            meta = db_access.get_pattern_for_route(rid, None, date_ymd)
-            if meta is not None:
+        metas: List[db_access.PatternMeta] = []
+        seen_patterns: Set[str] = set()
+        for _key in sorted(selected_by_key.keys()):
+            for meta in selected_by_key.get(_key, []):
+                if meta.pattern_id in seen_patterns:
+                    continue
+                seen_patterns.add(meta.pattern_id)
                 metas.append(meta)
         _merge_from_postgis_precomputed(g, edge_geoms, metas)
     else:
