@@ -9,5 +9,5 @@ try {
   Write-Host "Failed to reach http://127.0.0.1:8000/health" -ForegroundColor Red
   Write-Host $_.Exception.Message
   Write-Host ""
-  Write-Host "Make sure the backend is running (start-backend.bat or: python -m uvicorn app:app --port 8000 --host 0.0.0.0)"
+  Write-Host "Make sure the backend is running (start-backend.bat or: python -m run_uvicorn)"
 }

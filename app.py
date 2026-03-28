@@ -4,6 +4,7 @@ from dataclasses import replace
 from datetime import datetime
 from typing import Dict, List, Tuple, Optional
 import hashlib
+import logging.config
 import pickle
 import time
 
@@ -58,8 +59,11 @@ from backend.config import (
 )
 from backend.area_search import find_routes_in_polygon
 from backend import db_access as db_access_module
+from backend.logging_utils import log
 from backend.service_calendar import ServiceCalendar, resolve_service_profile
+from backend.uvicorn_logging import LOGGING_CONFIG
 
+logging.config.dictConfig(LOGGING_CONFIG)
 
 app = FastAPI(title="Israel GTFS Detour Router")
 GRAPH_WARMUP_STATUS: Dict[str, object] = {
@@ -191,9 +195,9 @@ def _run_graph_cache_warmup(profiles: Optional[List[str]] = None) -> Dict[str, o
     loaded_gtfs = 0
     loaded_osm = 0
     profile_keys = profiles or list(GRAPH_WARMUP_PROFILES)
-    print(
-        f"[graph/cache/warmup] start profiles={profile_keys}, timeout_s={GRAPH_WARMUP_TIMEOUT_S}",
-        flush=True,
+    log(
+        "graph/cache/warmup",
+        f"start profiles={profile_keys}, timeout_s={GRAPH_WARMUP_TIMEOUT_S}",
     )
     try:
         feed_id = db_access_module.get_active_feed_id()
@@ -226,17 +230,17 @@ def _run_graph_cache_warmup(profiles: Optional[List[str]] = None) -> Dict[str, o
                 except Exception:
                     GRAPH_WARMUP_STATUS["errors"] = int(GRAPH_WARMUP_STATUS["errors"] or 0) + 1
     except Exception as e:
-        print(f"[graph/cache/warmup] fatal_error={e!s}", flush=True)
+        log("graph/cache/warmup", f"fatal_error={e!s}")
         GRAPH_WARMUP_STATUS["errors"] = int(GRAPH_WARMUP_STATUS["errors"] or 0) + 1
     finished = time.time()
     GRAPH_WARMUP_STATUS["last_finished_at"] = datetime.utcnow().isoformat() + "Z"
     GRAPH_WARMUP_STATUS["last_duration_s"] = round(finished - started, 3)
     GRAPH_WARMUP_STATUS["loaded_gtfs"] = loaded_gtfs
     GRAPH_WARMUP_STATUS["loaded_osm"] = loaded_osm
-    print(
-        f"[graph/cache/warmup] done duration_s={GRAPH_WARMUP_STATUS['last_duration_s']}, "
+    log(
+        "graph/cache/warmup",
+        f"done duration_s={GRAPH_WARMUP_STATUS['last_duration_s']}, "
         f"loaded_gtfs={loaded_gtfs}, loaded_osm={loaded_osm}, errors={GRAPH_WARMUP_STATUS['errors']}",
-        flush=True,
     )
     return dict(GRAPH_WARMUP_STATUS)
 
@@ -244,9 +248,9 @@ def _run_graph_cache_warmup(profiles: Optional[List[str]] = None) -> Dict[str, o
 @app.on_event("startup")
 def startup_graph_warmup():
     if not GRAPH_WARMUP_ENABLED:
-        print("[graph/cache/warmup] startup skipped (GRAPH_WARMUP_ENABLED=false)", flush=True)
+        log("graph/cache/warmup", "startup skipped (GRAPH_WARMUP_ENABLED=false)")
         return
-    print("[graph/cache/warmup] startup trigger", flush=True)
+    log("graph/cache/warmup", "startup trigger")
     _run_graph_cache_warmup()
 
 
@@ -494,9 +498,9 @@ def graph_build(req: GraphBuildRequest, response: Response):
             response.headers["X-Elapsed-Ms"] = f"{elapsed:.1f}"
             response.headers["X-Cache-Hit"] = cache_hit
             response.headers["X-Graph-Cache-Hit"] = cache_hit
-            print(
-                f"[graph/build] route_id={req.route_id} dir={req.direction_id} hit={cache_hit} elapsed_ms={elapsed:.1f}",
-                flush=True,
+            log(
+                "graph/build",
+                f"route_id={req.route_id} dir={req.direction_id} hit={cache_hit} elapsed_ms={elapsed:.1f}",
             )
             return GraphBuildResponse(
                 pattern_id=pat.pattern_id,
@@ -544,9 +548,9 @@ def graph_build(req: GraphBuildRequest, response: Response):
                 response.headers["X-Elapsed-Ms"] = f"{elapsed:.1f}"
                 response.headers["X-Cache-Hit"] = cache_hit
                 response.headers["X-Graph-Cache-Hit"] = cache_hit
-                print(
-                    f"[graph/build] route_id={req.route_id} dir={req.direction_id} hit={cache_hit} elapsed_ms={elapsed:.1f}",
-                    flush=True,
+                log(
+                    "graph/build",
+                    f"route_id={req.route_id} dir={req.direction_id} hit={cache_hit} elapsed_ms={elapsed:.1f}",
                 )
                 return GraphBuildResponse(
                     pattern_id=pat.pattern_id,
@@ -615,9 +619,9 @@ def graph_build(req: GraphBuildRequest, response: Response):
         response.headers["X-Elapsed-Ms"] = f"{elapsed:.1f}"
         response.headers["X-Cache-Hit"] = "built"
         response.headers["X-Graph-Cache-Hit"] = "built"
-        print(
-            f"[graph/build] route_id={req.route_id} dir={req.direction_id} hit=built elapsed_ms={elapsed:.1f}",
-            flush=True,
+        log(
+            "graph/build",
+            f"route_id={req.route_id} dir={req.direction_id} hit=built elapsed_ms={elapsed:.1f}",
         )
         return GraphBuildResponse(
             pattern_id=pat.pattern_id,
@@ -734,9 +738,9 @@ def graph_stops(
         elapsed = (time.perf_counter() - t0) * 1000.0
         response.headers["X-Elapsed-Ms"] = f"{elapsed:.1f}"
         response.headers["X-Cache-Hit"] = "preview"
-        print(
-            f"[graph/stops] route_id={route_id} dir={direction_id} hit=preview elapsed_ms={elapsed:.1f}",
-            flush=True,
+        log(
+            "graph/stops",
+            f"route_id={route_id} dir={direction_id} hit=preview elapsed_ms={elapsed:.1f}",
         )
         return out
 
@@ -778,9 +782,9 @@ def graph_stops(
     elapsed = (time.perf_counter() - t0) * 1000.0
     response.headers["X-Elapsed-Ms"] = f"{elapsed:.1f}"
     response.headers["X-Cache-Hit"] = cache_hit
-    print(
-        f"[graph/stops] route_id={route_id} dir={direction_id} hit={cache_hit} elapsed_ms={elapsed:.1f}",
-        flush=True,
+    log(
+        "graph/stops",
+        f"route_id={route_id} dir={direction_id} hit={cache_hit} elapsed_ms={elapsed:.1f}",
     )
     return GraphStopsResponse(pattern_id=chosen.pattern_id, stops=res_stops)
 
@@ -790,11 +794,11 @@ def detour(req: DetourRequest):
     blockage_geojson = _ensure_geometry(req.blockage_geojson)
     date_str = req.date or datetime.utcnow().strftime("%Y%m%d")
 
-    print(
-        f"[detour] route_id={req.route_id!r}, direction_id={req.direction_id!r}, "
+    log(
+        "detour",
+        f"route_id={req.route_id!r}, direction_id={req.direction_id!r}, "
         f"date={date_str}, start_stop_id={req.start_stop_id!r}, "
         f"end_stop_id={req.end_stop_id!r}",
-        flush=True,
     )
 
     candidate_keys = _graph_cache_keys_for_lookup(
@@ -848,13 +852,13 @@ def detour(req: DetourRequest):
     except DetourComputeError as e:
         raise HTTPException(status_code=e.status_code, detail=e.detail)
 
-    print(
-        f"[detour] result route_id={req.route_id!r}, direction_id={req.direction_id!r}, "
+    log(
+        "detour",
+        f"result route_id={req.route_id!r}, direction_id={req.direction_id!r}, "
         f"blocked_edges={result.blocked_edges_count}, "
         f"stop_path_len={len(result.stop_path)}, "
         f"total_travel_time_s={result.total_travel_time_s:.1f}, "
         f"baseline_travel_time_s={result.baseline_travel_time_s if result.baseline_travel_time_s is not None else 'N/A'}",
-        flush=True,
     )
 
     return DetourResponse(
@@ -1158,9 +1162,9 @@ def graph_geojson(
         elapsed = (time.perf_counter() - t0) * 1000.0
         response.headers["X-Elapsed-Ms"] = f"{elapsed:.1f}"
         response.headers["X-Cache-Hit"] = "preview"
-        print(
-            f"[graph/geojson] route_id={route_id} dir={direction_id} hit=preview elapsed_ms={elapsed:.1f}",
-            flush=True,
+        log(
+            "graph/geojson",
+            f"route_id={route_id} dir={direction_id} hit=preview elapsed_ms={elapsed:.1f}",
         )
         return cache.get("preview_geojson")
 
@@ -1254,9 +1258,9 @@ def graph_geojson(
     elapsed = (time.perf_counter() - t0) * 1000.0
     response.headers["X-Elapsed-Ms"] = f"{elapsed:.1f}"
     response.headers["X-Cache-Hit"] = "assembled"
-    print(
-        f"[graph/geojson] route_id={route_id} dir={direction_id} hit=assembled elapsed_ms={elapsed:.1f}",
-        flush=True,
+    log(
+        "graph/geojson",
+        f"route_id={route_id} dir={direction_id} hit=assembled elapsed_ms={elapsed:.1f}",
     )
     return out
 
@@ -1301,9 +1305,9 @@ def graph_preview(
         response.headers["X-Elapsed-Ms"] = f"{elapsed:.1f}"
         response.headers["X-Cache-Hit"] = "memory"
         response.headers["X-Graph-Cache-Hit"] = "none"
-        print(
-            f"[graph/preview] route_id={route_id} dir={direction_id} preview_hit=memory graph_hit=none elapsed_ms={elapsed:.1f}",
-            flush=True,
+        log(
+            "graph/preview",
+            f"route_id={route_id} dir={direction_id} preview_hit=memory graph_hit=none elapsed_ms={elapsed:.1f}",
         )
         return mem_preview
 
@@ -1324,9 +1328,9 @@ def graph_preview(
                 response.headers["X-Elapsed-Ms"] = f"{elapsed:.1f}"
                 response.headers["X-Cache-Hit"] = "postgres"
                 response.headers["X-Graph-Cache-Hit"] = "none"
-                print(
-                    f"[graph/preview] route_id={route_id} dir={direction_id} preview_hit=postgres graph_hit=none elapsed_ms={elapsed:.1f}",
-                    flush=True,
+                log(
+                    "graph/preview",
+                    f"route_id={route_id} dir={direction_id} preview_hit=postgres graph_hit=none elapsed_ms={elapsed:.1f}",
                 )
                 return payload
         except Exception:
@@ -1418,9 +1422,9 @@ def graph_preview(
     response.headers["X-Elapsed-Ms"] = f"{elapsed:.1f}"
     response.headers["X-Cache-Hit"] = "built_fallback"
     response.headers["X-Graph-Cache-Hit"] = graph_cache_hit
-    print(
-        f"[graph/preview] route_id={route_id} dir={direction_id} preview_hit=built_fallback graph_hit={graph_cache_hit} elapsed_ms={elapsed:.1f}",
-        flush=True,
+    log(
+        "graph/preview",
+        f"route_id={route_id} dir={direction_id} preview_hit=built_fallback graph_hit={graph_cache_hit} elapsed_ms={elapsed:.1f}",
     )
     return payload
 
@@ -1439,7 +1443,7 @@ def graph_cache_warmup(profiles: Optional[str] = None):
     selected = None
     if profiles:
         selected = [p.strip() for p in str(profiles).split(",") if p.strip()]
-    print(f"[graph/cache/warmup] manual trigger profiles={selected}", flush=True)
+    log("graph/cache/warmup", f"manual trigger profiles={selected}")
     res = _run_graph_cache_warmup(selected)
     return {
         "ok": True,
@@ -2001,9 +2005,7 @@ def detours_by_area(req: DetourByAreaRequest):
             detail=f"GTFS feed could not be loaded. Place israel-public-transportation.zip in the project root or run /feed/update. ({e})",
         )
 
-    from backend.logging_utils import log as _log_detours
-
-    _log_detours(
+    log(
         "detours/by-area",
         f"mode={req.mode}, date={req.date}, "
         f"time_window={req.start_time}-{req.end_time}, "
@@ -2024,7 +2026,7 @@ def detours_by_area(req: DetourByAreaRequest):
             transfer_radius_m=req.transfer_radius_m,
             use_osm_detour=req.use_osm_detour,
         )
-        _log_detours(
+        log(
             "detours/by-area",
             f"single route_id={result.route_id!r}, "
             f"direction_id={result.direction_id!r}, "
@@ -2074,7 +2076,7 @@ def detours_by_area(req: DetourByAreaRequest):
         )
         results.append(res)
 
-    _log_detours(
+    log(
         "detours/by-area",
         f"computed {len(results)} route detours "
         f"for blockage on date={req.date}, "

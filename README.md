@@ -67,8 +67,10 @@ Re-run the import (or a full feed update) to create these tables if you have an 
 From the project root:
 
 ```bash
-uvicorn app:app --reload --port 8000
+python -m run_uvicorn
 ```
+
+(Uses `uvicorn_logging.json` for consistent timestamps in the reload parent. If you prefer `py -m uvicorn app:app ...`, either add `--log-config uvicorn_logging.json`, set `UVICORN_LOG_CONFIG` to that file’s path in your shell, or run `.\dev.ps1 app:app --reload --port 8000` / `dev.bat …`.)
 
 The FastAPI app exposes:
 
@@ -140,7 +142,7 @@ Benchmark helper:
   - `python -m scripts.benchmark_graph_latency --endpoint preview --route-id 36594 --direction-id 1 --date 20260327 --runs 10 --trigger-warmup`
 
 For realistic latency checks, avoid `--reload`:
-- `py -m uvicorn app:app --port 8000`
+- `py -m uvicorn app:app --port 8000 --log-config uvicorn_logging.json`
 
 **Manage / CI**
 
@@ -541,7 +543,7 @@ Valhalla supports `exclude_polygons` in the route request, so the segment betwee
 From project root:
 
 ```bash
-uvicorn app:app --reload --port 8000
+python -m run_uvicorn
 ```
 
 ### 2. Run demo
@@ -589,7 +591,7 @@ Demo steps:
 3. **Run backend**:
 
    ```bash
-   uvicorn app:app --reload --port 8000
+   python -m run_uvicorn
    ```
 
 4. **(Optional) Run OSRM for OSM “pretty” geometry**:

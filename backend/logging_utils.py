@@ -18,11 +18,13 @@ def log(tag: str, msg: str, *, flush: bool = True) -> None:
     """
     Print a log line with a consistent timestamp and tag.
 
+    Matches Uvicorn's leading ``HH:MM:SS`` style (no brackets around the time).
+
     Example:
-        [19:52:36] [feed/update] Downloading GTFS...
+        19:52:36 [feed/update] Downloading GTFS ...
     """
     ts = now_ts()
-    text = f"[{ts}] [{tag}] {msg}"
+    text = f"{ts} [{tag}] {msg}"
     # Use plain print so this stays simple and works in scripts.
     if flush:
         print(text, flush=True)

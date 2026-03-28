@@ -25,9 +25,9 @@ Leave that terminal window open while you use the app.
    ```powershell
    cd "C:\Users\חל\Desktop\israel-public-transportation"
    ```
-3. Start the backend (use `0.0.0.0` so the server accepts connections properly on Windows):
+3. Start the backend (from the project folder):
    ```powershell
-   python -m uvicorn app:app --reload --port 8000 --host 0.0.0.0
+   python -m run_uvicorn
    ```
 4. When you see `Uvicorn running on http://0.0.0.0:8000`, try in the browser: **http://127.0.0.1:8000/health** (no space at the end).
 5. To test from the terminal (same machine): run `.\check-health.ps1`. If that works but the browser doesn’t, the server is fine and the issue is the browser or firewall.
@@ -35,7 +35,7 @@ Leave that terminal window open while you use the app.
 ## If it still doesn’t work
 
 - **“python is not recognized”**  
-  Install Python and make sure “Add Python to PATH” was checked. Or try `py -m uvicorn app:app --reload --port 8000 --host 127.0.0.1` instead of `python -m ...`.
+  Install Python and make sure “Add Python to PATH” was checked. Or try `py -m run_uvicorn` instead of `python -m ...`.
 
 - **“Could not import module app”**  
   You’re not in the project folder. Run `cd` to the path above and try again.
