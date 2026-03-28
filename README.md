@@ -120,17 +120,24 @@ python -m backend.scripts.build_patterns_postgis --date 20260308 --database-url 
 python -m scripts.precompute_graphs_postgis --workers 4
 ```
 
+The same script writes **`route_preview_cache`** rows for each `--profiles` value (GTFS geometry always; OSM-pretty lines when map-matching succeeds). **Fast `/graph/preview`** depends on those preview rows (and optional in-memory preview warmup), not only on `route_graph_cache`. Use the **same profile list** as `GRAPH_WARMUP_PROFILES` so the UI’s resolved service profile (weekday / Friday / Shabbat, etc.) matches precomputed keys. After any feed or pattern change that rotates signatures, re-run precompute (or accept occasional `built_fallback` until the next run).
+
 After ingest, the new feed is marked active. Run the backend with `DATABASE_URL` set; `/graph/build` and area/detour endpoints will use PostGIS.
 
 Warmup behavior:
-- Startup warmup is enabled by default and hydrates in-memory graph cache from PostGIS cache.
+- Startup warmup is enabled by default and hydrates in-memory **graph** cache from PostGIS, then bulk-loads **`route_preview_cache`** into `GRAPH_CACHE` preview keys (same key shape as `/graph/preview`) until `GRAPH_WARMUP_TIMEOUT_S` is reached.
 - Configure with:
   - `GRAPH_WARMUP_ENABLED=true|false`
   - `GRAPH_WARMUP_TIMEOUT_S=300`
   - `GRAPH_WARMUP_PROFILES=weekday,friday,saturday,sunday`
+  - `GRAPH_WARMUP_PREVIEWS_ENABLED=true|false` (skip preview memory hydration)
+  - `GRAPH_WARMUP_PREVIEW_VERIFY_SIG=true|false` (skip rows whose `route_sig_hash` no longer matches the live route)
+  - `GRAPH_WARMUP_PREVIEW_MAX_ROUTES=0` (optional cap on preview rows loaded per warmup; `0` = unlimited within the timeout)
 - Operational endpoints:
-  - `GET /graph/cache/status`
-  - `POST /graph/cache/warmup?profiles=weekday,friday`
+  - `GET /graph/cache/status` (includes `warmup.loaded_previews_gtfs`, `loaded_previews_osm`, `previews_skipped_stale`)
+  - `POST /graph/cache/warmup?profiles=weekday,friday` — add `include_previews=false` to warm graphs only
+
+**Optional later optimization:** if `built_fallback` remains costly after precompute + preview warmup, a slimmer stored preview (for example one merged centerline instead of per-edge GeoJSON features) can shrink pickles and client parse time; `backend/route_preview_payload.py` is the single place to evolve the persisted dict shape alongside the API.
 
 Benchmark helper:
 - Compare first-call vs warm-cache `/graph/build` latency:

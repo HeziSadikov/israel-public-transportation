@@ -60,6 +60,10 @@ GRAPH_WARMUP_PROFILES = parse_csv_env(
     "GRAPH_WARMUP_PROFILES",
     "weekday,friday,saturday,sunday",
 )
+GRAPH_WARMUP_PREVIEWS_ENABLED = parse_bool_env("GRAPH_WARMUP_PREVIEWS_ENABLED", True)
+GRAPH_WARMUP_PREVIEW_VERIFY_SIG = parse_bool_env("GRAPH_WARMUP_PREVIEW_VERIFY_SIG", True)
+# 0 = no cap (within GRAPH_WARMUP_TIMEOUT_S)
+GRAPH_WARMUP_PREVIEW_MAX_ROUTES = max(0, parse_int_env("GRAPH_WARMUP_PREVIEW_MAX_ROUTES", 0))
 
 # PostgreSQL/PostGIS: backend/db_access.py reads DATABASE_URL for area search, graph build, detours.
 # Example: postgresql://user:pass@localhost:5432/israel_gtfs

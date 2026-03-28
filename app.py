@@ -56,7 +56,11 @@ from backend.config import (
     GRAPH_WARMUP_ENABLED,
     GRAPH_WARMUP_TIMEOUT_S,
     GRAPH_WARMUP_PROFILES,
+    GRAPH_WARMUP_PREVIEWS_ENABLED,
+    GRAPH_WARMUP_PREVIEW_VERIFY_SIG,
+    GRAPH_WARMUP_PREVIEW_MAX_ROUTES,
 )
+from backend.route_preview_payload import build_route_preview_cache_dict
 from backend.area_search import find_routes_in_polygon
 from backend import db_access as db_access_module
 from backend.logging_utils import log
@@ -72,6 +76,9 @@ GRAPH_WARMUP_STATUS: Dict[str, object] = {
     "last_duration_s": None,
     "loaded_gtfs": 0,
     "loaded_osm": 0,
+    "loaded_previews_gtfs": 0,
+    "loaded_previews_osm": 0,
+    "previews_skipped_stale": 0,
     "errors": 0,
 }
 
@@ -95,6 +102,67 @@ def _resolve_route_sig_hash(
         return db_access_module.compute_route_signature(route_id, direction_id)
     except Exception:
         return None
+
+
+def _warmup_route_previews(
+    feed_id: int,
+    feed_version: str,
+    profile_keys: List[str],
+    started: float,
+    timeout_s: int,
+) -> Tuple[int, int, int]:
+    """Bulk-load route_preview_cache rows into GRAPH_CACHE. Returns (gtfs_count, osm_count, stale_skips)."""
+    if not GRAPH_WARMUP_PREVIEWS_ENABLED:
+        return 0, 0, 0
+    loaded_gtfs = 0
+    loaded_osm = 0
+    skipped_stale = 0
+    max_n = int(GRAPH_WARMUP_PREVIEW_MAX_ROUTES or 0)
+    total_loaded = 0
+    stop_all = False
+    for pretty_osm in (False, True):
+        if stop_all or time.time() - started > timeout_s:
+            break
+        for profile_key in profile_keys:
+            if stop_all or time.time() - started > timeout_s:
+                break
+            try:
+                bulk = db_access_module.get_cached_previews_bulk(
+                    feed_id, profile_key, pretty_osm
+                )
+            except Exception:
+                GRAPH_WARMUP_STATUS["errors"] = int(GRAPH_WARMUP_STATUS["errors"] or 0) + 1
+                continue
+            for (route_id, direction_id), (sig_db, _pat_id, blob) in bulk.items():
+                if time.time() - started > timeout_s:
+                    stop_all = True
+                    break
+                if max_n > 0 and total_loaded >= max_n:
+                    stop_all = True
+                    break
+                if GRAPH_WARMUP_PREVIEW_VERIFY_SIG:
+                    live = _resolve_route_sig_hash(feed_id, route_id, direction_id)
+                    if not live or live != sig_db:
+                        skipped_stale += 1
+                        continue
+                try:
+                    payload = pickle.loads(blob)
+                except Exception:
+                    GRAPH_WARMUP_STATUS["errors"] = int(GRAPH_WARMUP_STATUS["errors"] or 0) + 1
+                    continue
+                if not isinstance(payload, dict) or payload.get("route_geojson") is None:
+                    GRAPH_WARMUP_STATUS["errors"] = int(GRAPH_WARMUP_STATUS["errors"] or 0) + 1
+                    continue
+                mem_key = _preview_mem_key(
+                    feed_version, route_id, direction_id, profile_key, pretty_osm
+                )
+                GRAPH_CACHE[mem_key] = payload
+                total_loaded += 1
+                if pretty_osm:
+                    loaded_osm += 1
+                else:
+                    loaded_gtfs += 1
+    return loaded_gtfs, loaded_osm, skipped_stale
 
 
 def _build_preview_payload_from_cache_entry(cache: Dict) -> Dict[str, object]:
@@ -188,16 +256,24 @@ def health():
     return {"status": "ok", "time": datetime.utcnow().isoformat() + "Z"}
 
 
-def _run_graph_cache_warmup(profiles: Optional[List[str]] = None) -> Dict[str, object]:
+def _run_graph_cache_warmup(
+    profiles: Optional[List[str]] = None,
+    *,
+    include_previews: bool = True,
+) -> Dict[str, object]:
     started = time.time()
     GRAPH_WARMUP_STATUS["last_started_at"] = datetime.utcnow().isoformat() + "Z"
     GRAPH_WARMUP_STATUS["errors"] = 0
+    GRAPH_WARMUP_STATUS["loaded_previews_gtfs"] = 0
+    GRAPH_WARMUP_STATUS["loaded_previews_osm"] = 0
+    GRAPH_WARMUP_STATUS["previews_skipped_stale"] = 0
     loaded_gtfs = 0
     loaded_osm = 0
     profile_keys = profiles or list(GRAPH_WARMUP_PROFILES)
     log(
         "graph/cache/warmup",
-        f"start profiles={profile_keys}, timeout_s={GRAPH_WARMUP_TIMEOUT_S}",
+        f"start profiles={profile_keys}, timeout_s={GRAPH_WARMUP_TIMEOUT_S}, "
+        f"include_previews={include_previews}",
     )
     try:
         feed_id = db_access_module.get_active_feed_id()
@@ -232,6 +308,28 @@ def _run_graph_cache_warmup(profiles: Optional[List[str]] = None) -> Dict[str, o
     except Exception as e:
         log("graph/cache/warmup", f"fatal_error={e!s}")
         GRAPH_WARMUP_STATUS["errors"] = int(GRAPH_WARMUP_STATUS["errors"] or 0) + 1
+    preview_gtfs = 0
+    preview_osm = 0
+    preview_skip = 0
+    if include_previews:
+        try:
+            feed_id_pv = db_access_module.get_active_feed_id()
+            feed_version_pv = f"postgis-{feed_id_pv}"
+            timeout_s = max(1, int(GRAPH_WARMUP_TIMEOUT_S))
+            if time.time() - started <= timeout_s:
+                preview_gtfs, preview_osm, preview_skip = _warmup_route_previews(
+                    feed_id_pv,
+                    feed_version_pv,
+                    profile_keys,
+                    started,
+                    timeout_s,
+                )
+        except Exception as e:
+            log("graph/cache/warmup", f"preview_warmup_error={e!s}")
+            GRAPH_WARMUP_STATUS["errors"] = int(GRAPH_WARMUP_STATUS["errors"] or 0) + 1
+    GRAPH_WARMUP_STATUS["loaded_previews_gtfs"] = preview_gtfs
+    GRAPH_WARMUP_STATUS["loaded_previews_osm"] = preview_osm
+    GRAPH_WARMUP_STATUS["previews_skipped_stale"] = preview_skip
     finished = time.time()
     GRAPH_WARMUP_STATUS["last_finished_at"] = datetime.utcnow().isoformat() + "Z"
     GRAPH_WARMUP_STATUS["last_duration_s"] = round(finished - started, 3)
@@ -240,7 +338,9 @@ def _run_graph_cache_warmup(profiles: Optional[List[str]] = None) -> Dict[str, o
     log(
         "graph/cache/warmup",
         f"done duration_s={GRAPH_WARMUP_STATUS['last_duration_s']}, "
-        f"loaded_gtfs={loaded_gtfs}, loaded_osm={loaded_osm}, errors={GRAPH_WARMUP_STATUS['errors']}",
+        f"loaded_gtfs={loaded_gtfs}, loaded_osm={loaded_osm}, "
+        f"loaded_previews_gtfs={preview_gtfs}, loaded_previews_osm={preview_osm}, "
+        f"previews_skipped_stale={preview_skip}, errors={GRAPH_WARMUP_STATUS['errors']}",
     )
     return dict(GRAPH_WARMUP_STATUS)
 
@@ -377,6 +477,25 @@ def _graph_cache_key(
             direction_id or "",
             f"profile:{profile_key}",
             "osm" if pretty_osm else "gtfs",
+        ]
+    )
+
+
+def _preview_mem_key(
+    feed_version: str,
+    route_id: str,
+    direction_id: str | None,
+    profile_key: str,
+    pretty_osm: bool,
+) -> str:
+    return "|".join(
+        [
+            feed_version,
+            route_id,
+            direction_id or "",
+            f"profile:{profile_key}",
+            "osm" if pretty_osm else "gtfs",
+            "preview",
         ]
     )
 
@@ -1289,15 +1408,8 @@ def graph_preview(
     if not sig_hash:
         raise HTTPException(status_code=409, detail="Could not resolve route signature for preview cache.")
 
-    preview_mem_key = "|".join(
-        [
-            feed_version,
-            route_id,
-            direction_id or "",
-            f"profile:{profile_key}",
-            "osm" if pretty_osm else "gtfs",
-            "preview",
-        ]
+    preview_mem_key = _preview_mem_key(
+        feed_version, route_id, direction_id, profile_key, pretty_osm
     )
     mem_preview = GRAPH_CACHE.get(preview_mem_key)
     if isinstance(mem_preview, dict) and mem_preview.get("route_geojson") is not None:
@@ -1396,13 +1508,13 @@ def graph_preview(
 
     preview = _build_preview_payload_from_cache_entry(cache)
     pat = cache["pattern"]
-    payload = {
-        "pattern_id": pat.pattern_id,
-        "stops": preview["stops"],
-        "route_geojson": preview["route_geojson"],
-        "used_osm_snapping": bool(cache.get("used_osm_snapping", False)),
-        "feed_version": feed_version,
-    }
+    payload = build_route_preview_cache_dict(
+        pat.pattern_id,
+        preview["stops"],
+        preview["route_geojson"],
+        bool(cache.get("used_osm_snapping", False)),
+        feed_version,
+    )
     GRAPH_CACHE[preview_mem_key] = payload
     try:
         db_access_module.save_route_preview_pg(
@@ -1439,12 +1551,18 @@ def graph_cache_status():
 
 
 @app.post("/graph/cache/warmup")
-def graph_cache_warmup(profiles: Optional[str] = None):
+def graph_cache_warmup(
+    profiles: Optional[str] = None,
+    include_previews: bool = True,
+):
     selected = None
     if profiles:
         selected = [p.strip() for p in str(profiles).split(",") if p.strip()]
-    log("graph/cache/warmup", f"manual trigger profiles={selected}")
-    res = _run_graph_cache_warmup(selected)
+    log(
+        "graph/cache/warmup",
+        f"manual trigger profiles={selected} include_previews={include_previews}",
+    )
+    res = _run_graph_cache_warmup(selected, include_previews=include_previews)
     return {
         "ok": True,
         "entries": len(GRAPH_CACHE),

@@ -35,6 +35,7 @@ from backend.graph_builder import build_graph_for_pattern_from_postgis
 from backend.logging_utils import log
 from backend.osm_pretty import map_match_pattern
 from backend import db_access as db_access_module
+from backend.route_preview_payload import build_route_preview_cache_dict
 
 
 def _connect(database_url: Optional[str]):
@@ -251,13 +252,13 @@ def _build_chunk(
                         route_sig_hash=sig_hash,
                         pattern_id=str(cache_entry["pattern"].pattern_id),
                         preview_blob=pickle.dumps(
-                            {
-                                "pattern_id": cache_entry["pattern"].pattern_id,
-                                "stops": cache_entry.get("preview_stops") or [],
-                                "route_geojson": cache_entry.get("preview_geojson"),
-                                "used_osm_snapping": False,
-                                "feed_version": f"postgis-{feed_id}",
-                            }
+                            build_route_preview_cache_dict(
+                                cache_entry["pattern"].pattern_id,
+                                cache_entry.get("preview_stops") or [],
+                                cache_entry.get("preview_geojson"),
+                                False,
+                                f"postgis-{feed_id}",
+                            )
                         ),
                         conn=conn_w,
                     )
@@ -304,13 +305,13 @@ def _build_chunk(
                                 route_sig_hash=sig_hash,
                                 pattern_id=str(pretty_entry["pattern"].pattern_id),
                                 preview_blob=pickle.dumps(
-                                    {
-                                        "pattern_id": pretty_entry["pattern"].pattern_id,
-                                        "stops": pretty_entry.get("preview_stops") or [],
-                                        "route_geojson": pretty_entry.get("preview_geojson"),
-                                        "used_osm_snapping": True,
-                                        "feed_version": f"postgis-{feed_id}",
-                                    }
+                                    build_route_preview_cache_dict(
+                                        pretty_entry["pattern"].pattern_id,
+                                        pretty_entry.get("preview_stops") or [],
+                                        pretty_entry.get("preview_geojson"),
+                                        True,
+                                        f"postgis-{feed_id}",
+                                    )
                                 ),
                                 conn=conn_w,
                             )
@@ -338,7 +339,10 @@ def main():
         "--profiles",
         type=str,
         default="weekday,friday,saturday,sunday",
-        help="Comma-separated service profiles to prewarm in in-memory cache keys.",
+        help=(
+            "Comma-separated service profiles for route_graph_cache and route_preview_cache "
+            "(match GRAPH_WARMUP_PROFILES / production UI service calendar)."
+        ),
     )
     ap.add_argument(
         "--workers",

@@ -100,6 +100,14 @@ const SOURCE_ROUTE = "route";
 const SOURCE_DETOUR = "detour";
 const SOURCE_STOPS = "stops";
 const SOURCE_PIN = "pin";
+/** First-edge rubber line while drawing (one anchor + cursor); not part of MapboxDraw HOT/COLD. */
+const SOURCE_POLYGON_PREVIEW = "blockage-polygon-preview-line";
+const LAYER_POLYGON_PREVIEW = "blockage-polygon-preview-line-layer";
+
+const EMPTY_FC: GeoJSONFeatureCollection = { type: "FeatureCollection", features: [] };
+
+/** MapboxDraw duplicates each style for cold/hot sources; layer ids are `${DRAW_STYLES.id}.hot`. */
+const DRAW_VERTEX_LAYER_HOT = "gl-draw-polygon-vertex.hot";
 
 /** Normalize drawn geometry: close polygon ring if needed (GeoJSON spec; backend expects closed). */
 function normalizeBlockageGeometry(geom: GeoJSON.Geometry): GeoJSON.Geometry {
@@ -178,6 +186,7 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
 
   useEffect(() => {
     if (!containerRef.current) return;
+    let detachPolygonPreview: (() => void) | null = null;
     const [lat, lng] = center;
     const map = new maplibregl.Map({
       container: containerRef.current,
@@ -262,9 +271,89 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
       map.addControl(draw as any, "top-right");
       drawRef.current = draw;
 
-      map.on("draw.create", (e: { features?: GeoJSON.Feature[] }) => {
-        console.log("draw.create fired", e);
+      map.addSource(SOURCE_POLYGON_PREVIEW, { type: "geojson", data: EMPTY_FC });
+      // Must match MapboxDraw's suffixed layer id (see @mapbox/mapbox-gl-draw options.js addSources).
+      if (map.getLayer(DRAW_VERTEX_LAYER_HOT)) {
+        map.addLayer(
+          {
+            id: LAYER_POLYGON_PREVIEW,
+            type: "line",
+            source: SOURCE_POLYGON_PREVIEW,
+            layout: { "line-cap": "round", "line-join": "round" },
+            paint: { "line-color": "#dc2626", "line-width": 2 },
+          },
+          DRAW_VERTEX_LAYER_HOT
+        );
+      } else {
+        map.addLayer({
+          id: LAYER_POLYGON_PREVIEW,
+          type: "line",
+          source: SOURCE_POLYGON_PREVIEW,
+          layout: { "line-cap": "round", "line-join": "round" },
+          paint: { "line-color": "#dc2626", "line-width": 2 },
+        });
+      }
 
+      const drawApi = draw as MapboxDraw & { getMode?: () => string };
+      const syncPolygonPreviewLine = () => {
+        const src = map.getSource(SOURCE_POLYGON_PREVIEW) as maplibregl.GeoJSONSource | undefined;
+        if (!src) return;
+        if (typeof drawApi.getMode !== "function" || drawApi.getMode() !== "draw_polygon") {
+          src.setData(EMPTY_FC as any);
+          return;
+        }
+        const all = draw.getAll();
+        const f = all?.features?.[0];
+        if (!f || f.geometry?.type !== "Polygon") {
+          src.setData(EMPTY_FC as any);
+          return;
+        }
+        const ring = f.geometry.coordinates?.[0];
+        if (!ring || ring.length < 2) {
+          src.setData(EMPTY_FC as any);
+          return;
+        }
+        // MapboxDraw Polygon.toGeoJSON closes the ring: two in-progress verts [A,B] become [A,B,A].
+        const closedAsFirstEdge =
+          ring.length === 3 &&
+          ring[0]?.length >= 2 &&
+          ring[2]?.length >= 2 &&
+          ring[0][0] === ring[2][0] &&
+          ring[0][1] === ring[2][1];
+        const openTwoVerts = ring.length === 2;
+        if (!closedAsFirstEdge && !openTwoVerts) {
+          src.setData(EMPTY_FC as any);
+          return;
+        }
+        const a = ring[0];
+        const b = ring[1];
+        if (!a || !b || a.length < 2 || b.length < 2) {
+          src.setData(EMPTY_FC as any);
+          return;
+        }
+        src.setData({
+          type: "FeatureCollection",
+          features: [
+            {
+              type: "Feature",
+              properties: {},
+              geometry: {
+                type: "LineString",
+                coordinates: [
+                  [a[0], a[1]],
+                  [b[0], b[1]],
+                ],
+              },
+            },
+          ],
+        } as any);
+      };
+
+      map.on("draw.render", syncPolygonPreviewLine);
+      map.on("mousemove", syncPolygonPreviewLine);
+      map.on("draw.modechange", syncPolygonPreviewLine);
+
+      map.on("draw.create", (e: { features?: GeoJSON.Feature[] }) => {
         let feature = e?.features?.[0];
         if (!feature && typeof draw.getAll === "function") {
           const all = draw.getAll();
@@ -274,9 +363,9 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
           const geom = normalizeBlockageGeometry(feature.geometry);
           onBlockageChange(geom);
         }
+        syncPolygonPreviewLine();
       });
       map.on("draw.update", (e: { features?: GeoJSON.Feature[] }) => {
-        console.log("draw.update fired", e);
         let feature = e?.features?.[0];
         if (!feature && typeof draw.getAll === "function") {
           const all = draw.getAll();
@@ -286,14 +375,25 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
           const geom = normalizeBlockageGeometry(feature.geometry);
           onBlockageChange(geom);
         }
+        syncPolygonPreviewLine();
       });
-      map.on("draw.delete", () => onBlockageChange(null));
+      map.on("draw.delete", () => {
+        onBlockageChange(null);
+        syncPolygonPreviewLine();
+      });
 
       setMapReady(true);
+
+      detachPolygonPreview = () => {
+        map.off("draw.render", syncPolygonPreviewLine);
+        map.off("mousemove", syncPolygonPreviewLine);
+        map.off("draw.modechange", syncPolygonPreviewLine);
+      };
     };
 
     map.on("load", onLoad);
     return () => {
+      detachPolygonPreview?.();
       map.remove();
       mapRef.current = null;
       drawRef.current = null;
