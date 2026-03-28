@@ -72,6 +72,27 @@ GRAPH_WARMUP_STATUS: Dict[str, object] = {
 }
 
 
+def _resolve_route_sig_hash(
+    feed_id: int,
+    route_id: str,
+    direction_id: str | None,
+) -> Optional[str]:
+    """
+    Get route signature cheaply from route_signatures table when available,
+    fallback to on-demand compute.
+    """
+    try:
+        sig = db_access_module.get_route_signature(feed_id, route_id, direction_id)
+        if sig:
+            return sig
+    except Exception:
+        pass
+    try:
+        return db_access_module.compute_route_signature(route_id, direction_id)
+    except Exception:
+        return None
+
+
 def _build_preview_payload_from_cache_entry(cache: Dict) -> Dict[str, object]:
     """
     Build route preview payload (geojson + ordered stops) from a cache entry.
@@ -472,6 +493,7 @@ def graph_build(req: GraphBuildRequest, response: Response):
             elapsed = (time.perf_counter() - t0) * 1000.0
             response.headers["X-Elapsed-Ms"] = f"{elapsed:.1f}"
             response.headers["X-Cache-Hit"] = cache_hit
+            response.headers["X-Graph-Cache-Hit"] = cache_hit
             print(
                 f"[graph/build] route_id={req.route_id} dir={req.direction_id} hit={cache_hit} elapsed_ms={elapsed:.1f}",
                 flush=True,
@@ -521,6 +543,7 @@ def graph_build(req: GraphBuildRequest, response: Response):
                 elapsed = (time.perf_counter() - t0) * 1000.0
                 response.headers["X-Elapsed-Ms"] = f"{elapsed:.1f}"
                 response.headers["X-Cache-Hit"] = cache_hit
+                response.headers["X-Graph-Cache-Hit"] = cache_hit
                 print(
                     f"[graph/build] route_id={req.route_id} dir={req.direction_id} hit={cache_hit} elapsed_ms={elapsed:.1f}",
                     flush=True,
@@ -591,6 +614,7 @@ def graph_build(req: GraphBuildRequest, response: Response):
         elapsed = (time.perf_counter() - t0) * 1000.0
         response.headers["X-Elapsed-Ms"] = f"{elapsed:.1f}"
         response.headers["X-Cache-Hit"] = "built"
+        response.headers["X-Graph-Cache-Hit"] = "built"
         print(
             f"[graph/build] route_id={req.route_id} dir={req.direction_id} hit=built elapsed_ms={elapsed:.1f}",
             flush=True,
@@ -610,6 +634,7 @@ def graph_build(req: GraphBuildRequest, response: Response):
         elapsed = (time.perf_counter() - t0) * 1000.0
         response.headers["X-Elapsed-Ms"] = f"{elapsed:.1f}"
         response.headers["X-Cache-Hit"] = cache_hit
+        response.headers["X-Graph-Cache-Hit"] = cache_hit
         raise HTTPException(
             status_code=500,
             detail=f"Graph build failed: {e!s}",
@@ -1250,16 +1275,65 @@ def graph_preview(
     """
     t0 = time.perf_counter()
     date_str = date or datetime.utcnow().strftime("%Y%m%d")
-    # Ensure cache entry exists (prefer warm/cached path inside graph_build).
-    _ = graph_build(
-        GraphBuildRequest(
-            route_id=route_id,
-            direction_id=direction_id,
-            date=date_str,
-            pretty_osm=pretty_osm,
-        ),
-        response,
+    profile_key = resolve_service_profile(date_str)
+    try:
+        feed_id = db_access_module.get_active_feed_id()
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Could not resolve active feed: {e!s}")
+    feed_version = f"postgis-{feed_id}"
+    sig_hash = _resolve_route_sig_hash(feed_id, route_id, direction_id)
+    if not sig_hash:
+        raise HTTPException(status_code=409, detail="Could not resolve route signature for preview cache.")
+
+    preview_mem_key = "|".join(
+        [
+            feed_version,
+            route_id,
+            direction_id or "",
+            f"profile:{profile_key}",
+            "osm" if pretty_osm else "gtfs",
+            "preview",
+        ]
     )
+    mem_preview = GRAPH_CACHE.get(preview_mem_key)
+    if isinstance(mem_preview, dict) and mem_preview.get("route_geojson") is not None:
+        elapsed = (time.perf_counter() - t0) * 1000.0
+        response.headers["X-Elapsed-Ms"] = f"{elapsed:.1f}"
+        response.headers["X-Cache-Hit"] = "memory"
+        response.headers["X-Graph-Cache-Hit"] = "none"
+        print(
+            f"[graph/preview] route_id={route_id} dir={direction_id} preview_hit=memory graph_hit=none elapsed_ms={elapsed:.1f}",
+            flush=True,
+        )
+        return mem_preview
+
+    db_preview = db_access_module.get_cached_route_preview_pg(
+        feed_id=feed_id,
+        route_id=route_id,
+        direction_id=direction_id,
+        profile_key=profile_key,
+        pretty_osm=pretty_osm,
+        route_sig_hash=sig_hash,
+    )
+    if db_preview and db_preview.get("preview_blob"):
+        try:
+            payload = pickle.loads(db_preview["preview_blob"])
+            if isinstance(payload, dict) and payload.get("route_geojson") is not None:
+                GRAPH_CACHE[preview_mem_key] = payload
+                elapsed = (time.perf_counter() - t0) * 1000.0
+                response.headers["X-Elapsed-Ms"] = f"{elapsed:.1f}"
+                response.headers["X-Cache-Hit"] = "postgres"
+                response.headers["X-Graph-Cache-Hit"] = "none"
+                print(
+                    f"[graph/preview] route_id={route_id} dir={direction_id} preview_hit=postgres graph_hit=none elapsed_ms={elapsed:.1f}",
+                    flush=True,
+                )
+                return payload
+        except Exception:
+            pass
+
+    # Fallback: load/build graph, assemble preview, then persist preview cache.
+    graph_cache_hit = "none"
     candidate_keys = _graph_cache_keys_for_lookup(route_id, direction_id, date_str)
     want_osm = "osm" if pretty_osm else "gtfs"
     cache = None
@@ -1268,30 +1342,87 @@ def graph_preview(
         if key in GRAPH_CACHE:
             if want_osm in key:
                 cache = GRAPH_CACHE[key]
+                graph_cache_hit = "memory"
                 break
             if fallback_cache is None:
                 fallback_cache = GRAPH_CACHE[key]
-    if cache is None:
+    if cache is None and fallback_cache is not None:
         cache = fallback_cache
+        graph_cache_hit = "memory_fallback"
+
+    if cache is None:
+        cached_blob = db_access_module.get_cached_route_graph_pg(
+            feed_id=feed_id,
+            route_id=route_id,
+            direction_id=direction_id,
+            pretty_osm=pretty_osm,
+            route_sig_hash=sig_hash,
+        )
+        if cached_blob:
+            try:
+                cache = pickle.loads(cached_blob)
+                graph_cache_hit = "postgres"
+                # hydrate canonical graph cache key
+                gk = _graph_cache_key(feed_version, route_id, direction_id, profile_key, pretty_osm)
+                GRAPH_CACHE[gk] = cache
+            except Exception:
+                cache = None
+
+    if cache is None:
+        # Last resort build path.
+        _ = graph_build(
+            GraphBuildRequest(
+                route_id=route_id,
+                direction_id=direction_id,
+                date=date_str,
+                pretty_osm=pretty_osm,
+            ),
+            response,
+        )
+        graph_cache_hit = "built"
+        # resolve again from in-memory graph cache
+        for key in _graph_cache_keys_for_lookup(route_id, direction_id, date_str):
+            if key in GRAPH_CACHE and (want_osm in key or cache is None):
+                cache = GRAPH_CACHE[key]
+                if want_osm in key:
+                    break
+
     if not cache:
-        raise HTTPException(status_code=400, detail="Graph not built yet; call /graph/build first.")
+        raise HTTPException(status_code=400, detail="Preview cache miss and graph fallback failed.")
 
     preview = _build_preview_payload_from_cache_entry(cache)
     pat = cache["pattern"]
-    elapsed = (time.perf_counter() - t0) * 1000.0
-    response.headers["X-Elapsed-Ms"] = f"{elapsed:.1f}"
-    response.headers["X-Cache-Hit"] = "preview"
-    print(
-        f"[graph/preview] route_id={route_id} dir={direction_id} elapsed_ms={elapsed:.1f}",
-        flush=True,
-    )
-    return {
+    payload = {
         "pattern_id": pat.pattern_id,
         "stops": preview["stops"],
         "route_geojson": preview["route_geojson"],
         "used_osm_snapping": bool(cache.get("used_osm_snapping", False)),
-        "feed_version": str(cache.get("date") or ""),
+        "feed_version": feed_version,
     }
+    GRAPH_CACHE[preview_mem_key] = payload
+    try:
+        db_access_module.save_route_preview_pg(
+            feed_id=feed_id,
+            route_id=route_id,
+            direction_id=direction_id,
+            profile_key=profile_key,
+            pretty_osm=pretty_osm,
+            route_sig_hash=sig_hash,
+            pattern_id=str(pat.pattern_id),
+            preview_blob=pickle.dumps(payload),
+        )
+    except Exception:
+        pass
+
+    elapsed = (time.perf_counter() - t0) * 1000.0
+    response.headers["X-Elapsed-Ms"] = f"{elapsed:.1f}"
+    response.headers["X-Cache-Hit"] = "built_fallback"
+    response.headers["X-Graph-Cache-Hit"] = graph_cache_hit
+    print(
+        f"[graph/preview] route_id={route_id} dir={direction_id} preview_hit=built_fallback graph_hit={graph_cache_hit} elapsed_ms={elapsed:.1f}",
+        flush=True,
+    )
+    return payload
 
 
 @app.get("/graph/cache/status")

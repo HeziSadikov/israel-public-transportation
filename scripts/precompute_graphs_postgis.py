@@ -207,6 +207,7 @@ def _build_chunk(
     feed_id: int,
     sigs_dict: Dict,
     database_url: Optional[str],
+    profiles: List[str],
 ) -> int:
     """Build and save graphs for a chunk of (route_id, direction_id). Used by parallel workers."""
     conn_w = _connect(database_url)
@@ -239,6 +240,27 @@ def _build_chunk(
                     graph_blob=pickle.dumps(cache_entry),
                     conn=conn_w,
                 )
+                # Save preview payload for configured profiles (GTFS).
+                for profile_key in profiles:
+                    db_access_module.save_route_preview_pg(
+                        feed_id=feed_id,
+                        route_id=r,
+                        direction_id=d,
+                        profile_key=profile_key,
+                        pretty_osm=False,
+                        route_sig_hash=sig_hash,
+                        pattern_id=str(cache_entry["pattern"].pattern_id),
+                        preview_blob=pickle.dumps(
+                            {
+                                "pattern_id": cache_entry["pattern"].pattern_id,
+                                "stops": cache_entry.get("preview_stops") or [],
+                                "route_geojson": cache_entry.get("preview_geojson"),
+                                "used_osm_snapping": False,
+                                "feed_version": f"postgis-{feed_id}",
+                            }
+                        ),
+                        conn=conn_w,
+                    )
                 # 2) Try to precompute OSRM-snapped variant (pretty_osm = True).
                 try:
                     pattern_geom = _merge_edge_geometries(
@@ -272,6 +294,26 @@ def _build_chunk(
                             graph_blob=pickle.dumps(pretty_entry),
                             conn=conn_w,
                         )
+                        for profile_key in profiles:
+                            db_access_module.save_route_preview_pg(
+                                feed_id=feed_id,
+                                route_id=r,
+                                direction_id=d,
+                                profile_key=profile_key,
+                                pretty_osm=True,
+                                route_sig_hash=sig_hash,
+                                pattern_id=str(pretty_entry["pattern"].pattern_id),
+                                preview_blob=pickle.dumps(
+                                    {
+                                        "pattern_id": pretty_entry["pattern"].pattern_id,
+                                        "stops": pretty_entry.get("preview_stops") or [],
+                                        "route_geojson": pretty_entry.get("preview_geojson"),
+                                        "used_osm_snapping": True,
+                                        "feed_version": f"postgis-{feed_id}",
+                                    }
+                                ),
+                                conn=conn_w,
+                            )
                 except Exception:
                     # OSRM failure should not break precompute.
                     pass
@@ -410,6 +452,26 @@ def main():
                         graph_blob=pickle.dumps(cache_entry),
                         conn=conn,
                     )
+                    for profile_key in profiles:
+                        db_access_module.save_route_preview_pg(
+                            feed_id=feed_id,
+                            route_id=r,
+                            direction_id=d,
+                            profile_key=profile_key,
+                            pretty_osm=False,
+                            route_sig_hash=sig_hash,
+                            pattern_id=str(cache_entry["pattern"].pattern_id),
+                            preview_blob=pickle.dumps(
+                                {
+                                    "pattern_id": cache_entry["pattern"].pattern_id,
+                                    "stops": cache_entry.get("preview_stops") or [],
+                                    "route_geojson": cache_entry.get("preview_geojson"),
+                                    "used_osm_snapping": False,
+                                    "feed_version": f"postgis-{feed_id}",
+                                }
+                            ),
+                            conn=conn,
+                        )
                     # 2) Try to precompute OSRM-snapped graph.
                     try:
                         pattern_geom = _merge_edge_geometries(
@@ -449,6 +511,26 @@ def main():
                                 graph_blob=pickle.dumps(pretty_entry),
                                 conn=conn,
                             )
+                            for profile_key in profiles:
+                                db_access_module.save_route_preview_pg(
+                                    feed_id=feed_id,
+                                    route_id=r,
+                                    direction_id=d,
+                                    profile_key=profile_key,
+                                    pretty_osm=True,
+                                    route_sig_hash=sig_hash,
+                                    pattern_id=str(pretty_entry["pattern"].pattern_id),
+                                    preview_blob=pickle.dumps(
+                                        {
+                                            "pattern_id": pretty_entry["pattern"].pattern_id,
+                                            "stops": pretty_entry.get("preview_stops") or [],
+                                            "route_geojson": pretty_entry.get("preview_geojson"),
+                                            "used_osm_snapping": True,
+                                            "feed_version": f"postgis-{feed_id}",
+                                        }
+                                    ),
+                                    conn=conn,
+                                )
                     except Exception:
                         pass
                 except Exception:
@@ -486,6 +568,7 @@ def main():
                         feed_id,
                         sigs,
                         args.database_url or DB_URL,
+                        profiles,
                     )
                     for ch in chunks
                 ]

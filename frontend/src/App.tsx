@@ -134,14 +134,16 @@ const App: React.FC = () => {
       setStops(preview.stops || []);
       // Include backend-timing headers when available.
       const backendMs = Number(previewRes.headers?.["x-elapsed-ms"] || 0);
+      const previewHit = previewRes.headers?.["x-cache-hit"] ?? "n/a";
+      const graphHit = previewRes.headers?.["x-graph-cache-hit"] ?? "none";
       const frontendMs = t1 - t0;
       console.info(
         `[route/preview] route_id=${routeId} direction_id=${directionId ?? ""} frontend_ms=${frontendMs.toFixed(
           1
-        )} backend_ms=${backendMs.toFixed(1)} cache_hit=${previewRes.headers?.["x-cache-hit"] ?? "n/a"}`
+        )} backend_ms=${backendMs.toFixed(1)} preview_hit=${previewHit} graph_hit=${graphHit}`
       );
       setMessage(
-        `Route loaded: frontend ${frontendMs.toFixed(0)}ms, backend ${backendMs.toFixed(0)}ms (${preview.stops?.length ?? 0} stops)`
+        `Route loaded: frontend ${frontendMs.toFixed(0)}ms, backend ${backendMs.toFixed(0)}ms, preview=${previewHit}, graph=${graphHit} (${preview.stops?.length ?? 0} stops)`
       );
       requestAnimationFrame(() => {
         const tPaint = performance.now();

@@ -142,7 +142,8 @@ def main() -> None:
         mark = "ok" if ok else "err"
         print(
             f"  run {i + 1:02d}: {mark} status={st} latency={_fmt(dt)} "
-            f"backend={_fmt(b_ms)} cache_hit={headers.get('x-cache-hit', 'n/a')}"
+            f"backend={_fmt(b_ms)} cache_hit={headers.get('x-cache-hit', 'n/a')} "
+            f"graph_hit={headers.get('x-graph-cache-hit', 'n/a')}"
         )
         if not ok:
             failures += 1

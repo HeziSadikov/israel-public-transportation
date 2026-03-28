@@ -201,6 +201,23 @@ CREATE TABLE IF NOT EXISTS route_graph_cache (
     PRIMARY KEY (feed_id, route_id, direction_id, pretty_osm)
 );
 
+-- Optional cache for lightweight route preview payloads (selection-time rendering).
+CREATE TABLE IF NOT EXISTS route_preview_cache (
+    feed_id        INT REFERENCES feed_versions(id) ON DELETE CASCADE,
+    route_id       TEXT NOT NULL,
+    direction_id   INT,
+    profile_key    TEXT NOT NULL,
+    pretty_osm     BOOLEAN NOT NULL,
+    route_sig_hash TEXT NOT NULL,
+    pattern_id     TEXT,
+    preview_blob   BYTEA NOT NULL,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (feed_id, route_id, direction_id, profile_key, pretty_osm)
+);
+
+CREATE INDEX IF NOT EXISTS idx_route_preview_cache_feed_profile
+    ON route_preview_cache(feed_id, profile_key, pretty_osm);
+
 -- ---------------------------------------------------------------------------
 -- Precomputed directional ride network (pattern_nodes / pattern_edges)
 -- ---------------------------------------------------------------------------

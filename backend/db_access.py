@@ -1611,6 +1611,156 @@ def save_route_graph_pg(
             conn.close()
 
 
+def get_cached_route_preview_pg(
+    feed_id: int,
+    route_id: str,
+    direction_id: Optional[str],
+    profile_key: str,
+    pretty_osm: bool,
+    route_sig_hash: str,
+    conn=None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Return cached preview payload for route/profile when signature matches.
+    """
+    close = False
+    if conn is None:
+        conn = _get_conn()
+        close = True
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT pattern_id, preview_blob
+                FROM route_preview_cache
+                WHERE feed_id = %s
+                  AND route_id = %s
+                  AND COALESCE(direction_id, -1) = COALESCE(%s::int, -1)
+                  AND profile_key = %s
+                  AND pretty_osm = %s
+                  AND route_sig_hash = %s
+                """,
+                (
+                    feed_id,
+                    route_id,
+                    int(direction_id) if direction_id is not None else None,
+                    profile_key,
+                    pretty_osm,
+                    route_sig_hash,
+                ),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            return {
+                "pattern_id": row["pattern_id"],
+                "preview_blob": bytes(row["preview_blob"]),
+            }
+    finally:
+        if close:
+            conn.close()
+
+
+def get_cached_previews_bulk(
+    feed_id: int,
+    profile_key: str,
+    pretty_osm: bool,
+    conn=None,
+) -> Dict[RouteDirKey, Tuple[str, str, bytes]]:
+    """
+    Load preview cache rows for (feed_id, profile_key, pretty_osm).
+    Returns (route_id, direction_id) -> (route_sig_hash, pattern_id, preview_blob)
+    """
+    close = False
+    if conn is None:
+        conn = _get_conn()
+        close = True
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT route_id, direction_id, route_sig_hash, pattern_id, preview_blob
+                FROM route_preview_cache
+                WHERE feed_id = %s
+                  AND profile_key = %s
+                  AND pretty_osm = %s
+                """,
+                (feed_id, profile_key, pretty_osm),
+            )
+            out: Dict[RouteDirKey, Tuple[str, str, bytes]] = {}
+            for row in cur.fetchall():
+                key: RouteDirKey = (
+                    row["route_id"],
+                    None if row["direction_id"] is None else str(row["direction_id"]),
+                )
+                out[key] = (
+                    row["route_sig_hash"],
+                    str(row["pattern_id"] or ""),
+                    bytes(row["preview_blob"]),
+                )
+            return out
+    finally:
+        if close:
+            conn.close()
+
+
+def save_route_preview_pg(
+    feed_id: int,
+    route_id: str,
+    direction_id: Optional[str],
+    profile_key: str,
+    pretty_osm: bool,
+    route_sig_hash: str,
+    pattern_id: str,
+    preview_blob: bytes,
+    conn=None,
+) -> None:
+    """
+    Save/update cached preview payload keyed by route+profile.
+    """
+    close = False
+    if conn is None:
+        conn = _get_conn()
+        close = True
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO route_preview_cache (
+                  feed_id,
+                  route_id,
+                  direction_id,
+                  profile_key,
+                  pretty_osm,
+                  route_sig_hash,
+                  pattern_id,
+                  preview_blob
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (feed_id, route_id, direction_id, profile_key, pretty_osm)
+                DO UPDATE SET
+                  route_sig_hash = EXCLUDED.route_sig_hash,
+                  pattern_id     = EXCLUDED.pattern_id,
+                  preview_blob   = EXCLUDED.preview_blob,
+                  created_at     = NOW()
+                """,
+                (
+                    feed_id,
+                    route_id,
+                    int(direction_id) if direction_id is not None else None,
+                    profile_key,
+                    pretty_osm,
+                    route_sig_hash,
+                    pattern_id,
+                    psycopg2.Binary(preview_blob),
+                ),
+            )
+            conn.commit()
+    finally:
+        if close:
+            conn.close()
+
+
 
 def get_blocked_edge_keys_pg(
     edge_geometries: Dict[Tuple[str, str], Any],
