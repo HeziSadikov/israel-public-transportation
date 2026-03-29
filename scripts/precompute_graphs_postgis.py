@@ -24,6 +24,8 @@ Optional:
 import argparse
 import pickle
 import sys
+import threading
+import time
 from typing import Optional, Tuple, List, Dict, Any
 
 import psycopg2
@@ -36,6 +38,7 @@ from backend.logging_utils import log
 from backend.osm_pretty import map_match_pattern
 from backend import db_access as db_access_module
 from backend.route_preview_payload import build_route_preview_cache_dict
+from backend.scripts.build_patterns_postgis import pick_default_pattern_build_date
 
 
 def _connect(database_url: Optional[str]):
@@ -138,7 +141,7 @@ def _iter_route_directions(conn) -> List[Tuple[str, Optional[str]]]:
         )
         rows = cur.fetchall()
     return [
-        (r["route_id"], None if r["direction_id"] is None else str(r["direction_id"]))
+        (str(r["route_id"]), None if r["direction_id"] is None else str(r["direction_id"]))
         for r in rows
     ]
 
@@ -172,6 +175,58 @@ def _build_one(
     cache_entry["preview_geojson"] = preview_geojson
     cache_entry["preview_stops"] = preview_stops
     return result.pattern, cache_entry
+
+
+def _subset_bulk_for_chunk(
+    chunk: List[Tuple[str, Optional[str]]],
+    patterns: Dict,
+    stops_by_pid: Dict,
+    shapes_by_sid: Dict,
+    stop_times_by_trip: Dict,
+) -> Tuple[Dict, Dict, Dict, Dict]:
+    """
+    Pass only rows needed for this chunk to worker processes (smaller pickle; fixes Windows spawn issues).
+    """
+    patterns_sub: Dict = {k: patterns[k] for k in chunk if k in patterns}
+    pids = {patterns[k].pattern_id for k in chunk if k in patterns}
+    trip_ids = {
+        patterns[k].repr_trip_id
+        for k in chunk
+        if k in patterns and patterns[k].repr_trip_id
+    }
+    shape_ids = {
+        patterns[k].repr_shape_id
+        for k in chunk
+        if k in patterns and patterns[k].repr_shape_id
+    }
+    stops_sub = {pid: stops_by_pid[pid] for pid in pids if pid in stops_by_pid}
+    for pid in pids:
+        if pid not in stops_sub:
+            alt = str(pid)
+            if alt in stops_by_pid:
+                stops_sub[pid] = stops_by_pid[alt]
+    shapes_sub = {sid: shapes_by_sid[sid] for sid in shape_ids if sid in shapes_by_sid}
+    for sid in shape_ids:
+        if sid not in shapes_sub:
+            alt = str(sid)
+            if alt in shapes_by_sid:
+                shapes_sub[sid] = shapes_by_sid[alt]
+    st_sub = {tid: stop_times_by_trip[tid] for tid in trip_ids if tid in stop_times_by_trip}
+    for tid in trip_ids:
+        if tid not in st_sub:
+            alt = str(tid)
+            if alt in stop_times_by_trip:
+                st_sub[tid] = stop_times_by_trip[alt]
+    return patterns_sub, stops_sub, shapes_sub, st_sub
+
+
+def _chunk_batches(seq: List[str], chunk_size: int) -> List[List[str]]:
+    """Split seq into chunks; chunk_size <= 0 means one batch (whole seq)."""
+    if not seq:
+        return []
+    if chunk_size <= 0:
+        return [seq]
+    return [seq[i : i + chunk_size] for i in range(0, len(seq), chunk_size)]
 
 
 def _merge_edge_geometries(edge_geometries: Dict[Tuple[str, str], Any]):
@@ -209,12 +264,47 @@ def _build_chunk(
     sigs_dict: Dict,
     database_url: Optional[str],
     profiles: List[str],
+    date_ymd: str,
+    chunk_label: str,
+    progress_every: int,
+    heartbeat_every_s: int,
 ) -> int:
     """Build and save graphs for a chunk of (route_id, direction_id). Used by parallel workers."""
     conn_w = _connect(database_url)
     n = 0
+    total_in_chunk = len(chunk)
+    log(
+        "precompute_graphs",
+        f"build: chunk {chunk_label} worker started ({total_in_chunk} routes in this chunk)",
+    )
+    pe = max(1, int(progress_every))
+    hb_s = max(0, int(heartbeat_every_s))
+    state = {"idx": 0, "saved": 0, "route": None, "stop": False}
+
+    def _heartbeat() -> None:
+        if hb_s <= 0:
+            return
+        while not state["stop"]:
+            time.sleep(hb_s)
+            if state["stop"]:
+                break
+            log(
+                "precompute_graphs",
+                (
+                    f"build: chunk {chunk_label} heartbeat "
+                    f"position {state['idx']}/{total_in_chunk} "
+                    f"saved_ok={state['saved']} current_route={state['route']}"
+                ),
+            )
+
+    hb_thread = None
+    if hb_s > 0:
+        hb_thread = threading.Thread(target=_heartbeat, daemon=True)
+        hb_thread.start()
     try:
-        for (r, d) in chunk:
+        for idx, (r, d) in enumerate(chunk, start=1):
+            state["idx"] = idx
+            state["route"] = (r, d)
             meta = patterns_dict.get((r, d))
             if not meta:
                 continue
@@ -239,7 +329,9 @@ def _build_chunk(
                     pretty_osm=False,
                     route_sig_hash=sig_hash,
                     graph_blob=pickle.dumps(cache_entry),
+                    date_ymd=date_ymd,
                     conn=conn_w,
+                    commit=False,
                 )
                 # Save preview payload for configured profiles (GTFS).
                 for profile_key in profiles:
@@ -261,6 +353,7 @@ def _build_chunk(
                             )
                         ),
                         conn=conn_w,
+                        commit=False,
                     )
                 # 2) Try to precompute OSRM-snapped variant (pretty_osm = True).
                 try:
@@ -293,7 +386,9 @@ def _build_chunk(
                             pretty_osm=True,
                             route_sig_hash=sig_hash,
                             graph_blob=pickle.dumps(pretty_entry),
+                            date_ymd=date_ymd,
                             conn=conn_w,
+                            commit=False,
                         )
                         for profile_key in profiles:
                             db_access_module.save_route_preview_pg(
@@ -314,14 +409,46 @@ def _build_chunk(
                                     )
                                 ),
                                 conn=conn_w,
+                                commit=False,
                             )
                 except Exception:
                     # OSRM failure should not break precompute.
                     pass
+                conn_w.commit()
                 n += 1
-            except Exception:
-                pass
+                state["saved"] = n
+            except Exception as e:
+                # Clear aborted transaction state so the worker can continue.
+                try:
+                    conn_w.rollback()
+                except Exception:
+                    pass
+                if isinstance(e, psycopg2.Error):
+                    log(
+                        "precompute_graphs",
+                        (
+                            f"route ({r!r},{d!r}) graph/preview save failed: "
+                            f"{type(e).__name__}: {e!s} "
+                            f"(pgcode={getattr(e, 'pgcode', None)!r})"
+                        ),
+                    )
+                else:
+                    log(
+                        "precompute_graphs",
+                        f"route ({r!r},{d!r}) graph/preview save failed: {type(e).__name__}: {e!s}",
+                    )
+            if idx % pe == 0 or idx == total_in_chunk:
+                log(
+                    "precompute_graphs",
+                    (
+                        f"build: chunk {chunk_label} position {idx}/{total_in_chunk} "
+                        f"saved_ok={n}"
+                    ),
+                )
     finally:
+        state["stop"] = True
+        if hb_thread is not None:
+            hb_thread.join(timeout=0.2)
         conn_w.close()
     return n
 
@@ -356,6 +483,49 @@ def main():
         default=50,
         help="Print progress every N graphs (default 50)",
     )
+    ap.add_argument(
+        "--signature-progress-every",
+        type=int,
+        default=500,
+        help="Print progress every N signature hashes during bulk signature step (default 500)",
+    )
+    ap.add_argument(
+        "--date",
+        type=str,
+        default=None,
+        metavar="YYYYMMDD",
+        help=(
+            "Metadata date_ymd stored with route_graph_cache rows (DB may require NOT NULL). "
+            "Default: a date inside the feed calendar window (same logic as pattern build)."
+        ),
+    )
+    ap.add_argument(
+        "--bulk-chunk-size",
+        type=int,
+        default=400,
+        help=(
+            "Split bulk pattern_stops / shapes / stop_times queries into batches of this many "
+            "IDs so logs advance during long DB reads (0 = single query per table)."
+        ),
+    )
+    ap.add_argument(
+        "--worker-heartbeat-seconds",
+        type=int,
+        default=15,
+        help=(
+            "Per-worker liveness heartbeat interval in seconds during parallel build "
+            "(0 = disable heartbeats)."
+        ),
+    )
+    ap.add_argument(
+        "--force-signatures",
+        action="store_true",
+        help=(
+            "Always recompute route signatures from trips/stop_times/shapes (slow). "
+            "Default: when feed checksum matches patterns_built_checksum, load signatures "
+            "from route_signatures (one query) instead of the bulk scan."
+        ),
+    )
     args = ap.parse_args()
     profiles = [p.strip() for p in str(args.profiles).split(",") if p.strip()]
     if not profiles:
@@ -365,6 +535,19 @@ def main():
     try:
         feed_id = db_access_module.get_active_feed_id(conn)
         log("precompute_graphs", f"feed_id={feed_id}")
+        force_signatures = bool(args.force_signatures)
+        with conn.cursor() as cur:
+            if args.date and str(args.date).strip().isdigit() and len(str(args.date).strip()) == 8:
+                reference_date_ymd = str(args.date).strip()
+            elif args.date:
+                log(
+                    "precompute_graphs",
+                    f"Ignoring invalid --date {args.date!r}; using feed-derived reference date.",
+                )
+                reference_date_ymd = pick_default_pattern_build_date(cur, feed_id)
+            else:
+                reference_date_ymd = pick_default_pattern_build_date(cur, feed_id)
+        log("precompute_graphs", f"reference date_ymd (metadata for graph cache)={reference_date_ymd}")
 
         pairs = _iter_route_directions(conn)
         total = len(pairs)
@@ -380,10 +563,58 @@ def main():
         )
         log("precompute_graphs", f"Loaded {len(cache)} cached graphs (GTFS).")
 
-        # 3) Signatures for all route/direction in one go (3 queries)
-        log("precompute_graphs", "Computing route signatures in bulk ...")
-        sigs = db_access_module.compute_route_signatures_bulk(feed_id, conn)
-        log("precompute_graphs", f"Computed {len(sigs)} signatures.")
+        # 3) Route signatures: either load from route_signatures (fast) or full bulk scan.
+        sig_t0 = time.monotonic()
+        zip_ck, pat_ck = db_access_module.get_feed_checksums(feed_id, conn)
+        can_trust_db_sigs = (
+            not force_signatures
+            and zip_ck is not None
+            and pat_ck is not None
+            and zip_ck == pat_ck
+        )
+        sigs: Dict[Tuple[str, Optional[str]], str] = {}
+        if can_trust_db_sigs:
+            db_sigs = db_access_module.get_route_signatures_bulk(feed_id, conn)
+            missing_cov = [
+                (r, d)
+                for (r, d) in pairs
+                if (r, d) in patterns and (r, d) not in db_sigs
+            ]
+            if not missing_cov:
+                sigs = db_sigs
+                log(
+                    "precompute_graphs",
+                    (
+                        "Using route_signatures from DB (feed checksum matches "
+                        "patterns_built_checksum); skipping bulk trip/stop_times/shapes scan."
+                    ),
+                )
+                log(
+                    "precompute_graphs",
+                    f"Loaded {len(sigs)} signatures from DB. "
+                    f"Signature phase elapsed={time.monotonic() - sig_t0:.2f}s",
+                )
+            else:
+                log(
+                    "precompute_graphs",
+                    (
+                        f"route_signatures missing {len(missing_cov)} (route,direction) rows "
+                        "for routes that have patterns; falling back to bulk signature scan."
+                    ),
+                )
+
+        if not sigs:
+            log("precompute_graphs", "Computing route signatures in bulk ...")
+            sigs = db_access_module.compute_route_signatures_bulk(
+                feed_id,
+                conn,
+                progress_every=max(0, int(args.signature_progress_every)),
+            )
+            log("precompute_graphs", f"Computed {len(sigs)} signatures.")
+            log(
+                "precompute_graphs",
+                f"Signature phase elapsed={time.monotonic() - sig_t0:.2f}s",
+            )
 
         # Pairs that need building: have pattern, (not in cache or sig mismatch)
         to_build: List[Tuple[str, Optional[str]]] = []
@@ -414,13 +645,119 @@ def main():
             for (r, d) in to_build
             if patterns[(r, d)].repr_shape_id
         ]
-        shape_ids = list(dict.fromkeys(shape_ids))
+        shape_ids = list(dict.fromkeys(str(s) for s in shape_ids if s))
         trip_ids = [patterns[(r, d)].repr_trip_id for (r, d) in to_build]
 
         log("precompute_graphs", "Bulk loading pattern_stops, shapes, stop_times ...")
-        stops_by_pid = db_access_module.get_pattern_stops_bulk(feed_id, pattern_ids, conn)
-        shapes_by_sid = db_access_module.get_shape_lines_bulk(feed_id, shape_ids, conn)
-        stop_times_by_trip = db_access_module.get_stop_times_bulk(feed_id, trip_ids, conn)
+        chunk_sz = max(0, int(args.bulk_chunk_size))
+        pattern_ids_uniq = list(dict.fromkeys(str(p) for p in pattern_ids))
+        trip_ids_uniq = list(dict.fromkeys(str(t) for t in trip_ids if t))
+        n_pat_ids = len(pattern_ids)
+        n_pat_unique = len(pattern_ids_uniq)
+        n_shape_ids = len(shape_ids)
+        n_trip_ids = len(trip_ids)
+        n_trip_unique = len(trip_ids_uniq)
+        log(
+            "precompute_graphs",
+            (
+                f"bulk_load: request pattern_ids={n_pat_ids} (unique={n_pat_unique}), "
+                f"shape_ids={n_shape_ids}, trip_ids={n_trip_ids} (unique={n_trip_unique}), "
+                f"chunk_size={chunk_sz or 'all'}"
+            ),
+        )
+        bulk_t0 = time.monotonic()
+
+        pat_batches = _chunk_batches(pattern_ids_uniq, chunk_sz)
+        n_pb = len(pat_batches)
+        stops_by_pid: Dict[str, Any] = {}
+        log(
+            "precompute_graphs",
+            f"bulk_load: pattern_stops {n_pb} batch(es) (feed_id={feed_id})",
+        )
+        for bi, batch in enumerate(pat_batches, start=1):
+            t0 = time.monotonic()
+            log(
+                "precompute_graphs",
+                f"bulk_load: pattern_stops batch {bi}/{n_pb} (patterns_in_batch={len(batch)}) ...",
+            )
+            part = db_access_module.get_pattern_stops_bulk(feed_id, batch, conn)
+            stops_by_pid.update(part)
+            br = sum(len(v) for v in part.values())
+            log(
+                "precompute_graphs",
+                (
+                    f"bulk_load: pattern_stops batch {bi}/{n_pb} done "
+                    f"stop_rows_in_batch={br} elapsed={time.monotonic() - t0:.2f}s"
+                ),
+            )
+        n_pat_loaded = len(stops_by_pid)
+        n_pat_stop_rows = sum(len(v) for v in stops_by_pid.values())
+        log(
+            "precompute_graphs",
+            (
+                f"bulk_load: pattern_stops all batches done patterns={n_pat_loaded} "
+                f"stop_rows={n_pat_stop_rows}"
+            ),
+        )
+
+        shape_batches = _chunk_batches(shape_ids, chunk_sz)
+        n_sb = len(shape_batches)
+        shapes_by_sid: Dict[str, Any] = {}
+        log("precompute_graphs", f"bulk_load: shapes_lines {n_sb} batch(es)")
+        for bi, batch in enumerate(shape_batches, start=1):
+            t0 = time.monotonic()
+            log(
+                "precompute_graphs",
+                f"bulk_load: shapes_lines batch {bi}/{n_sb} (shapes_in_batch={len(batch)}) ...",
+            )
+            part = db_access_module.get_shape_lines_bulk(feed_id, batch, conn)
+            shapes_by_sid.update(part)
+            log(
+                "precompute_graphs",
+                (
+                    f"bulk_load: shapes_lines batch {bi}/{n_sb} done "
+                    f"elapsed={time.monotonic() - t0:.2f}s"
+                ),
+            )
+        n_shapes_loaded = len(shapes_by_sid)
+        log(
+            "precompute_graphs",
+            f"bulk_load: shapes_lines all batches done shapes={n_shapes_loaded}",
+        )
+
+        st_batches = _chunk_batches(trip_ids_uniq, chunk_sz)
+        n_tb = len(st_batches)
+        stop_times_by_trip: Dict[str, Any] = {}
+        log("precompute_graphs", f"bulk_load: stop_times {n_tb} batch(es)")
+        for bi, batch in enumerate(st_batches, start=1):
+            t0 = time.monotonic()
+            log(
+                "precompute_graphs",
+                f"bulk_load: stop_times batch {bi}/{n_tb} (trips_in_batch={len(batch)}) ...",
+            )
+            part = db_access_module.get_stop_times_bulk(feed_id, batch, conn)
+            stop_times_by_trip.update(part)
+            br = sum(len(v) for v in part.values())
+            log(
+                "precompute_graphs",
+                (
+                    f"bulk_load: stop_times batch {bi}/{n_tb} done "
+                    f"rows_in_batch={br} elapsed={time.monotonic() - t0:.2f}s"
+                ),
+            )
+        n_trips_loaded = len(stop_times_by_trip)
+        n_st_rows = sum(len(v) for v in stop_times_by_trip.values())
+        log(
+            "precompute_graphs",
+            (
+                f"bulk_load: stop_times all batches done trips={n_trips_loaded} "
+                f"stop_time_rows={n_st_rows}"
+            ),
+        )
+        log(
+            "precompute_graphs",
+            f"bulk_load: done total_elapsed={time.monotonic() - bulk_t0:.2f}s",
+        )
 
         # 5) Build graphs (sequential or parallel)
         workers = max(1, int(args.workers))
@@ -450,11 +787,12 @@ def main():
                         feed_id=feed_id,
                         route_id=r,
                         direction_id=d,
-                        date_ymd=None,
                         pretty_osm=False,
                         route_sig_hash=sig_hash,
                         graph_blob=pickle.dumps(cache_entry),
+                        date_ymd=reference_date_ymd,
                         conn=conn,
+                        commit=False,
                     )
                     for profile_key in profiles:
                         db_access_module.save_route_preview_pg(
@@ -475,6 +813,7 @@ def main():
                                 }
                             ),
                             conn=conn,
+                            commit=False,
                         )
                     # 2) Try to precompute OSRM-snapped graph.
                     try:
@@ -509,11 +848,12 @@ def main():
                                 feed_id=feed_id,
                                 route_id=r,
                                 direction_id=d,
-                                date_ymd=None,
                                 pretty_osm=True,
                                 route_sig_hash=sig_hash,
                                 graph_blob=pickle.dumps(pretty_entry),
+                                date_ymd=reference_date_ymd,
                                 conn=conn,
+                                commit=False,
                             )
                             for profile_key in profiles:
                                 db_access_module.save_route_preview_pg(
@@ -534,11 +874,18 @@ def main():
                                         }
                                     ),
                                     conn=conn,
+                                    commit=False,
                                 )
                     except Exception:
                         pass
+                    conn.commit()
                 except Exception:
-                    pass
+                    # Keep the main connection usable after any failed statement.
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                    continue
                 built += 1
                 progress_every = max(1, int(args.progress_every))
                 if built % progress_every == 0 or i == total_build:
@@ -560,22 +907,45 @@ def main():
                 to_build[i : i + chunk_size]
                 for i in range(0, len(to_build), chunk_size)
             ]
+            pe = max(1, int(args.progress_every))
+            log(
+                "precompute_graphs",
+                (
+                    f"Parallel graph build: {workers} workers, {total_build} routes, "
+                    f"{len(chunks)} chunk(s) (~{chunk_size} routes/chunk). "
+                    f"Each worker logs every {pe} routes and heartbeats every "
+                    f"{max(0, int(args.worker_heartbeat_seconds))}s; this can take a long time."
+                ),
+            )
             with ProcessPoolExecutor(max_workers=workers) as ex:
-                futures = [
-                    ex.submit(
-                        _build_chunk,
+                futures = []
+                for ci, ch in enumerate(chunks, start=1):
+                    psub, ssub, shsub, stsub = _subset_bulk_for_chunk(
                         ch,
                         patterns,
                         stops_by_pid,
                         shapes_by_sid,
                         stop_times_by_trip,
-                        feed_id,
-                        sigs,
-                        args.database_url or DB_URL,
-                        profiles,
                     )
-                    for ch in chunks
-                ]
+                    label = f"{ci}/{len(chunks)}"
+                    futures.append(
+                        ex.submit(
+                            _build_chunk,
+                            ch,
+                            psub,
+                            ssub,
+                            shsub,
+                            stsub,
+                            feed_id,
+                            sigs,
+                            args.database_url or DB_URL,
+                            profiles,
+                            reference_date_ymd,
+                            label,
+                            pe,
+                            max(0, int(args.worker_heartbeat_seconds)),
+                        )
+                    )
                 completed = 0
                 for fut in as_completed(futures):
                     built += fut.result()

@@ -52,7 +52,7 @@ def _save_metadata(meta: Dict[str, Any]) -> None:
         json.dump(meta, f, ensure_ascii=False, indent=2)
 
 
-def _import_feed(path: Path, version_id: str, date: str, sha256: str) -> FeedVersion:
+def _import_feed(path: Path, version_id: str, sha256: str) -> FeedVersion:
     """
     Import the downloaded GTFS zip into PostgreSQL/PostGIS and return a FeedVersion
     record describing the new active feed.
@@ -60,13 +60,13 @@ def _import_feed(path: Path, version_id: str, date: str, sha256: str) -> FeedVer
     # 1) Ingest GTFS into PostGIS (creates feed_versions row and marks it active).
     ingest_gtfs(path, DB_URL, source_url=str(path))
 
-    # 2) Build patterns/pattern_stops for this active feed and date.
-    build_patterns(DB_URL, date)
+    # 2) Build patterns/pattern_stops (reference date chosen from feed calendar if not fixed).
+    ref_date = build_patterns(DB_URL, None, force=False)
 
     now = datetime.utcnow().isoformat() + "Z"
     return FeedVersion(
         version_id=version_id,
-        date=date,
+        date=ref_date,
         sha256=sha256,
         path=path,
         imported_ok=True,
@@ -135,7 +135,7 @@ def update_feed() -> Dict[str, Any]:
 
     # Import and only then switch active (blue/green)
     log("feed/update", "Importing GTFS into PostGIS and building patterns ...")
-    feed_version = _import_feed(zip_path, version_id, today, sha256)
+    feed_version = _import_feed(zip_path, version_id, sha256)
     record = {
         "version_id": feed_version.version_id,
         "date": feed_version.date,

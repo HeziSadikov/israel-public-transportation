@@ -20,6 +20,7 @@ RouteDirKey = Tuple[str, Optional[str]]
 import os
 import hashlib
 import json
+import time
 
 import psycopg2
 from psycopg2.extras import DictCursor
@@ -526,15 +527,17 @@ def get_patterns_for_feed(feed_id: int, conn=None) -> Dict[RouteDirKey, PatternM
             out: Dict[RouteDirKey, PatternMeta] = {}
             for row in cur.fetchall():
                 key: RouteDirKey = (
-                    row["route_id"],
+                    str(row["route_id"]),
                     None if row["direction_id"] is None else str(row["direction_id"]),
                 )
                 out[key] = PatternMeta(
-                    pattern_id=row["pattern_id"],
-                    route_id=row["route_id"],
+                    pattern_id=str(row["pattern_id"]) if row["pattern_id"] is not None else "",
+                    route_id=str(row["route_id"]),
                     direction_id=row["direction_id"],
-                    repr_trip_id=row["repr_trip_id"],
-                    repr_shape_id=row["repr_shape_id"],
+                    repr_trip_id=str(row["repr_trip_id"]) if row["repr_trip_id"] is not None else "",
+                    repr_shape_id=(
+                        str(row["repr_shape_id"]) if row["repr_shape_id"] is not None else None
+                    ),
                     stop_ids=list(row["stop_ids"] or []),
                     frequency=int(row["frequency"] or 0),
                     used_shape=bool(row["used_shape"]),
@@ -612,7 +615,7 @@ def get_pattern_stops_bulk(
             )
             out: Dict[str, List[StopMeta]] = {}
             for row in cur.fetchall():
-                pid = row["pattern_id"]
+                pid = str(row["pattern_id"]) if row["pattern_id"] is not None else ""
                 out.setdefault(pid, []).append(
                     StopMeta(
                         stop_id=row["stop_id"],
@@ -811,7 +814,7 @@ def get_shape_lines_bulk(
             )
             out: Dict[str, Any] = {}
             for row in cur.fetchall():
-                sid = row["shape_id"]
+                sid = str(row["shape_id"]) if row["shape_id"] is not None else ""
                 if row.get("wkt"):
                     try:
                         out[sid] = wkt.loads(str(row["wkt"]))
@@ -886,7 +889,7 @@ def get_stop_times_bulk(
             )
             out: Dict[str, List[Dict[str, Any]]] = {}
             for row in cur.fetchall():
-                tid = row["trip_id"]
+                tid = str(row["trip_id"]) if row["trip_id"] is not None else ""
                 out.setdefault(tid, []).append({
                     "stop_id": row["stop_id"],
                     "stop_sequence": row["stop_sequence"],
@@ -922,7 +925,7 @@ def get_all_stop_times_for_feed(
             )
             out: Dict[str, List[Dict[str, Any]]] = {}
             for row in cur.fetchall():
-                tid = row["trip_id"]
+                tid = str(row["trip_id"]) if row["trip_id"] is not None else ""
                 out.setdefault(tid, []).append({
                     "stop_id": row["stop_id"],
                     "stop_sequence": row["stop_sequence"],
@@ -1330,27 +1333,39 @@ def compute_route_signature(
             conn.close()
 
 
-def compute_route_signatures_bulk(feed_id: int, conn=None) -> Dict[RouteDirKey, str]:
+def compute_route_signatures_bulk(
+    feed_id: int,
+    conn=None,
+    progress_every: int = 0,
+) -> Dict[RouteDirKey, str]:
     """
     Compute signature for every (route_id, direction_id) in the feed in 3 queries.
     Returns (route_id, direction_id) -> sig_hash. Memory-heavy for large feeds.
     """
+    from backend.logging_utils import log
+
     close = False
     if conn is None:
         conn = _get_conn()
         close = True
     try:
+        t0 = time.monotonic()
+        log("precompute_graphs", f"signatures: trips query start (feed_id={feed_id})")
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT trip_id, service_id, shape_id, route_id, direction_id FROM trips WHERE feed_id = %s",
                 (feed_id,),
             )
             trips_rows = cur.fetchall()
+        log(
+            "precompute_graphs",
+            f"signatures: trips query done rows={len(trips_rows)} elapsed={time.monotonic() - t0:.2f}s",
+        )
         # Group trips by (route_id, direction_id)
         by_key: Dict[RouteDirKey, List[Dict]] = {}
         for r in trips_rows:
             key: RouteDirKey = (
-                r["route_id"],
+                str(r["route_id"]),
                 None if r["direction_id"] is None else str(r["direction_id"]),
             )
             by_key.setdefault(key, []).append({
@@ -1362,6 +1377,8 @@ def compute_route_signatures_bulk(feed_id: int, conn=None) -> Dict[RouteDirKey, 
             lst.sort(key=lambda x: x["trip_id"])
 
         trip_ids = [r["trip_id"] for r in trips_rows]
+        t1 = time.monotonic()
+        log("precompute_graphs", f"signatures: stop_times query start trips={len(trip_ids)}")
         with conn.cursor() as cur:
             cur.execute(
                 """
@@ -1373,13 +1390,20 @@ def compute_route_signatures_bulk(feed_id: int, conn=None) -> Dict[RouteDirKey, 
                 (feed_id, trip_ids),
             )
             stop_times_rows = cur.fetchall()
+        log(
+            "precompute_graphs",
+            f"signatures: stop_times query done rows={len(stop_times_rows)} elapsed={time.monotonic() - t1:.2f}s",
+        )
         stop_times_by_trip: Dict[str, List[Dict]] = {}
         for row in stop_times_rows:
-            stop_times_by_trip.setdefault(row["trip_id"], []).append(dict(row))
+            tid = str(row["trip_id"]) if row["trip_id"] is not None else ""
+            stop_times_by_trip.setdefault(tid, []).append(dict(row))
 
         shape_ids = sorted({r["shape_id"] for r in trips_rows if r.get("shape_id")})
         shapes_rows: List[Dict] = []
         if shape_ids:
+            t2 = time.monotonic()
+            log("precompute_graphs", f"signatures: shapes query start shape_ids={len(shape_ids)}")
             with conn.cursor() as cur:
                 cur.execute(
                     """
@@ -1391,23 +1415,45 @@ def compute_route_signatures_bulk(feed_id: int, conn=None) -> Dict[RouteDirKey, 
                     (feed_id, shape_ids),
                 )
                 shapes_rows = [dict(r) for r in cur.fetchall()]
+            log(
+                "precompute_graphs",
+                f"signatures: shapes query done rows={len(shapes_rows)} elapsed={time.monotonic() - t2:.2f}s",
+            )
         shapes_by_id: Dict[str, List[Dict]] = {}
         for s in shapes_rows:
-            shapes_by_id.setdefault(s["shape_id"], []).append(s)
+            sid = str(s["shape_id"]) if s["shape_id"] is not None else ""
+            shapes_by_id.setdefault(sid, []).append(s)
 
         out: Dict[RouteDirKey, str] = {}
-        for key, trips in by_key.items():
+        total_keys = len(by_key)
+        if total_keys:
+            log("precompute_graphs", f"signatures: hashing {total_keys} route-direction keys")
+        hash_t0 = time.monotonic()
+        for i, (key, trips) in enumerate(by_key.items(), start=1):
             trip_ids_k = [t["trip_id"] for t in trips]
             stop_times = []
             for tid in trip_ids_k:
-                stop_times.extend(stop_times_by_trip.get(tid, []))
+                stop_times.extend(
+                    stop_times_by_trip.get(str(tid) if tid is not None else "", [])
+                )
             shape_ids_k = sorted({t["shape_id"] for t in trips if t.get("shape_id")})
             shapes = []
             for sid in shape_ids_k:
-                shapes.extend(shapes_by_id.get(sid, []))
+                shapes.extend(
+                    shapes_by_id.get(str(sid) if sid is not None else "", [])
+                )
             payload = {"trips": trips, "stop_times": stop_times, "shapes": shapes}
             raw = json.dumps(payload, sort_keys=True).encode("utf-8")
             out[key] = hashlib.sha256(raw).hexdigest()
+            if progress_every > 0 and (i % progress_every == 0 or i == total_keys):
+                log(
+                    "precompute_graphs",
+                    f"signatures: hashed {i}/{total_keys} elapsed={time.monotonic() - hash_t0:.2f}s",
+                )
+        log(
+            "precompute_graphs",
+            f"signatures: done total={len(out)} elapsed={time.monotonic() - t0:.2f}s",
+        )
         return out
     finally:
         if close:
@@ -1466,6 +1512,63 @@ def upsert_route_signature(
                 (feed_id, route_id, int(direction_id) if direction_id is not None else None, sig_hash),
             )
             conn.commit()
+    finally:
+        if close:
+            conn.close()
+
+
+def get_feed_checksums(feed_id: int, conn=None) -> Tuple[Optional[str], Optional[str]]:
+    """Return (checksum, patterns_built_checksum) for feed_versions.id = feed_id."""
+    close = False
+    if conn is None:
+        conn = _get_conn()
+        close = True
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT checksum, patterns_built_checksum
+                FROM feed_versions
+                WHERE id = %s
+                """,
+                (feed_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None, None
+            return row.get("checksum"), row.get("patterns_built_checksum")
+    finally:
+        if close:
+            conn.close()
+
+
+def get_route_signatures_bulk(
+    feed_id: int,
+    conn=None,
+) -> Dict[RouteDirKey, str]:
+    """Load route_signatures.sig_hash for every row in the feed (one query)."""
+    close = False
+    if conn is None:
+        conn = _get_conn()
+        close = True
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT route_id, direction_id, sig_hash
+                FROM route_signatures
+                WHERE feed_id = %s
+                """,
+                (feed_id,),
+            )
+            out: Dict[RouteDirKey, str] = {}
+            for row in cur.fetchall():
+                key: RouteDirKey = (
+                    str(row["route_id"]),
+                    None if row["direction_id"] is None else str(row["direction_id"]),
+                )
+                out[key] = row["sig_hash"]
+            return out
     finally:
         if close:
             conn.close()
@@ -1544,7 +1647,7 @@ def get_cached_graphs_bulk(
             out: Dict[RouteDirKey, Tuple[str, bytes]] = {}
             for row in cur.fetchall():
                 key: RouteDirKey = (
-                    row["route_id"],
+                    str(row["route_id"]),
                     None if row["direction_id"] is None else str(row["direction_id"]),
                 )
                 out[key] = (row["route_sig_hash"], bytes(row["graph_blob"]))
@@ -1563,12 +1666,17 @@ def save_route_graph_pg(
     graph_blob: bytes,
     date_ymd: Optional[str] = None,
     conn=None,
+    *,
+    commit: bool = True,
 ) -> None:
     """
     Save or update a cached pickled graph entry in PostGIS route_graph_cache.
 
     The logical key is (feed_id, route_id, direction_id, pretty_osm); date_ymd is
     stored as metadata only when provided.
+
+    If ``commit`` is False, the INSERT runs in the current transaction; the caller
+    must ``commit`` (or rely on autocommit). Own connections always commit before close.
     """
     close = False
     if conn is None:
@@ -1605,6 +1713,7 @@ def save_route_graph_pg(
                     psycopg2.Binary(graph_blob),
                 ),
             )
+        if close or commit:
             conn.commit()
     finally:
         if close:
@@ -1714,9 +1823,13 @@ def save_route_preview_pg(
     pattern_id: str,
     preview_blob: bytes,
     conn=None,
+    *,
+    commit: bool = True,
 ) -> None:
     """
     Save/update cached preview payload keyed by route+profile.
+
+    If ``commit`` is False, the caller must commit. Own connections always commit before close.
     """
     close = False
     if conn is None:
@@ -1755,6 +1868,7 @@ def save_route_preview_pg(
                     psycopg2.Binary(preview_blob),
                 ),
             )
+        if close or commit:
             conn.commit()
     finally:
         if close:

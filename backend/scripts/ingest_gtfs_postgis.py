@@ -3,11 +3,16 @@ GTFS -> Postgres/PostGIS ingest script for Israel GTFS Detour Router.
 
 Usage (example):
 
+    # Defaults: zip at repo root `israel-public-transportation.zip`, DB from DATABASE_URL
+    # (or db_access fallback), source-url = MOT GTFS file URL (overridable via env).
+    python -m backend.scripts.ingest_gtfs_postgis
+
     python -m backend.scripts.ingest_gtfs_postgis \\
         --gtfs-zip ./israel-public-transportation.zip \\
         --database-url postgresql://user:password@localhost:5432/israel_gtfs
 
 This script:
+  - SHA-256 checksums the zip; skips loading if the active feed already has the same checksum (use --force to override).
   - Creates a new feed_versions row.
   - Loads core GTFS CSVs into Postgres tables (see db_postgis_schema.sql).
   - Builds shapes_lines (LineStrings) and basic derived tables such as
@@ -19,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import io
 import zipfile
 from pathlib import Path
@@ -27,9 +33,23 @@ from typing import Dict, Iterable, Tuple
 import psycopg2
 from psycopg2.extras import execute_values
 
+from backend.config import GTFS_REMOTE_BASE, GTFS_REMOTE_FILENAME, LOCAL_GTFS_ZIP
+from backend.db_access import DB_URL
+
 
 def _connect(database_url: str):
     return psycopg2.connect(database_url)
+
+
+def _sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def _create_feed_version(cur, source_url: str | None, checksum: str | None) -> int:
@@ -66,14 +86,35 @@ def _bulk_insert(cur, table: str, columns: Tuple[str, ...], rows: Iterable[Tuple
     execute_values(cur, sql, rows, page_size=1000)
 
 
-def ingest_gtfs(gtfs_zip: Path, database_url: str, source_url: str | None = None):
+def ingest_gtfs(
+    gtfs_zip: Path,
+    database_url: str,
+    source_url: str | None = None,
+    *,
+    force: bool = False,
+):
+    zip_checksum = _sha256_file(gtfs_zip)
     conn = _connect(database_url)
     conn.autocommit = False
     try:
+        if not force:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, checksum FROM feed_versions WHERE active = TRUE LIMIT 1"
+                )
+                row = cur.fetchone()
+            if row and row[1] and row[1] == zip_checksum:
+                conn.rollback()
+                print(
+                    f"[ingest] Skip: zip unchanged (checksum={zip_checksum}, feed_id={row[0]})",
+                    flush=True,
+                )
+                return
+            conn.rollback()
+
         with conn, conn.cursor() as cur:
             print(f"[ingest] Starting ingest for {gtfs_zip} into {database_url}")
-            checksum = None  # could compute SHA256 of zip if desired
-            feed_id = _create_feed_version(cur, source_url or str(gtfs_zip), checksum)
+            feed_id = _create_feed_version(cur, source_url or str(gtfs_zip), zip_checksum)
             print(f"[ingest] Created feed_versions row feed_id={feed_id}")
 
             with zipfile.ZipFile(gtfs_zip, "r") as zf:
@@ -413,19 +454,50 @@ def ingest_gtfs(gtfs_zip: Path, database_url: str, source_url: str | None = None
         conn.close()
 
 
+def _default_gtfs_source_url() -> str:
+    return f"{GTFS_REMOTE_BASE.rstrip('/')}/{GTFS_REMOTE_FILENAME}"
+
+
 def main():
-    ap = argparse.ArgumentParser(description="Ingest GTFS zip into Postgres/PostGIS.")
-    ap.add_argument("--gtfs-zip", type=str, required=True, help="Path to GTFS zip file")
+    ap = argparse.ArgumentParser(
+        description="Ingest GTFS zip into Postgres/PostGIS.",
+        epilog=(
+            f"Defaults: --gtfs-zip {LOCAL_GTFS_ZIP} ; "
+            "--database-url from DATABASE_URL env (else db_access fallback); "
+            f"--source-url {_default_gtfs_source_url()}"
+        ),
+    )
+    ap.add_argument(
+        "--gtfs-zip",
+        type=str,
+        default=str(LOCAL_GTFS_ZIP),
+        help=f"Path to GTFS zip (default: {LOCAL_GTFS_ZIP})",
+    )
     ap.add_argument(
         "--database-url",
         type=str,
-        required=True,
-        help="PostgreSQL connection URL, e.g. postgresql://user:pass@localhost:5432/dbname",
+        default=None,
+        help="PostgreSQL URL (default: DATABASE_URL env, else same fallback as backend/db_access.py)",
     )
-    ap.add_argument("--source-url", type=str, default=None, help="Optional original GTFS URL for metadata")
+    ap.add_argument(
+        "--source-url",
+        type=str,
+        default=_default_gtfs_source_url(),
+        help="Original GTFS URL for feed_versions metadata (default: MOT israel-public-transportation.zip)",
+    )
+    ap.add_argument(
+        "--force",
+        action="store_true",
+        help="Ingest even if the active feed already has the same zip checksum",
+    )
     args = ap.parse_args()
 
-    ingest_gtfs(Path(args.gtfs_zip), args.database_url, source_url=args.source_url)
+    database_url = args.database_url or DB_URL
+    gtfs_path = Path(args.gtfs_zip)
+    if not gtfs_path.is_file():
+        ap.error(f"GTFS zip not found: {gtfs_path.resolve()}")
+
+    ingest_gtfs(gtfs_path, database_url, source_url=args.source_url, force=args.force)
 
 
 if __name__ == "__main__":

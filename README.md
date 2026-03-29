@@ -110,10 +110,22 @@ docker compose exec postgis psql -U postgres -d israel_gtfs -f /backend/db_postg
 From the project root, with `DATABASE_URL` set (or pass `--database-url`):
 
 ```bash
-# Ingest GTFS zip into PostGIS
-python -m backend.scripts.ingest_gtfs_postgis --gtfs-zip ./israel-public-transportation.zip --database-url "postgresql://user:pass@localhost:5432/israel_gtfs"
+# All-in-one: patterns (auto date) + graph/preview precompute. Add --with-ingest to run GTFS ingest first.
+# Ingest / patterns / graphs each skip their own work when unchanged (--ingest-force / --force-patterns override patterns+ingest).
+python -m scripts.precompute_all_postgis --workers 4
+python -m scripts.precompute_all_postgis --with-ingest --workers 4
+```
 
-# Precompute route patterns (bootstrap date still required by builder)
+```bash
+# Ingest (defaults: repo-root israel-public-transportation.zip, DATABASE_URL, MOT source URL).
+# Skips reload if the active feed's stored SHA-256 matches the zip; use --force to ingest anyway.
+python -m backend.scripts.ingest_gtfs_postgis
+# Override paths / DB if needed:
+python -m backend.scripts.ingest_gtfs_postgis --gtfs-zip ./other.zip --database-url "postgresql://user:pass@localhost:5432/israel_gtfs"
+
+# Precompute route patterns (--date optional; skips if patterns already match active feed zip checksum; --force to rebuild).
+# Adds feed_versions.patterns_built_checksum via ALTER if your DB predates that column.
+python -m backend.scripts.build_patterns_postgis
 python -m backend.scripts.build_patterns_postgis --date 20260308 --database-url "postgresql://user:pass@localhost:5432/israel_gtfs"
 
 # Precompute route graph cache incrementally (signature-gated; skips unchanged routes)

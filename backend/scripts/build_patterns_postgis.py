@@ -10,6 +10,8 @@ This script:
 
 Usage:
 
+  python -m backend.scripts.build_patterns_postgis
+
   python -m backend.scripts.build_patterns_postgis \\
       --database-url postgresql://user:pass@localhost:5432/israel_gtfs \\
       --date 20260308
@@ -43,6 +45,19 @@ from backend.db_access import (
 
 def _connect(database_url: Optional[str]):
   return psycopg2.connect(database_url or DEFAULT_DB_URL, cursor_factory=DictCursor)
+
+
+def _ensure_patterns_built_checksum_column(conn) -> None:
+  """Idempotent DDL for databases created before patterns_built_checksum was added."""
+  prev = conn.autocommit
+  conn.autocommit = True
+  try:
+    with conn.cursor() as cur:
+      cur.execute(
+        "ALTER TABLE feed_versions ADD COLUMN IF NOT EXISTS patterns_built_checksum TEXT"
+      )
+  finally:
+    conn.autocommit = prev
 
 
 def _load_feed_from_postgis(cur, feed_id: int) -> GTFSFeed:
@@ -614,14 +629,118 @@ def _insert_pattern(cur, feed_id: int, pat: RoutePattern) -> None:
     )
 
 
-def build_patterns(database_url: Optional[str], date_ymd: str) -> None:
+def pick_default_pattern_build_date(cur, feed_id: int) -> str:
+  """
+  Choose a YYYYMMDD inside the feed's published service window so scripts need no --date.
+  Prefer UTC today when it falls in [min(start_date), max(end_date)] from calendar;
+  otherwise clamp to the nearest bound. Falls back to calendar_dates bounds, then today.
+  """
+  from datetime import datetime, timezone
+
+  today_s = datetime.now(timezone.utc).strftime("%Y%m%d")
+  today_i = int(today_s)
+
+  cur.execute(
+    """
+    SELECT MIN(start_date)::bigint AS mn, MAX(end_date)::bigint AS mx
+    FROM calendar
+    WHERE feed_id = %s
+    """,
+    (feed_id,),
+  )
+  row = cur.fetchone()
+  mn = int(row["mn"]) if row and row["mn"] is not None else None
+  mx = int(row["mx"]) if row and row["mx"] is not None else None
+
+  if mn is not None and mx is not None:
+    if mn <= today_i <= mx:
+      return today_s
+    if today_i < mn:
+      return f"{mn:08d}"
+    return f"{mx:08d}"
+
+  cur.execute(
+    """
+    SELECT MIN(date)::bigint AS mn, MAX(date)::bigint AS mx
+    FROM calendar_dates
+    WHERE feed_id = %s
+    """,
+    (feed_id,),
+  )
+  row2 = cur.fetchone()
+  mn2 = int(row2["mn"]) if row2 and row2["mn"] is not None else None
+  mx2 = int(row2["mx"]) if row2 and row2["mx"] is not None else None
+
+  if mn2 is not None and mx2 is not None:
+    if mn2 <= today_i <= mx2:
+      return today_s
+    if today_i < mn2:
+      return f"{mn2:08d}"
+    return f"{mx2:08d}"
+
+  return today_s
+
+
+def build_patterns(
+  database_url: Optional[str],
+  date_ymd: Optional[str] = None,
+  *,
+  force: bool = False,
+) -> str:
+  """
+  Populate patterns / pattern_stops (and ride network) for the active feed.
+  If date_ymd is None, picks a reference date from calendar coverage (see pick_default_pattern_build_date).
+  Skips work when feed_versions.checksum matches patterns_built_checksum (same zip as last pattern build),
+  unless force=True.
+  Returns the YYYYMMDD reference date (for logging / metadata).
+  """
   conn = _connect(database_url)
   conn.autocommit = False
   try:
-    log("patterns", f"Starting pattern build for date {date_ymd} using {database_url or 'DEFAULT_DB_URL'}")
+    _ensure_patterns_built_checksum_column(conn)
+    feed_id = get_active_feed_id(conn)
+
+    if not force:
+      with conn.cursor() as cur:
+        cur.execute(
+          """
+          SELECT checksum, patterns_built_checksum
+          FROM feed_versions
+          WHERE id = %s
+          """,
+          (feed_id,),
+        )
+        fv = cur.fetchone()
+      zip_ck = fv["checksum"] if fv else None
+      pat_ck = fv["patterns_built_checksum"] if fv else None
+      if zip_ck and pat_ck and zip_ck == pat_ck:
+        with conn.cursor() as cur:
+          ref_date = (
+            date_ymd
+            if date_ymd is not None
+            else pick_default_pattern_build_date(cur, feed_id)
+          )
+        conn.rollback()
+        log(
+          "patterns",
+          f"Skip: patterns already built for this feed zip (feed_id={feed_id})",
+        )
+        return ref_date
+
+    conn.rollback()
+
     with conn:
-      # Use db_access logic to resolve active feed_id inside Postgres.
-      feed_id = get_active_feed_id(conn)
+      with conn.cursor() as cur:
+        if date_ymd is None:
+          date_ymd = pick_default_pattern_build_date(cur, feed_id)
+          log(
+            "patterns",
+            f"No --date given; using feed-derived reference date {date_ymd}",
+          )
+      log(
+        "patterns",
+        f"Starting pattern build for date {date_ymd} using {database_url or 'DEFAULT_DB_URL'}",
+      )
       # Find the most recent previous feed (if any) to reuse patterns from.
       with conn.cursor() as cur:
         cur.execute(
@@ -639,8 +758,16 @@ def build_patterns(database_url: Optional[str], date_ymd: str) -> None:
       log("patterns", f"Active PostGIS feed_id={feed_id}, old_feed_id={old_feed_id}")
       with conn.cursor() as cur:
         _upsert_patterns_for_feed(cur, feed_id, old_feed_id, date_ymd)
-    conn.commit()
+        cur.execute(
+          """
+          UPDATE feed_versions
+          SET patterns_built_checksum = checksum
+          WHERE id = %s
+          """,
+          (feed_id,),
+        )
     log("patterns", "Patterns and pattern_stops populated successfully.")
+    return date_ymd
   finally:
     conn.close()
 
@@ -656,12 +783,20 @@ def main() -> None:
   ap.add_argument(
     "--date",
     type=str,
-    required=True,
-    help="Service date (YYYYMMDD) used when selecting active trips for patterns.",
+    default=None,
+    help=(
+      "Optional service date YYYYMMDD. If omitted, a date inside the feed calendar "
+      "window is chosen automatically (UTC today when in range, else clamped)."
+    ),
+  )
+  ap.add_argument(
+    "--force",
+    action="store_true",
+    help="Rebuild patterns even when they already match the active feed zip checksum.",
   )
   args = ap.parse_args()
 
-  build_patterns(args.database_url, args.date)
+  build_patterns(args.database_url, args.date, force=args.force)
 
 
 if __name__ == "__main__":

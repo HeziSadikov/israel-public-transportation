@@ -183,60 +183,89 @@ def _build_preview_payload_from_cache_entry(cache: Dict) -> Dict[str, object]:
 
     stop_features = []
     stops_list = []
-    if graph is not None:
-        by_stop: Dict[str, Dict] = {}
-        for _nid, node_data in graph.nodes(data=True):
-            sid = node_data.get("stop_id")
-            if sid is None:
-                continue
-            key = str(sid)
-            # Keep first seen node per stop_id (stable enough for preview).
-            if key not in by_stop:
-                by_stop[key] = node_data
-        for idx, sid in enumerate(pattern.stop_ids):
-            d = by_stop.get(str(sid))
+    try:
+        feed = load_active_feed()
+        stops_by_id = {s["stop_id"]: s for s in feed.stops}
+    except Exception:
+        stops_by_id = {}
+    by_stop: Dict[str, Dict] | None = None
+
+    def _graph_stop_map() -> Dict[str, Dict]:
+        nonlocal by_stop
+        if by_stop is None:
+            by_stop = {}
+            if graph is not None:
+                for _nid, node_data in graph.nodes(data=True):
+                    sid = node_data.get("stop_id")
+                    if sid is None:
+                        continue
+                    key = str(sid)
+                    if key not in by_stop:
+                        by_stop[key] = node_data
+        return by_stop
+
+    for idx, sid in enumerate(pattern.stop_ids):
+        st = stops_by_id.get(sid)
+        if st:
+            lat, lon = float(st["stop_lat"]), float(st["stop_lon"])
+            name = st.get("stop_name")
+        else:
+            d = _graph_stop_map().get(str(sid))
             if not d:
                 continue
             lat, lon = d.get("lat"), d.get("lon")
             if lat is None or lon is None:
                 continue
-            stop_name = d.get("stop_name")
-            pt = Point(float(lon), float(lat))
-            stop_features.append(
-                {
-                    "type": "Feature",
-                    "geometry": mapping(pt),
-                    "properties": {"stop_id": sid, "name": stop_name},
-                }
-            )
-            stops_list.append(
-                {
-                    "stop_id": str(sid),
-                    "name": stop_name,
-                    "lat": float(lat),
-                    "lon": float(lon),
-                    "sequence": idx,
-                }
-            )
-
-    edge_features = []
-    for (_u, _v), eg in edge_geometries.items():
-        edge_features.append(
+            name = d.get("stop_name")
+        pt = Point(float(lon), float(lat))
+        stop_features.append(
             {
                 "type": "Feature",
-                "geometry": mapping(eg.linestring),
-                "properties": {"from_stop_id": eg.from_stop_id, "to_stop_id": eg.to_stop_id},
+                "geometry": mapping(pt),
+                "properties": {"stop_id": sid, "name": name},
             }
         )
-    features = stop_features + edge_features
+        stops_list.append(
+            {
+                "stop_id": str(sid),
+                "name": name,
+                "lat": float(lat),
+                "lon": float(lon),
+                "sequence": idx,
+            }
+        )
+
+    # One line feature instead of per-edge mapping() — avoids multi-minute Shapely on long routes.
+    line_features: List[Dict] = []
     if snapped_pattern_geom is not None:
-        features.append(
+        line_features.append(
             {
                 "type": "Feature",
                 "geometry": mapping(snapped_pattern_geom),
                 "properties": {"kind": "pattern_snapped"},
             }
         )
+    else:
+        merged = _merge_edge_geometries(edge_geometries)
+        if merged is not None and not getattr(merged, "is_empty", False):
+            line_features.append(
+                {
+                    "type": "Feature",
+                    "geometry": mapping(merged),
+                    "properties": {"kind": "route_merged"},
+                }
+            )
+        else:
+            for (_u, _v), eg in edge_geometries.items():
+                line_features.append(
+                    {
+                        "type": "Feature",
+                        "geometry": mapping(eg.linestring),
+                        "properties": {"from_stop_id": eg.from_stop_id, "to_stop_id": eg.to_stop_id},
+                    }
+                )
+
+    features = stop_features + line_features
     route_geojson = {"type": "FeatureCollection", "features": features}
     cache["preview_geojson"] = route_geojson
     cache["preview_stops"] = stops_list
