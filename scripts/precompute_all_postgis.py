@@ -96,6 +96,11 @@ def main() -> None:
         default=50,
         help="Progress log interval for graph precompute.",
     )
+    ap.add_argument(
+        "--with-pretty-osm",
+        action="store_true",
+        help="Forward to graph precompute: run OSRM map-match and pretty_osm cache rows (slow).",
+    )
     args = ap.parse_args()
     db = args.database_url
 
@@ -122,6 +127,8 @@ def main() -> None:
             "--progress-every",
             str(args.progress_every),
         ]
+        if args.with_pretty_osm:
+            graph_extra.append("--with-pretty-osm")
         _run_py_module("scripts.precompute_graphs_postgis", graph_extra, db)
 
     print("[precompute-all] Done.", flush=True)

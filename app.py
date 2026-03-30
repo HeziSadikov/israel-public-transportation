@@ -120,20 +120,56 @@ def _warmup_route_previews(
     max_n = int(GRAPH_WARMUP_PREVIEW_MAX_ROUTES or 0)
     total_loaded = 0
     stop_all = False
+    # Avoid a DB round-trip per preview row when signature verification is enabled.
+    # We bulk-load route signatures once, then only compute missing keys on demand.
+    live_sig_by_route_dir: Dict[Tuple[str, Optional[str]], Optional[str]] = {}
+    if GRAPH_WARMUP_PREVIEW_VERIFY_SIG:
+        t0 = time.time()
+        try:
+            sigs = db_access_module.get_route_signatures_bulk(feed_id)
+            live_sig_by_route_dir.update(sigs)
+            log(
+                "graph/cache/warmup",
+                f"phase=preview_sig_bulk_load done rows={len(sigs)} elapsed_s={round(time.time() - t0, 3)}",
+            )
+        except Exception as e:
+            log("graph/cache/warmup", f"phase=preview_sig_bulk_load error={e!s}")
+            GRAPH_WARMUP_STATUS["errors"] = int(GRAPH_WARMUP_STATUS["errors"] or 0) + 1
     for pretty_osm in (False, True):
         if stop_all or time.time() - started > timeout_s:
             break
         for profile_key in profile_keys:
             if stop_all or time.time() - started > timeout_s:
                 break
+            bulk_t0 = time.time()
+            log(
+                "graph/cache/warmup",
+                f"phase=preview_bulk_fetch start profile={profile_key} pretty_osm={pretty_osm}",
+            )
             try:
                 bulk = db_access_module.get_cached_previews_bulk(
                     feed_id, profile_key, pretty_osm
                 )
             except Exception:
                 GRAPH_WARMUP_STATUS["errors"] = int(GRAPH_WARMUP_STATUS["errors"] or 0) + 1
+                log(
+                    "graph/cache/warmup",
+                    f"phase=preview_bulk_fetch error profile={profile_key} pretty_osm={pretty_osm} elapsed_s={round(time.time() - bulk_t0, 3)}",
+                )
                 continue
+            log(
+                "graph/cache/warmup",
+                f"phase=preview_bulk_fetch done profile={profile_key} pretty_osm={pretty_osm} rows={len(bulk)} elapsed_s={round(time.time() - bulk_t0, 3)}",
+            )
+            items_seen = 0
             for (route_id, direction_id), (sig_db, _pat_id, blob) in bulk.items():
+                items_seen += 1
+                if items_seen % 500 == 0:
+                    elapsed_s = round(time.time() - started, 3)
+                    log(
+                        "graph/cache/warmup",
+                        f"phase=preview_hydrate progress profile={profile_key} pretty_osm={pretty_osm} seen={items_seen} loaded_gtfs={loaded_gtfs} loaded_osm={loaded_osm} skipped_stale={skipped_stale} elapsed_s={elapsed_s}",
+                    )
                 if time.time() - started > timeout_s:
                     stop_all = True
                     break
@@ -141,7 +177,12 @@ def _warmup_route_previews(
                     stop_all = True
                     break
                 if GRAPH_WARMUP_PREVIEW_VERIFY_SIG:
-                    live = _resolve_route_sig_hash(feed_id, route_id, direction_id)
+                    key = (str(route_id), None if direction_id is None else str(direction_id))
+                    if key not in live_sig_by_route_dir:
+                        live_sig_by_route_dir[key] = _resolve_route_sig_hash(
+                            feed_id, route_id, direction_id
+                        )
+                    live = live_sig_by_route_dir.get(key)
                     if not live or live != sig_db:
                         skipped_stale += 1
                         continue
@@ -162,6 +203,10 @@ def _warmup_route_previews(
                     loaded_osm += 1
                 else:
                     loaded_gtfs += 1
+            log(
+                "graph/cache/warmup",
+                f"phase=preview_hydrate done profile={profile_key} pretty_osm={pretty_osm} seen={items_seen} loaded_gtfs={loaded_gtfs} loaded_osm={loaded_osm} skipped_stale={skipped_stale}",
+            )
     return loaded_gtfs, loaded_osm, skipped_stale
 
 
@@ -305,15 +350,53 @@ def _run_graph_cache_warmup(
         f"include_previews={include_previews}",
     )
     try:
+        phase_t0 = time.time()
+        log("graph/cache/warmup", "phase=resolve_active_feed start")
         feed_id = db_access_module.get_active_feed_id()
         feed_version = f"postgis-{feed_id}"
+        log(
+            "graph/cache/warmup",
+            f"phase=resolve_active_feed done feed_id={feed_id} elapsed_s={round(time.time() - phase_t0, 3)}",
+        )
+        phase_t0 = time.time()
+        log("graph/cache/warmup", "phase=load_route_direction_pairs start")
         pairs = db_access_module.get_route_direction_pairs(feed_id)
+        log(
+            "graph/cache/warmup",
+            f"phase=load_route_direction_pairs done pairs={len(pairs)} elapsed_s={round(time.time() - phase_t0, 3)}",
+        )
+        phase_t0 = time.time()
+        log("graph/cache/warmup", "phase=load_cached_graphs_bulk start pretty_osm=False")
         cached_gtfs = db_access_module.get_cached_graphs_bulk(feed_id, False)
+        log(
+            "graph/cache/warmup",
+            f"phase=load_cached_graphs_bulk done pretty_osm=False rows={len(cached_gtfs)} elapsed_s={round(time.time() - phase_t0, 3)}",
+        )
+        phase_t0 = time.time()
+        log("graph/cache/warmup", "phase=load_cached_graphs_bulk start pretty_osm=True")
         cached_osm = db_access_module.get_cached_graphs_bulk(feed_id, True)
+        log(
+            "graph/cache/warmup",
+            f"phase=load_cached_graphs_bulk done pretty_osm=True rows={len(cached_osm)} elapsed_s={round(time.time() - phase_t0, 3)}",
+        )
         timeout_s = max(1, int(GRAPH_WARMUP_TIMEOUT_S))
+        log(
+            "graph/cache/warmup",
+            f"phase=hydrate_memory_graph_cache start timeout_s={timeout_s} profiles={len(profile_keys)}",
+        )
+        last_progress_log = 0
         for route_id, direction_id in pairs:
             if time.time() - started > timeout_s:
+                log("graph/cache/warmup", "phase=hydrate_memory_graph_cache timeout_reached")
                 break
+            last_progress_log += 1
+            if last_progress_log >= 250:
+                last_progress_log = 0
+                elapsed_s = round(time.time() - started, 3)
+                log(
+                    "graph/cache/warmup",
+                    f"phase=hydrate_memory_graph_cache progress elapsed_s={elapsed_s} loaded_gtfs={loaded_gtfs} loaded_osm={loaded_osm}",
+                )
             row_gtfs = cached_gtfs.get((route_id, direction_id))
             if row_gtfs:
                 try:
@@ -334,6 +417,10 @@ def _run_graph_cache_warmup(
                     loaded_osm += 1
                 except Exception:
                     GRAPH_WARMUP_STATUS["errors"] = int(GRAPH_WARMUP_STATUS["errors"] or 0) + 1
+        log(
+            "graph/cache/warmup",
+            f"phase=hydrate_memory_graph_cache done loaded_gtfs={loaded_gtfs} loaded_osm={loaded_osm}",
+        )
     except Exception as e:
         log("graph/cache/warmup", f"fatal_error={e!s}")
         GRAPH_WARMUP_STATUS["errors"] = int(GRAPH_WARMUP_STATUS["errors"] or 0) + 1
@@ -342,10 +429,17 @@ def _run_graph_cache_warmup(
     preview_skip = 0
     if include_previews:
         try:
+            phase_t0 = time.time()
+            log("graph/cache/warmup", "phase=preview_warmup_prepare start")
             feed_id_pv = db_access_module.get_active_feed_id()
             feed_version_pv = f"postgis-{feed_id_pv}"
             timeout_s = max(1, int(GRAPH_WARMUP_TIMEOUT_S))
+            log(
+                "graph/cache/warmup",
+                f"phase=preview_warmup_prepare done feed_id={feed_id_pv} elapsed_s={round(time.time() - phase_t0, 3)}",
+            )
             if time.time() - started <= timeout_s:
+                log("graph/cache/warmup", "phase=preview_warmup_load start")
                 preview_gtfs, preview_osm, preview_skip = _warmup_route_previews(
                     feed_id_pv,
                     feed_version_pv,
@@ -353,6 +447,12 @@ def _run_graph_cache_warmup(
                     started,
                     timeout_s,
                 )
+                log(
+                    "graph/cache/warmup",
+                    f"phase=preview_warmup_load done loaded_previews_gtfs={preview_gtfs} loaded_previews_osm={preview_osm} previews_skipped_stale={preview_skip}",
+                )
+            else:
+                log("graph/cache/warmup", "phase=preview_warmup_load skipped timeout_reached_before_start")
         except Exception as e:
             log("graph/cache/warmup", f"preview_warmup_error={e!s}")
             GRAPH_WARMUP_STATUS["errors"] = int(GRAPH_WARMUP_STATUS["errors"] or 0) + 1

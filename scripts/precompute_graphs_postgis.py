@@ -29,6 +29,7 @@ import time
 from typing import Optional, Tuple, List, Dict, Any
 
 import psycopg2
+from psycopg2 import sql as pg_sql
 from psycopg2.extras import DictCursor
 
 from backend.config import GRAPH_CACHE
@@ -110,6 +111,59 @@ def _build_preview_payload(cache_entry: Dict[str, Any]) -> Tuple[Dict[str, Any],
     return {"type": "FeatureCollection", "features": features}, stops_list
 
 
+def _build_preview_payload_from_stops_and_shape(
+    stops: Optional[List],
+    shape_line: Optional[Any],
+    snapped_pattern_geom: Optional[Any] = None,
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    """
+    Build route preview GeoJSON from ordered pattern stops + one route polyline (shape or OSRM snap).
+    Avoids iterating all graph edge geometries (preview-only; graph blobs unchanged).
+    """
+    from shapely.geometry import mapping, Point
+
+    stop_features: List[Dict[str, Any]] = []
+    stops_list: List[Dict[str, Any]] = []
+    if stops:
+        for idx, sm in enumerate(stops):
+            sid = getattr(sm, "stop_id", None)
+            if sid is None:
+                continue
+            lat, lon = getattr(sm, "lat", None), getattr(sm, "lon", None)
+            if lat is None or lon is None:
+                continue
+            name = getattr(sm, "name", None)
+            pt = Point(float(lon), float(lat))
+            stop_features.append(
+                {
+                    "type": "Feature",
+                    "geometry": mapping(pt),
+                    "properties": {"stop_id": sid, "name": name},
+                }
+            )
+            stops_list.append(
+                {
+                    "stop_id": str(sid),
+                    "name": name,
+                    "lat": float(lat),
+                    "lon": float(lon),
+                    "sequence": idx,
+                }
+            )
+
+    features: List[Dict[str, Any]] = list(stop_features)
+    line = snapped_pattern_geom if snapped_pattern_geom is not None else shape_line
+    if line is not None and len(getattr(line, "coords", []) or []) >= 2:
+        features.append(
+            {
+                "type": "Feature",
+                "geometry": mapping(line),
+                "properties": {"kind": "pattern_shape" if snapped_pattern_geom is None else "pattern_snapped"},
+            }
+        )
+    return {"type": "FeatureCollection", "features": features}, stops_list
+
+
 def _render_progress(done: int, total: int, prefix: str = "") -> None:
     """Simple in-place ASCII progress bar for long loops."""
     if total <= 0:
@@ -151,6 +205,8 @@ def _build_one(
     stops: Optional[List],
     shape_line: Optional[Any],
     stop_times: Optional[List],
+    *,
+    fast_preview_geojson: bool = False,
 ) -> Tuple[Any, Dict]:
     """Build graph for one pattern; returns (pattern, cache_entry dict)."""
     result = build_graph_for_pattern_from_postgis(
@@ -171,7 +227,12 @@ def _build_one(
         "preview_geojson": None,
         "preview_stops": None,
     }
-    preview_geojson, preview_stops = _build_preview_payload(cache_entry)
+    if fast_preview_geojson:
+        preview_geojson, preview_stops = _build_preview_payload_from_stops_and_shape(
+            stops, shape_line, None
+        )
+    else:
+        preview_geojson, preview_stops = _build_preview_payload(cache_entry)
     cache_entry["preview_geojson"] = preview_geojson
     cache_entry["preview_stops"] = preview_stops
     return result.pattern, cache_entry
@@ -254,6 +315,27 @@ def _merge_edge_geometries(edge_geometries: Dict[Tuple[str, str], Any]):
         return parts[0]
 
 
+def _commit_route_bundle(
+    conn,
+    *,
+    commit_bs: int,
+    sp_name: str,
+    pending_since_commit: List[int],
+) -> None:
+    """Finish one route in the current transaction: release savepoint if batching, else commit."""
+    if commit_bs <= 1:
+        conn.commit()
+        return
+    with conn.cursor() as cur:
+        cur.execute(
+            pg_sql.SQL("RELEASE SAVEPOINT {}").format(pg_sql.Identifier(sp_name))
+        )
+    pending_since_commit[0] += 1
+    if pending_since_commit[0] >= commit_bs:
+        conn.commit()
+        pending_since_commit[0] = 0
+
+
 def _build_chunk(
     chunk: List[Tuple[str, Optional[str]]],
     patterns_dict: Dict,
@@ -268,11 +350,16 @@ def _build_chunk(
     chunk_label: str,
     progress_every: int,
     heartbeat_every_s: int,
+    fast_preview_geojson: bool,
+    with_pretty_osm: bool,
+    commit_batch_size: int,
 ) -> int:
     """Build and save graphs for a chunk of (route_id, direction_id). Used by parallel workers."""
     conn_w = _connect(database_url)
     n = 0
     total_in_chunk = len(chunk)
+    commit_bs = max(1, int(commit_batch_size))
+    pending_since_commit: List[int] = [0]
     log(
         "precompute_graphs",
         f"build: chunk {chunk_label} worker started ({total_in_chunk} routes in this chunk)",
@@ -303,6 +390,7 @@ def _build_chunk(
         hb_thread.start()
     try:
         for idx, (r, d) in enumerate(chunk, start=1):
+            sp_name = f"sp_{chunk_label.replace('/', '_')}_{idx}"
             state["idx"] = idx
             state["route"] = (r, d)
             meta = patterns_dict.get((r, d))
@@ -318,9 +406,20 @@ def _build_chunk(
             stop_times = stop_times_by_trip.get(meta.repr_trip_id)
             if not stops or len(stops) < 2:
                 continue
-            _, cache_entry = _build_one(meta, stops, shape_line, stop_times or [])
+            _, cache_entry = _build_one(
+                meta,
+                stops,
+                shape_line,
+                stop_times or [],
+                fast_preview_geojson=fast_preview_geojson,
+            )
             sig_hash = sigs_dict.get((r, d), "")
             try:
+                if commit_bs > 1:
+                    with conn_w.cursor() as cur:
+                        cur.execute(
+                            pg_sql.SQL("SAVEPOINT {}").format(pg_sql.Identifier(sp_name))
+                        )
                 # 1) Save GTFS-only graph (pretty_osm = False).
                 db_access_module.save_route_graph_pg(
                     feed_id=feed_id,
@@ -333,7 +432,15 @@ def _build_chunk(
                     conn=conn_w,
                     commit=False,
                 )
-                # Save preview payload for configured profiles (GTFS).
+                gtfs_preview_bytes = pickle.dumps(
+                    build_route_preview_cache_dict(
+                        cache_entry["pattern"].pattern_id,
+                        cache_entry.get("preview_stops") or [],
+                        cache_entry.get("preview_geojson"),
+                        False,
+                        f"postgis-{feed_id}",
+                    )
+                )
                 for profile_key in profiles:
                     db_access_module.save_route_preview_pg(
                         feed_id=feed_id,
@@ -343,86 +450,108 @@ def _build_chunk(
                         pretty_osm=False,
                         route_sig_hash=sig_hash,
                         pattern_id=str(cache_entry["pattern"].pattern_id),
-                        preview_blob=pickle.dumps(
-                            build_route_preview_cache_dict(
-                                cache_entry["pattern"].pattern_id,
-                                cache_entry.get("preview_stops") or [],
-                                cache_entry.get("preview_geojson"),
-                                False,
-                                f"postgis-{feed_id}",
-                            )
-                        ),
+                        preview_blob=gtfs_preview_bytes,
                         conn=conn_w,
                         commit=False,
                     )
-                # 2) Try to precompute OSRM-snapped variant (pretty_osm = True).
-                try:
-                    pattern_geom = _merge_edge_geometries(
-                        cache_entry["edge_geometries"]
-                    )
-                    osm_res = map_match_pattern(
-                        pattern_geom=pattern_geom,
-                        edge_geometries=cache_entry["edge_geometries"],
-                    )
-                    if osm_res.used_osm:
-                        pretty_entry = {
-                            "graph": cache_entry["graph"],
-                            "edge_geometries": osm_res.snapped_edges,
-                            "pattern": cache_entry["pattern"],
-                            "used_shape": cache_entry["used_shape"],
-                            "used_osm_snapping": True,
-                            "snapped_pattern_geom": osm_res.snapped_pattern_geom,
-                            "date": None,
-                            "preview_geojson": None,
-                            "preview_stops": None,
-                        }
-                        preview_geojson, preview_stops = _build_preview_payload(pretty_entry)
-                        pretty_entry["preview_geojson"] = preview_geojson
-                        pretty_entry["preview_stops"] = preview_stops
-                        db_access_module.save_route_graph_pg(
-                            feed_id=feed_id,
-                            route_id=r,
-                            direction_id=d,
-                            pretty_osm=True,
-                            route_sig_hash=sig_hash,
-                            graph_blob=pickle.dumps(pretty_entry),
-                            date_ymd=date_ymd,
-                            conn=conn_w,
-                            commit=False,
+                # 2) Optional OSRM-snapped variant (pretty_osm = True).
+                if with_pretty_osm:
+                    try:
+                        pattern_geom = _merge_edge_geometries(
+                            cache_entry["edge_geometries"]
                         )
-                        for profile_key in profiles:
-                            db_access_module.save_route_preview_pg(
+                        osm_res = map_match_pattern(
+                            pattern_geom=pattern_geom,
+                            edge_geometries=cache_entry["edge_geometries"],
+                        )
+                        if osm_res.used_osm:
+                            pretty_entry = {
+                                "graph": cache_entry["graph"],
+                                "edge_geometries": osm_res.snapped_edges,
+                                "pattern": cache_entry["pattern"],
+                                "used_shape": cache_entry["used_shape"],
+                                "used_osm_snapping": True,
+                                "snapped_pattern_geom": osm_res.snapped_pattern_geom,
+                                "date": None,
+                                "preview_geojson": None,
+                                "preview_stops": None,
+                            }
+                            if fast_preview_geojson:
+                                preview_geojson, preview_stops = (
+                                    _build_preview_payload_from_stops_and_shape(
+                                        stops,
+                                        shape_line,
+                                        osm_res.snapped_pattern_geom,
+                                    )
+                                )
+                            else:
+                                preview_geojson, preview_stops = _build_preview_payload(
+                                    pretty_entry
+                                )
+                            pretty_entry["preview_geojson"] = preview_geojson
+                            pretty_entry["preview_stops"] = preview_stops
+                            db_access_module.save_route_graph_pg(
                                 feed_id=feed_id,
                                 route_id=r,
                                 direction_id=d,
-                                profile_key=profile_key,
                                 pretty_osm=True,
                                 route_sig_hash=sig_hash,
-                                pattern_id=str(pretty_entry["pattern"].pattern_id),
-                                preview_blob=pickle.dumps(
-                                    build_route_preview_cache_dict(
-                                        pretty_entry["pattern"].pattern_id,
-                                        pretty_entry.get("preview_stops") or [],
-                                        pretty_entry.get("preview_geojson"),
-                                        True,
-                                        f"postgis-{feed_id}",
-                                    )
-                                ),
+                                graph_blob=pickle.dumps(pretty_entry),
+                                date_ymd=date_ymd,
                                 conn=conn_w,
                                 commit=False,
                             )
-                except Exception:
-                    # OSRM failure should not break precompute.
-                    pass
-                conn_w.commit()
+                            osm_preview_bytes = pickle.dumps(
+                                build_route_preview_cache_dict(
+                                    pretty_entry["pattern"].pattern_id,
+                                    pretty_entry.get("preview_stops") or [],
+                                    pretty_entry.get("preview_geojson"),
+                                    True,
+                                    f"postgis-{feed_id}",
+                                )
+                            )
+                            for profile_key in profiles:
+                                db_access_module.save_route_preview_pg(
+                                    feed_id=feed_id,
+                                    route_id=r,
+                                    direction_id=d,
+                                    profile_key=profile_key,
+                                    pretty_osm=True,
+                                    route_sig_hash=sig_hash,
+                                    pattern_id=str(pretty_entry["pattern"].pattern_id),
+                                    preview_blob=osm_preview_bytes,
+                                    conn=conn_w,
+                                    commit=False,
+                                )
+                    except Exception:
+                        pass
+                _commit_route_bundle(
+                    conn_w,
+                    commit_bs=commit_bs,
+                    sp_name=sp_name,
+                    pending_since_commit=pending_since_commit,
+                )
                 n += 1
                 state["saved"] = n
             except Exception as e:
-                # Clear aborted transaction state so the worker can continue.
-                try:
-                    conn_w.rollback()
-                except Exception:
-                    pass
+                if commit_bs > 1:
+                    try:
+                        with conn_w.cursor() as cur:
+                            cur.execute(
+                                pg_sql.SQL("ROLLBACK TO SAVEPOINT {}").format(
+                                    pg_sql.Identifier(sp_name)
+                                )
+                            )
+                    except Exception:
+                        try:
+                            conn_w.rollback()
+                        except Exception:
+                            pass
+                else:
+                    try:
+                        conn_w.rollback()
+                    except Exception:
+                        pass
                 if isinstance(e, psycopg2.Error):
                     log(
                         "precompute_graphs",
@@ -445,6 +574,8 @@ def _build_chunk(
                         f"saved_ok={n}"
                     ),
                 )
+        if commit_bs > 1 and pending_since_commit[0] > 0:
+            conn_w.commit()
     finally:
         state["stop"] = True
         if hb_thread is not None:
@@ -524,6 +655,37 @@ def main():
             "Always recompute route signatures from trips/stop_times/shapes (slow). "
             "Default: when feed checksum matches patterns_built_checksum, load signatures "
             "from route_signatures (one query) instead of the bulk scan."
+        ),
+    )
+    ap.add_argument(
+        "--fast-preview-geojson",
+        action="store_true",
+        help=(
+            "Build route preview GeoJSON from pattern stops + one polyline (faster; less map detail). "
+            "Default uses full graph edge geometries for previews (same fidelity as before the fast path)."
+        ),
+    )
+    ap.add_argument(
+        "--legacy-preview-geojson",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    ap.add_argument(
+        "--with-pretty-osm",
+        action="store_true",
+        help=(
+            "Run OSRM map-match and write pretty_osm=True graph + preview rows (adds significant time). "
+            "Default is GTFS-only cache for this run."
+        ),
+    )
+    ap.add_argument(
+        "--commit-batch-size",
+        type=int,
+        default=1,
+        metavar="N",
+        help=(
+            "Commit every N successful routes (per worker in parallel; uses SAVEPOINT per route when N>1). "
+            "Default 1 commits after each route."
         ),
     )
     args = ap.parse_args()
@@ -760,10 +922,22 @@ def main():
         )
 
         # 5) Build graphs (sequential or parallel)
+        log(
+            "precompute_graphs",
+            (
+                f"Graph build options: fast_preview_geojson={bool(args.fast_preview_geojson)}, "
+                f"with_pretty_osm={bool(args.with_pretty_osm)}, "
+                f"commit_batch_size={max(1, int(args.commit_batch_size))}"
+            ),
+        )
         workers = max(1, int(args.workers))
         built = 0
         if workers <= 1:
             total_build = len(to_build)
+            commit_bs_seq = max(1, int(args.commit_batch_size))
+            pending_seq: List[int] = [0]
+            fast_pv = bool(args.fast_preview_geojson)
+            with_pretty_seq = bool(args.with_pretty_osm)
             for i, (r, d) in enumerate(to_build, start=1):
                 meta = patterns[(r, d)]
                 pid = meta.pattern_id
@@ -776,13 +950,26 @@ def main():
                 stop_times = stop_times_by_trip.get(meta.repr_trip_id)
                 if not stops or len(stops) < 2:
                     continue
-                _, cache_entry = _build_one(meta, stops, shape_line, stop_times or [])
+                _, cache_entry = _build_one(
+                    meta,
+                    stops,
+                    shape_line,
+                    stop_times or [],
+                    fast_preview_geojson=fast_pv,
+                )
                 sig_hash = sigs.get((r, d), "")
-                # 1) Save GTFS-only graph.
                 for profile_key in profiles:
                     key = f"postgis-{feed_id}|{r}|{d or ''}|profile:{profile_key}|gtfs"
                     GRAPH_CACHE[key] = cache_entry
+                sp_name_seq = f"sp_seq_{i}"
                 try:
+                    if commit_bs_seq > 1:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                pg_sql.SQL("SAVEPOINT {}").format(
+                                    pg_sql.Identifier(sp_name_seq)
+                                )
+                            )
                     db_access_module.save_route_graph_pg(
                         feed_id=feed_id,
                         route_id=r,
@@ -794,6 +981,15 @@ def main():
                         conn=conn,
                         commit=False,
                     )
+                    gtfs_preview_bytes = pickle.dumps(
+                        build_route_preview_cache_dict(
+                            cache_entry["pattern"].pattern_id,
+                            cache_entry.get("preview_stops") or [],
+                            cache_entry.get("preview_geojson"),
+                            False,
+                            f"postgis-{feed_id}",
+                        )
+                    )
                     for profile_key in profiles:
                         db_access_module.save_route_preview_pg(
                             feed_id=feed_id,
@@ -803,88 +999,110 @@ def main():
                             pretty_osm=False,
                             route_sig_hash=sig_hash,
                             pattern_id=str(cache_entry["pattern"].pattern_id),
-                            preview_blob=pickle.dumps(
-                                {
-                                    "pattern_id": cache_entry["pattern"].pattern_id,
-                                    "stops": cache_entry.get("preview_stops") or [],
-                                    "route_geojson": cache_entry.get("preview_geojson"),
-                                    "used_osm_snapping": False,
-                                    "feed_version": f"postgis-{feed_id}",
-                                }
-                            ),
+                            preview_blob=gtfs_preview_bytes,
                             conn=conn,
                             commit=False,
                         )
-                    # 2) Try to precompute OSRM-snapped graph.
-                    try:
-                        pattern_geom = _merge_edge_geometries(
-                            cache_entry["edge_geometries"]
-                        )
-                        osm_res = map_match_pattern(
-                            pattern_geom=pattern_geom,
-                            edge_geometries=cache_entry["edge_geometries"],
-                        )
-                        if osm_res.used_osm:
-                            pretty_entry = {
-                                "graph": cache_entry["graph"],
-                                "edge_geometries": osm_res.snapped_edges,
-                                "pattern": cache_entry["pattern"],
-                                "used_shape": cache_entry["used_shape"],
-                                "used_osm_snapping": True,
-                                "snapped_pattern_geom": osm_res.snapped_pattern_geom,
-                                "date": None,
-                                "preview_geojson": None,
-                                "preview_stops": None,
-                            }
-                            preview_geojson, preview_stops = _build_preview_payload(pretty_entry)
-                            pretty_entry["preview_geojson"] = preview_geojson
-                            pretty_entry["preview_stops"] = preview_stops
-                            for profile_key in profiles:
-                                key_osm = (
-                                    f"postgis-{feed_id}|{r}|{d or ''}|profile:{profile_key}|osm"
-                                )
-                                GRAPH_CACHE[key_osm] = pretty_entry
-                            db_access_module.save_route_graph_pg(
-                                feed_id=feed_id,
-                                route_id=r,
-                                direction_id=d,
-                                pretty_osm=True,
-                                route_sig_hash=sig_hash,
-                                graph_blob=pickle.dumps(pretty_entry),
-                                date_ymd=reference_date_ymd,
-                                conn=conn,
-                                commit=False,
+                    if with_pretty_seq:
+                        try:
+                            pattern_geom = _merge_edge_geometries(
+                                cache_entry["edge_geometries"]
                             )
-                            for profile_key in profiles:
-                                db_access_module.save_route_preview_pg(
+                            osm_res = map_match_pattern(
+                                pattern_geom=pattern_geom,
+                                edge_geometries=cache_entry["edge_geometries"],
+                            )
+                            if osm_res.used_osm:
+                                pretty_entry = {
+                                    "graph": cache_entry["graph"],
+                                    "edge_geometries": osm_res.snapped_edges,
+                                    "pattern": cache_entry["pattern"],
+                                    "used_shape": cache_entry["used_shape"],
+                                    "used_osm_snapping": True,
+                                    "snapped_pattern_geom": osm_res.snapped_pattern_geom,
+                                    "date": None,
+                                    "preview_geojson": None,
+                                    "preview_stops": None,
+                                }
+                                if fast_pv:
+                                    preview_geojson, preview_stops = (
+                                        _build_preview_payload_from_stops_and_shape(
+                                            stops,
+                                            shape_line,
+                                            osm_res.snapped_pattern_geom,
+                                        )
+                                    )
+                                else:
+                                    preview_geojson, preview_stops = _build_preview_payload(
+                                        pretty_entry
+                                    )
+                                pretty_entry["preview_geojson"] = preview_geojson
+                                pretty_entry["preview_stops"] = preview_stops
+                                for profile_key in profiles:
+                                    key_osm = (
+                                        f"postgis-{feed_id}|{r}|{d or ''}|profile:{profile_key}|osm"
+                                    )
+                                    GRAPH_CACHE[key_osm] = pretty_entry
+                                db_access_module.save_route_graph_pg(
                                     feed_id=feed_id,
                                     route_id=r,
                                     direction_id=d,
-                                    profile_key=profile_key,
                                     pretty_osm=True,
                                     route_sig_hash=sig_hash,
-                                    pattern_id=str(pretty_entry["pattern"].pattern_id),
-                                    preview_blob=pickle.dumps(
-                                        {
-                                            "pattern_id": pretty_entry["pattern"].pattern_id,
-                                            "stops": pretty_entry.get("preview_stops") or [],
-                                            "route_geojson": pretty_entry.get("preview_geojson"),
-                                            "used_osm_snapping": True,
-                                            "feed_version": f"postgis-{feed_id}",
-                                        }
-                                    ),
+                                    graph_blob=pickle.dumps(pretty_entry),
+                                    date_ymd=reference_date_ymd,
                                     conn=conn,
                                     commit=False,
                                 )
-                    except Exception:
-                        pass
-                    conn.commit()
+                                osm_preview_bytes = pickle.dumps(
+                                    build_route_preview_cache_dict(
+                                        pretty_entry["pattern"].pattern_id,
+                                        pretty_entry.get("preview_stops") or [],
+                                        pretty_entry.get("preview_geojson"),
+                                        True,
+                                        f"postgis-{feed_id}",
+                                    )
+                                )
+                                for profile_key in profiles:
+                                    db_access_module.save_route_preview_pg(
+                                        feed_id=feed_id,
+                                        route_id=r,
+                                        direction_id=d,
+                                        profile_key=profile_key,
+                                        pretty_osm=True,
+                                        route_sig_hash=sig_hash,
+                                        pattern_id=str(pretty_entry["pattern"].pattern_id),
+                                        preview_blob=osm_preview_bytes,
+                                        conn=conn,
+                                        commit=False,
+                                    )
+                        except Exception:
+                            pass
+                    _commit_route_bundle(
+                        conn,
+                        commit_bs=commit_bs_seq,
+                        sp_name=sp_name_seq,
+                        pending_since_commit=pending_seq,
+                    )
                 except Exception:
-                    # Keep the main connection usable after any failed statement.
-                    try:
-                        conn.rollback()
-                    except Exception:
-                        pass
+                    if commit_bs_seq > 1:
+                        try:
+                            with conn.cursor() as cur:
+                                cur.execute(
+                                    pg_sql.SQL("ROLLBACK TO SAVEPOINT {}").format(
+                                        pg_sql.Identifier(sp_name_seq)
+                                    )
+                                )
+                        except Exception:
+                            try:
+                                conn.rollback()
+                            except Exception:
+                                pass
+                    else:
+                        try:
+                            conn.rollback()
+                        except Exception:
+                            pass
                     continue
                 built += 1
                 progress_every = max(1, int(args.progress_every))
@@ -898,6 +1116,8 @@ def main():
                         "precompute_graphs",
                         f"Processed {i}/{total_build} (built={built})",
                     )
+            if commit_bs_seq > 1 and pending_seq[0] > 0:
+                conn.commit()
         else:
             from concurrent.futures import ProcessPoolExecutor, as_completed
 
@@ -944,6 +1164,9 @@ def main():
                             label,
                             pe,
                             max(0, int(args.worker_heartbeat_seconds)),
+                            bool(args.fast_preview_geojson),
+                            bool(args.with_pretty_osm),
+                            max(1, int(args.commit_batch_size)),
                         )
                     )
                 completed = 0
