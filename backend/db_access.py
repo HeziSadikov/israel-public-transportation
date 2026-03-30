@@ -67,6 +67,8 @@ class RouteInAreaRow:
     agency_name: Optional[str]
     first_time_s: Optional[int]
     last_time_s: Optional[int]
+    trip_count: Optional[int]
+    last_stop_name: Optional[str] = None
 
 
 def get_routes_in_polygon(
@@ -122,6 +124,24 @@ def get_routes_in_polygon(
                       AND b.last_sec >= %s
                       AND b.first_sec <= %s
                 ),
+                trip_last_stop AS (
+                    SELECT DISTINCT ON (tiw.route_id, tiw.direction_id)
+                        tiw.route_id,
+                        tiw.direction_id,
+                        s.name AS last_stop_name
+                    FROM trips_in_window tiw
+                    JOIN trips t ON t.feed_id = tiw.feed_id AND t.trip_id = tiw.trip_id
+                    JOIN (
+                        SELECT feed_id, trip_id, MAX(stop_sequence) AS max_seq
+                        FROM stop_times
+                        GROUP BY feed_id, trip_id
+                    ) mx ON mx.feed_id = t.feed_id AND mx.trip_id = t.trip_id
+                    JOIN stop_times st
+                        ON st.feed_id = mx.feed_id AND st.trip_id = mx.trip_id AND st.stop_sequence = mx.max_seq
+                    JOIN stops s ON s.feed_id = st.feed_id AND s.stop_id = st.stop_id
+                    WHERE t.feed_id = %s
+                    ORDER BY tiw.route_id, tiw.direction_id, t.trip_id
+                ),
                 routes_geom AS (
                     SELECT DISTINCT
                         tiw.route_id,
@@ -130,7 +150,8 @@ def get_routes_in_polygon(
                         r.long_name AS route_long_name,
                         r.agency_id,
                         MIN(b.first_sec) AS first_time_s,
-                        MAX(b.last_sec) AS last_time_s
+                        MAX(b.last_sec) AS last_time_s,
+                        COUNT(DISTINCT tiw.trip_id)::int AS trip_count
                     FROM trips_in_window tiw
                     JOIN trips t
                       ON t.feed_id = tiw.feed_id AND t.trip_id = tiw.trip_id
@@ -155,8 +176,13 @@ def get_routes_in_polygon(
                     rg.agency_id,
                     a.name AS agency_name,
                     rg.first_time_s,
-                    rg.last_time_s
+                    rg.last_time_s,
+                    rg.trip_count,
+                    tls.last_stop_name
                 FROM routes_geom rg
+                LEFT JOIN trip_last_stop tls
+                    ON tls.route_id = rg.route_id
+                    AND tls.direction_id IS NOT DISTINCT FROM rg.direction_id
                 LEFT JOIN agencies a
                   ON a.feed_id = %s AND a.agency_id = rg.agency_id
                 ORDER BY rg.route_short_name, rg.route_id, rg.direction_id
@@ -170,6 +196,7 @@ def get_routes_in_polygon(
                     feed_id,
                     start_sec,
                     end_sec,
+                    feed_id,
                     polygon_wkt,
                     feed_id,
                 ),
@@ -186,6 +213,8 @@ def get_routes_in_polygon(
                         agency_name=r["agency_name"],
                         first_time_s=r["first_time_s"],
                         last_time_s=r["last_time_s"],
+                        trip_count=r["trip_count"],
+                        last_stop_name=r.get("last_stop_name"),
                     )
                 )
             return rows
@@ -1940,7 +1969,13 @@ def get_blocked_edge_keys_pg(
     return {keys[i - 1] for i in indices if 1 <= i <= len(keys)}
 
 
-def search_routes_pg(q: str, limit: int) -> List[Dict[str, Any]]:
+def search_routes_pg(
+    q: str,
+    limit: int,
+    date_ymd: Optional[str] = None,
+    start_sec: Optional[int] = None,
+    end_sec: Optional[int] = None,
+) -> List[Dict[str, Any]]:
     """
     Search routes in the active feed by id/short_name/long_name using PostGIS.
     Mirrors the old SQLite-based semantics.
@@ -1953,49 +1988,185 @@ def search_routes_pg(q: str, limit: int) -> List[Dict[str, Any]]:
     close = True
     try:
         feed_id = get_active_feed_id(conn)
+        use_window = (
+            bool(date_ymd)
+            and len(str(date_ymd)) == 8
+            and str(date_ymd).isdigit()
+            and start_sec is not None
+            and end_sec is not None
+        )
+        window_sql = ""
+        window_params: List[Any] = []
+        if use_window:
+            window_sql = """
+                ,
+                dow AS (
+                    SELECT EXTRACT(DOW FROM to_timestamp(%s::text, 'YYYYMMDD'))::int AS d
+                ),
+                calendar_services AS (
+                    SELECT c.service_id
+                    FROM calendar c, dow
+                    WHERE c.feed_id = %s
+                      AND %s BETWEEN c.start_date AND c.end_date
+                      AND (
+                        (d = 0 AND c.sunday = 1)
+                        OR (d = 1 AND c.monday = 1)
+                        OR (d = 2 AND c.tuesday = 1)
+                        OR (d = 3 AND c.wednesday = 1)
+                        OR (d = 4 AND c.thursday = 1)
+                        OR (d = 5 AND c.friday = 1)
+                        OR (d = 6 AND c.saturday = 1)
+                      )
+                ),
+                add_services AS (
+                    SELECT service_id
+                    FROM calendar_dates
+                    WHERE feed_id = %s
+                      AND date = %s
+                      AND exception_type = 1
+                ),
+                remove_services AS (
+                    SELECT service_id
+                    FROM calendar_dates
+                    WHERE feed_id = %s
+                      AND date = %s
+                      AND exception_type = 2
+                ),
+                active_services AS (
+                    (SELECT service_id FROM calendar_services
+                     UNION
+                     SELECT service_id FROM add_services)
+                    EXCEPT
+                    SELECT service_id FROM remove_services
+                ),
+                trips_in_window AS (
+                    SELECT t.route_id, COUNT(DISTINCT t.trip_id)::int AS trip_count
+                    FROM trips t
+                    JOIN active_services s
+                      ON s.service_id = t.service_id
+                    JOIN trip_time_bounds b
+                      ON b.feed_id = t.feed_id AND b.trip_id = t.trip_id
+                    WHERE t.feed_id = %s
+                      AND b.last_sec >= %s
+                      AND b.first_sec <= %s
+                    GROUP BY t.route_id
+                )
+            """
+            window_params = [
+                int(str(date_ymd)),
+                feed_id,
+                int(str(date_ymd)),
+                feed_id,
+                int(str(date_ymd)),
+                feed_id,
+                int(str(date_ymd)),
+                feed_id,
+                int(start_sec),
+                int(end_sec),
+            ]
         with conn.cursor() as cur:
             if q.isdigit():
                 cur.execute(
-                    """
+                    f"""
+                    WITH route_last_stop AS (
+                      SELECT DISTINCT ON (t.route_id)
+                        t.route_id,
+                        s.name AS last_stop_name
+                      FROM trips t
+                      JOIN (
+                        SELECT feed_id, trip_id, MAX(stop_sequence) AS max_seq
+                        FROM stop_times
+                        GROUP BY feed_id, trip_id
+                      ) mx ON mx.feed_id = t.feed_id AND mx.trip_id = t.trip_id
+                      JOIN stop_times st
+                        ON st.feed_id = mx.feed_id AND st.trip_id = mx.trip_id AND st.stop_sequence = mx.max_seq
+                      JOIN stops s ON s.feed_id = st.feed_id AND s.stop_id = st.stop_id
+                      WHERE t.feed_id = %s
+                      ORDER BY t.route_id, t.trip_id
+                    ),
+                    filtered_routes AS (
+                      SELECT
+                        r.route_id,
+                        r.short_name,
+                        r.long_name,
+                        r.agency_id,
+                        r.route_type
+                      FROM routes r
+                      WHERE r.feed_id = %s
+                        AND (LOWER(r.route_id) = %s OR LOWER(r.short_name) = %s)
+                      LIMIT %s
+                    )
+                    {window_sql}
                     SELECT
-                      r.route_id,
-                      r.short_name,
-                      r.long_name,
-                      r.agency_id,
-                      r.route_type,
-                      a.name AS agency_name
-                    FROM routes r
+                      fr.route_id,
+                      fr.short_name,
+                      fr.long_name,
+                      fr.agency_id,
+                      fr.route_type,
+                      a.name AS agency_name,
+                      {"COALESCE(tw.trip_count, 0)::int AS trip_count" if use_window else "NULL::int AS trip_count"},
+                      rls.last_stop_name
+                    FROM filtered_routes fr
+                    LEFT JOIN route_last_stop rls ON rls.route_id = fr.route_id
                     LEFT JOIN agencies a
-                      ON a.feed_id = r.feed_id AND a.agency_id = r.agency_id
-                    WHERE r.feed_id = %s
-                      AND (LOWER(r.route_id) = %s OR LOWER(r.short_name) = %s)
-                    LIMIT %s
+                      ON a.feed_id = %s AND a.agency_id = fr.agency_id
+                    {"LEFT JOIN trips_in_window tw ON tw.route_id = fr.route_id" if use_window else ""}
                     """,
-                    (feed_id, q, q, limit),
+                    [feed_id, feed_id, q, q, limit, *window_params, feed_id],
                 )
             else:
                 like = f"%{q}%"
                 cur.execute(
-                    """
+                    f"""
+                    WITH route_last_stop AS (
+                      SELECT DISTINCT ON (t.route_id)
+                        t.route_id,
+                        s.name AS last_stop_name
+                      FROM trips t
+                      JOIN (
+                        SELECT feed_id, trip_id, MAX(stop_sequence) AS max_seq
+                        FROM stop_times
+                        GROUP BY feed_id, trip_id
+                      ) mx ON mx.feed_id = t.feed_id AND mx.trip_id = t.trip_id
+                      JOIN stop_times st
+                        ON st.feed_id = mx.feed_id AND st.trip_id = mx.trip_id AND st.stop_sequence = mx.max_seq
+                      JOIN stops s ON s.feed_id = st.feed_id AND s.stop_id = st.stop_id
+                      WHERE t.feed_id = %s
+                      ORDER BY t.route_id, t.trip_id
+                    ),
+                    filtered_routes AS (
+                      SELECT
+                        r.route_id,
+                        r.short_name,
+                        r.long_name,
+                        r.agency_id,
+                        r.route_type
+                      FROM routes r
+                      WHERE r.feed_id = %s
+                        AND (
+                          LOWER(COALESCE(r.route_id, ''))    LIKE %s OR
+                          LOWER(COALESCE(r.short_name, ''))  LIKE %s OR
+                          LOWER(COALESCE(r.long_name, ''))   LIKE %s
+                        )
+                      LIMIT %s
+                    )
+                    {window_sql}
                     SELECT
-                      r.route_id,
-                      r.short_name,
-                      r.long_name,
-                      r.agency_id,
-                      r.route_type,
-                      a.name AS agency_name
-                    FROM routes r
+                      fr.route_id,
+                      fr.short_name,
+                      fr.long_name,
+                      fr.agency_id,
+                      fr.route_type,
+                      a.name AS agency_name,
+                      {"COALESCE(tw.trip_count, 0)::int AS trip_count" if use_window else "NULL::int AS trip_count"},
+                      rls.last_stop_name
+                    FROM filtered_routes fr
+                    LEFT JOIN route_last_stop rls ON rls.route_id = fr.route_id
                     LEFT JOIN agencies a
-                      ON a.feed_id = r.feed_id AND a.agency_id = r.agency_id
-                    WHERE r.feed_id = %s
-                      AND (
-                        LOWER(COALESCE(r.route_id, ''))    LIKE %s OR
-                        LOWER(COALESCE(r.short_name, ''))  LIKE %s OR
-                        LOWER(COALESCE(r.long_name, ''))   LIKE %s
-                      )
-                    LIMIT %s
+                      ON a.feed_id = %s AND a.agency_id = fr.agency_id
+                    {"LEFT JOIN trips_in_window tw ON tw.route_id = fr.route_id" if use_window else ""}
                     """,
-                    (feed_id, like, like, like, limit),
+                    [feed_id, feed_id, like, like, like, limit, *window_params, feed_id],
                 )
             return [
                 {
@@ -2005,6 +2176,8 @@ def search_routes_pg(q: str, limit: int) -> List[Dict[str, Any]]:
                     "agency_id": r["agency_id"],
                     "route_type": r["route_type"],
                     "agency_name": r["agency_name"],
+                    "trip_count": r["trip_count"],
+                    "last_stop_name": r.get("last_stop_name"),
                 }
                 for r in cur.fetchall()
             ]

@@ -9,6 +9,9 @@ from pydantic import BaseModel, Field
 class RouteSearchRequest(BaseModel):
     q: str
     limit: int = 20
+    date: Optional[str] = None  # YYYYMMDD
+    start_time: Optional[str] = None  # HH:MM or HH:MM:SS
+    end_time: Optional[str] = None  # HH:MM or HH:MM:SS
 
 
 class RouteInfo(BaseModel):
@@ -18,6 +21,8 @@ class RouteInfo(BaseModel):
     agency_id: Optional[str] = None
     agency_name: Optional[str] = None
     route_type: Optional[int] = None
+    trip_count: Optional[int] = None
+    last_stop_name: Optional[str] = None
 
 
 class FeedUpdateResponse(BaseModel):
@@ -112,6 +117,8 @@ class AreaRouteResult(BaseModel):
     agency_name: Optional[str] = None
     first_time: Optional[str] = None
     last_time: Optional[str] = None
+    trip_count: Optional[int] = None
+    last_stop_name: Optional[str] = None
 
 
 class AreaRoutesResponse(BaseModel):

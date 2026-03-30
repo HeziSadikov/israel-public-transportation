@@ -49,6 +49,8 @@ def find_routes_in_polygon(
       "agency_name": r.agency_name,
       "first_time_s": r.first_time_s,
       "last_time_s": r.last_time_s,
+      "trip_count": r.trip_count,
+      "last_stop_name": r.last_stop_name,
     }
     for r in rows
   ]

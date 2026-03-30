@@ -2,9 +2,9 @@ import "./app.css";
 
 import axios from "axios";
 import React, { useMemo, useRef, useState } from "react";
-import { ExplorerWindow, type ExplorerTab, type GeocodeResult } from "./ExplorerWindow";
+import { ExplorerWindow, type ExplorerSortBy, type ExplorerTab, type GeocodeResult } from "./ExplorerWindow";
 import type { AreaRouteResult, RouteInfo } from "./ExplorerWindow";
-import MapLibreMap, { type MapLibreMapHandle } from "./MapLibreMap";
+import MapLibreMap, { type BasemapKind, type MapLibreMapHandle } from "./MapLibreMap";
 
 type StopInfo = {
   stop_id: string;
@@ -60,7 +60,7 @@ const API_BASE: string =
   "http://127.0.0.1:8000";
 
 const DEFAULT_EXPLORER_POSITION = { x: 24, y: 24 };
-const DEFAULT_EXPLORER_SIZE = { width: 360, height: 380 };
+const DEFAULT_EXPLORER_SIZE = { width: 620, height: 420 };
 const EXPLORER_HEADER_HEIGHT = 44;
 
 const App: React.FC = () => {
@@ -97,12 +97,14 @@ const App: React.FC = () => {
   const [lineSearchQuery, setLineSearchQuery] = useState("");
   const [lineSearchResults, setLineSearchResults] = useState<RouteInfo[]>([]);
   const [lineSearchLoading, setLineSearchLoading] = useState(false);
+  const [sortBy, setSortBy] = useState<ExplorerSortBy>("line_asc");
 
   const [addressQuery, setAddressQuery] = useState("");
   const [addressResults, setAddressResults] = useState<GeocodeResult[]>([]);
   const [addressLoading, setAddressLoading] = useState(false);
 
   const [pinPosition, setPinPosition] = useState<[number, number] | null>(null);
+  const [basemap, setBasemap] = useState<BasemapKind>("osm");
 
   const mapRef = useRef<MapLibreMapHandle | null>(null);
   const latestRouteLoadIdRef = useRef(0);
@@ -219,6 +221,9 @@ const App: React.FC = () => {
       const res = await axios.post<RouteInfo[]>(`${API_BASE}/routes/search`, {
         q: lineSearchQuery.trim(),
         limit: 20,
+        date: areaDate.trim(),
+        start_time: areaStartTime.trim() || "04:00",
+        end_time: areaEndTime.trim() || "23:59",
       });
       setLineSearchResults(res.data);
     } catch (e) {
@@ -413,7 +418,34 @@ const App: React.FC = () => {
         </section>
 
         <section className="rail-section">
+          <h2 className="rail-heading">Sort by</h2>
+          <select
+            value={sortBy}
+            onChange={(e) => setSortBy(e.target.value as ExplorerSortBy)}
+            className="rail-select"
+          >
+            <option value="line_asc">Line number (small to big)</option>
+            <option value="line_desc">Line number (big to small)</option>
+            <option value="agency_asc">Agency (A to Z)</option>
+            <option value="agency_desc">Agency (Z to A)</option>
+            <option value="trips_desc">Trips count (high to low)</option>
+            <option value="destination_asc">Destination (A to Z)</option>
+          </select>
+        </section>
+
+        <section className="rail-section">
           <h2 className="rail-heading">Map</h2>
+          <label>Basemap</label>
+          <select
+            className="rail-select"
+            value={basemap}
+            onChange={(e) => setBasemap(e.target.value as BasemapKind)}
+            title="Raster options use GPU tuning for clarity; vector uses OpenFreeMap (crisp labels)"
+          >
+            <option value="osm">OSM standard (raster)</option>
+            <option value="carto_light">Carto light (minimal raster)</option>
+            <option value="vector_liberty">Vector Liberty (OpenFreeMap)</option>
+          </select>
           <div className="rail-buttons">
             <button type="button" onClick={() => mapRef.current?.fitToBlockage()} disabled={!blockageGeojson}>
               Fit blockage
@@ -450,6 +482,7 @@ const App: React.FC = () => {
           blockageGeojson={blockageGeojson as GeoJSON.Geometry | null}
           onBlockageChange={setBlockageGeojson}
           pinPosition={pinPosition}
+          basemap={basemap}
         />
         {explorerOpen && (
           <ExplorerWindow
@@ -496,6 +529,7 @@ const App: React.FC = () => {
             addressLoading={addressLoading}
             onAddressSearch={handleAddressSearch}
             onSelectAddressResult={handleSelectAddressResult}
+            sortBy={sortBy}
           />
         )}
       </div>

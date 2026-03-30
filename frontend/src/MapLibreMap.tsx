@@ -14,20 +14,79 @@ type GeoJSONGeometry =
 type GeoJSONFeature = { type: "Feature"; geometry: GeoJSONGeometry; properties?: Record<string, unknown> };
 type GeoJSONFeatureCollection = { type: "FeatureCollection"; features: GeoJSONFeature[] };
 
-// OSM raster basemap (standard tiles).
-const OSM_STYLE: maplibregl.StyleSpecification = {
-  version: 8,
-  sources: {
-    osm: {
-      type: "raster",
-      tiles: ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"],
-      tileSize: 256,
-      attribution: "© OpenStreetMap",
-      maxzoom: 19,
-    },
-  },
-  layers: [{ id: "osm", type: "raster", source: "osm" }],
+/** Shared paint: sharper scaling + slightly subdued basemap so routes/detours read clearer (GPU-only). */
+const RASTER_BASEMAP_PAINT: maplibregl.RasterLayerSpecification["paint"] = {
+  /** Avoid cross-fade between old/new tiles (default ~300ms can look soft while zooming). */
+  "raster-fade-duration": 0,
+  "raster-resampling": "linear",
+  "raster-opacity": 0.96,
+  "raster-brightness-min": 0,
+  "raster-brightness-max": 1,
+  "raster-saturation": -0.12,
+  "raster-contrast": 0.06,
 };
+
+export type BasemapKind = "osm" | "carto_light" | "vector_liberty";
+
+/** OpenFreeMap Liberty — vector tiles, crisp at all zooms (separate CDN; check terms for production). */
+const OPENFREEMAP_LIBERTY_STYLE = "https://tiles.openfreemap.org/styles/liberty";
+
+function rasterStyle(
+  sourceId: string,
+  tiles: string[],
+  attribution: string
+): maplibregl.StyleSpecification {
+  return {
+    version: 8,
+    sources: {
+      [sourceId]: {
+        type: "raster",
+        tiles,
+        tileSize: 256,
+        attribution,
+        maxzoom: 19,
+      },
+    },
+    layers: [
+      {
+        id: "basemap-raster",
+        type: "raster",
+        source: sourceId,
+        paint: RASTER_BASEMAP_PAINT,
+      },
+    ],
+  };
+}
+
+const OSM_STYLE = rasterStyle("osm", ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"], "© OpenStreetMap");
+
+/** Carto Positron-style light raster — less visual noise than full OSM. */
+const CARTO_LIGHT_STYLE = rasterStyle(
+  "carto",
+  [
+    "https://a.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png",
+    "https://b.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png",
+    "https://c.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png",
+  ],
+  "© OpenStreetMap contributors © CARTO"
+);
+
+function styleForBasemap(kind: BasemapKind): string | maplibregl.StyleSpecification {
+  if (kind === "vector_liberty") return OPENFREEMAP_LIBERTY_STYLE;
+  if (kind === "carto_light") return CARTO_LIGHT_STYLE;
+  return OSM_STYLE;
+}
+
+/**
+ * Raster tiles (OSM/Carto) are fixed 256px; MapLibre upscales to the canvas.
+ * Use full devicePixelRatio so HiDPI screens look sharp (more GPU/tile work on 3x).
+ * Vector basemap: cap at 2 to limit label/GPU cost on very dense 3x phones.
+ */
+function mapPixelRatioForBasemap(kind: BasemapKind): number {
+  const dpr = typeof window !== "undefined" ? window.devicePixelRatio || 1 : 1;
+  if (kind === "vector_liberty") return Math.min(dpr, 2);
+  return dpr;
+}
 
 // Custom, minimal styles for MapboxDraw that are compatible with MapLibre.
 // We avoid any complex line-dasharray expressions that trigger style errors.
@@ -166,10 +225,42 @@ export type MapLibreMapProps = {
   blockageGeojson: GeoJSON.Geometry | null;
   onBlockageChange: (geom: GeoJSON.Geometry | null) => void;
   pinPosition: [number, number] | null;
+  /** Basemap: OSM raster, minimal Carto raster, or vector (OpenFreeMap Liberty). */
+  basemap?: BasemapKind;
 };
 
+type StopRole = "first" | "last" | "middle" | "both";
+
+function rolesForStops(stops: MapLibreMapProps["stops"]): Map<string, StopRole> {
+  const sequences = stops.map((s) => s.sequence).filter((n) => Number.isFinite(n));
+  let minSeq: number | null = null;
+  let maxSeq: number | null = null;
+  if (sequences.length > 0) {
+    minSeq = Math.min(...sequences);
+    maxSeq = Math.max(...sequences);
+  }
+  const byId = new Map<string, StopRole>();
+  for (const s of stops) {
+    const seq = s.sequence;
+    if (!Number.isFinite(seq) || minSeq === null || maxSeq === null) {
+      byId.set(s.stop_id, "middle");
+      continue;
+    }
+    if (minSeq === maxSeq) {
+      byId.set(s.stop_id, "both");
+    } else if (seq === minSeq) {
+      byId.set(s.stop_id, "first");
+    } else if (seq === maxSeq) {
+      byId.set(s.stop_id, "last");
+    } else {
+      byId.set(s.stop_id, "middle");
+    }
+  }
+  return byId;
+}
+
 const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(function MapLibreMap(
-  { center, stops, routeGeojson, detour, blockageGeojson, onBlockageChange, pinPosition },
+  { center, stops, routeGeojson, detour, blockageGeojson, onBlockageChange, pinPosition, basemap = "osm" },
   ref
 ) {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -178,9 +269,11 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
   const blockageRef = useRef<GeoJSON.Geometry | null>(null);
   const routeRef = useRef<GeoJSON.FeatureCollection | null>(null);
   const detourRef = useRef<MapLibreMapProps["detour"]>(null);
+  const blockagePropRef = useRef<GeoJSON.Geometry | null>(null);
   const [mapReady, setMapReady] = useState(false);
 
   blockageRef.current = blockageGeojson;
+  blockagePropRef.current = blockageGeojson;
   routeRef.current = routeGeojson;
   detourRef.current = detour;
 
@@ -190,19 +283,34 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
     const [lat, lng] = center;
     const map = new maplibregl.Map({
       container: containerRef.current,
-      style: OSM_STYLE,
+      style: styleForBasemap(basemap),
       center: [lng, lat],
       zoom: 9,
       minZoom: 5,
       maxZoom: 19,
       dragRotate: false,
       pitchWithRotate: false,
+      pixelRatio: mapPixelRatioForBasemap(basemap),
     });
     // Make mouse-wheel zoom a bit faster/more responsive.
     map.scrollZoom.setWheelZoomRate(1 / 180);
     map.scrollZoom.setZoomRate(1.0);
     map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "top-right");
     mapRef.current = map;
+
+    const containerEl = containerRef.current;
+    const scheduleResize = () => {
+      map.resize();
+    };
+    const resizeObserver =
+      typeof ResizeObserver !== "undefined" && containerEl
+        ? new ResizeObserver(() => {
+            scheduleResize();
+          })
+        : null;
+    resizeObserver?.observe(containerEl);
+    window.addEventListener("resize", scheduleResize);
+    requestAnimationFrame(scheduleResize);
 
     const onLoad = () => {
       // Persistent sources + layers (created once)
@@ -235,10 +343,40 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
           type: "circle",
           source: SOURCE_STOPS,
           paint: {
-            "circle-radius": 6,
-            "circle-color": "#1e40af",
+            "circle-radius": [
+              "match",
+              ["get", "role"],
+              "first",
+              7,
+              "last",
+              7,
+              "both",
+              8,
+              6,
+            ],
+            "circle-color": [
+              "match",
+              ["get", "role"],
+              "first",
+              "#bbf7d0",
+              "last",
+              "#fecaca",
+              "both",
+              "#e9d5ff",
+              "#1e40af",
+            ],
             "circle-stroke-width": 2,
-            "circle-stroke-color": "#fff",
+            "circle-stroke-color": [
+              "match",
+              ["get", "role"],
+              "first",
+              "#22c55e",
+              "last",
+              "#ef4444",
+              "both",
+              "#7c3aed",
+              "#fff",
+            ],
           },
         });
       }
@@ -383,6 +521,7 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
       });
 
       setMapReady(true);
+      requestAnimationFrame(scheduleResize);
 
       detachPolygonPreview = () => {
         map.off("draw.render", syncPolygonPreviewLine);
@@ -393,12 +532,34 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
 
     map.on("load", onLoad);
     return () => {
+      resizeObserver?.disconnect();
+      window.removeEventListener("resize", scheduleResize);
       detachPolygonPreview?.();
       map.remove();
       mapRef.current = null;
       drawRef.current = null;
+      setMapReady(false);
     };
-  }, [onBlockageChange]);
+  }, [onBlockageChange, basemap]);
+
+  // After basemap remount, re-apply blockage from React state into MapboxDraw (draw is fresh).
+  useEffect(() => {
+    if (!mapReady || !drawRef.current) return;
+    const draw = drawRef.current;
+    const geom = blockagePropRef.current;
+    try {
+      draw.deleteAll();
+      if (geom) {
+        draw.add({
+          type: "Feature",
+          geometry: geom as GeoJSON.Geometry,
+          properties: {},
+        } as GeoJSON.Feature);
+      }
+    } catch {
+      /* ignore restore errors */
+    }
+  }, [mapReady, basemap]);
 
   // Route source data
   useEffect(() => {
@@ -427,12 +588,13 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
     if (!map || !mapReady) return;
     const source = map.getSource(SOURCE_STOPS) as maplibregl.GeoJSONSource | undefined;
     if (!source) return;
+    const roleByStopId = rolesForStops(stops);
     const stopsFc: GeoJSONFeatureCollection = {
       type: "FeatureCollection",
       features: stops.map((s) => ({
         type: "Feature" as const,
         geometry: { type: "Point" as const, coordinates: [s.lon, s.lat] },
-        properties: { stop_id: s.stop_id },
+        properties: { stop_id: s.stop_id, role: roleByStopId.get(s.stop_id) ?? "middle" },
       })),
     };
     source.setData(stopsFc as any);

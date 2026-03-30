@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+import sys
 from datetime import datetime
-from typing import Any
 
 
 def now_ts() -> str:
@@ -25,9 +25,7 @@ def log(tag: str, msg: str, *, flush: bool = True) -> None:
     """
     ts = now_ts()
     text = f"{ts} [{tag}] {msg}"
-    # Use plain print so this stays simple and works in scripts.
-    if flush:
-        print(text, flush=True)
-    else:
-        print(text)
+    # Write to stderr so lines show next to Uvicorn's default/error logs
+    # (uvicorn_logging.json routes those to sys.stderr, not stdout).
+    print(text, file=sys.stderr, flush=flush)
 

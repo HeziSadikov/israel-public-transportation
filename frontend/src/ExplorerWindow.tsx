@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useMemo, useState } from "react";
 import { Rnd } from "react-rnd";
 
 export type ExplorerTab = "area" | "line" | "point" | "address";
@@ -9,6 +9,8 @@ export type RouteInfo = {
   route_long_name?: string;
   agency_id?: string;
   agency_name?: string;
+  trip_count?: number | null;
+  last_stop_name?: string | null;
 };
 
 export type AreaRouteResult = {
@@ -20,7 +22,11 @@ export type AreaRouteResult = {
   agency_name?: string | null;
   first_time?: string | null;
   last_time?: string | null;
+  trip_count?: number | null;
+  last_stop_name?: string | null;
 };
+
+export type ExplorerSortBy = "line_asc" | "line_desc" | "agency_asc" | "agency_desc" | "trips_desc" | "destination_asc";
 
 export type DetourByAreaRouteResult = {
   route_id: string;
@@ -75,12 +81,29 @@ type ExplorerWindowProps = {
   addressLoading: boolean;
   onAddressSearch: () => void;
   onSelectAddressResult: (r: GeocodeResult) => void;
+  sortBy: ExplorerSortBy;
 };
 
 function getRouteResultStatus(r: DetourByAreaRouteResult): "detour" | "no-detour" | "error" {
   if (r.error) return "error";
   if (r.detour_geojson && Array.isArray(r.detour_stop_path) && r.detour_stop_path.length > 0) return "detour";
   return "no-detour";
+}
+
+/** Shown in Destination column: last stop name, else route long name. */
+export function destinationLabel(r: {
+  last_stop_name?: string | null;
+  route_long_name?: string | null;
+}): string {
+  const t = (r.last_stop_name ?? "").trim() || (r.route_long_name ?? "").trim();
+  return t || "—";
+}
+
+function destinationSortKey(r: {
+  last_stop_name?: string | null;
+  route_long_name?: string | null;
+}): string {
+  return (r.last_stop_name ?? "").trim() || (r.route_long_name ?? "").trim();
 }
 
 const TAB_LABELS: Record<ExplorerTab, string> = {
@@ -104,6 +127,64 @@ export const ExplorerWindow: React.FC<ExplorerWindowProps> = (props) => {
     }
   };
 
+  const sortedAreaRoutes = useMemo(() => {
+    const rows = [...(props.areaRoutes ?? [])];
+    const cmpText = (a: string | null | undefined, b: string | null | undefined) =>
+      (a ?? "").localeCompare(b ?? "", "he", { sensitivity: "base", numeric: true });
+    const cmpLine = (a: string | null | undefined, b: string | null | undefined) =>
+      (a ?? "").localeCompare(b ?? "", "he", { sensitivity: "base", numeric: true });
+    rows.sort((a, b) => {
+      switch (props.sortBy) {
+        case "line_desc":
+          return cmpLine(b.route_short_name ?? b.route_id, a.route_short_name ?? a.route_id);
+        case "agency_asc":
+          return cmpText(a.agency_name, b.agency_name) || cmpLine(a.route_short_name ?? a.route_id, b.route_short_name ?? b.route_id);
+        case "agency_desc":
+          return cmpText(b.agency_name, a.agency_name) || cmpLine(a.route_short_name ?? a.route_id, b.route_short_name ?? b.route_id);
+        case "trips_desc":
+          return Number(b.trip_count ?? 0) - Number(a.trip_count ?? 0) || cmpLine(a.route_short_name ?? a.route_id, b.route_short_name ?? b.route_id);
+        case "destination_asc":
+          return (
+            cmpText(destinationSortKey(a), destinationSortKey(b)) ||
+            cmpLine(a.route_short_name ?? a.route_id, b.route_short_name ?? b.route_id)
+          );
+        case "line_asc":
+        default:
+          return cmpLine(a.route_short_name ?? a.route_id, b.route_short_name ?? b.route_id);
+      }
+    });
+    return rows;
+  }, [props.areaRoutes, props.sortBy]);
+
+  const sortedLineRoutes = useMemo(() => {
+    const rows = [...props.lineSearchResults];
+    const cmpText = (a: string | null | undefined, b: string | null | undefined) =>
+      (a ?? "").localeCompare(b ?? "", "he", { sensitivity: "base", numeric: true });
+    const cmpLine = (a: string | null | undefined, b: string | null | undefined) =>
+      (a ?? "").localeCompare(b ?? "", "he", { sensitivity: "base", numeric: true });
+    rows.sort((a, b) => {
+      switch (props.sortBy) {
+        case "line_desc":
+          return cmpLine(b.route_short_name ?? b.route_id, a.route_short_name ?? a.route_id);
+        case "agency_asc":
+          return cmpText(a.agency_name, b.agency_name) || cmpLine(a.route_short_name ?? a.route_id, b.route_short_name ?? b.route_id);
+        case "agency_desc":
+          return cmpText(b.agency_name, a.agency_name) || cmpLine(a.route_short_name ?? a.route_id, b.route_short_name ?? b.route_id);
+        case "trips_desc":
+          return Number(b.trip_count ?? 0) - Number(a.trip_count ?? 0) || cmpLine(a.route_short_name ?? a.route_id, b.route_short_name ?? b.route_id);
+        case "destination_asc":
+          return (
+            cmpText(destinationSortKey(a), destinationSortKey(b)) ||
+            cmpLine(a.route_short_name ?? a.route_id, b.route_short_name ?? b.route_id)
+          );
+        case "line_asc":
+        default:
+          return cmpLine(a.route_short_name ?? a.route_id, b.route_short_name ?? b.route_id);
+      }
+    });
+    return rows;
+  }, [props.lineSearchResults, props.sortBy]);
+
   const content = (
     <div className="explorer-content">
       {props.activeTab === "area" && (
@@ -117,52 +198,72 @@ export const ExplorerWindow: React.FC<ExplorerWindowProps> = (props) => {
             {props.areaLoading ? "Searching…" : "Find lines in polygon"}
           </button>
           {props.areaRoutes && props.areaRoutes.length > 0 ? (
-            <div className="explorer-area-list">
-              {props.areaRoutes.slice(0, 100).map((r) => {
-                const key = `${r.route_id}\t${r.direction_id ?? ""}`;
-                const result = props.resultByRouteId.get(key);
-                const status = result ? getRouteResultStatus(result) : null;
-                const isSelected = props.selectedRouteId === r.route_id;
-                return (
-                  <div
-                    key={key}
-                    className={`explorer-area-row ${isSelected ? "selected" : ""}`}
-                    onClick={() => props.onSelectAreaRoute(r)}
-                    onDoubleClick={() => props.onFitToRoute()}
-                  >
-                    <div className="explorer-area-main">
-                      <strong>{r.route_short_name ?? r.route_id}</strong>
-                      {r.direction_id != null && <span className="dir"> dir {r.direction_id}</span>}
-                      {r.route_long_name && <span className="long">{r.route_long_name}</span>}
-                    </div>
-                    <div className="explorer-area-meta">
-                      {r.agency_name && <span>{r.agency_name}</span>}
-                      {r.first_time != null && r.last_time != null && (
-                        <span>{r.first_time}–{r.last_time}</span>
-                      )}
-                    </div>
-                    {status && (
-                      <span className={`badge badge-${status}`}>
-                        {status === "detour" && (result?.used_transfers ? "Detour (transfers)" : "Detour")}
-                        {status === "no-detour" && "No detour"}
-                        {status === "error" && (result?.error ?? "Error")}
-                      </span>
-                    )}
-                    <button
-                      type="button"
-                      className="btn-use-detour"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        props.onUseForDetour(r);
-                      }}
-                    >
-                      Use for route-only detour
-                    </button>
-                  </div>
-                );
-              })}
-              {props.areaRoutes.length > 100 && (
-                <p className="hint">Showing first 100 of {props.areaRoutes.length}</p>
+            <div className="lines-table-wrap">
+              <p className="lines-table-scroll-hint">Scroll horizontally to see all columns.</p>
+              <div className="explorer-results-scroll">
+                <table className="lines-table" dir="rtl">
+                  <thead>
+                    <tr>
+                      <th className="col-index">#</th>
+                      <th className="col-num">line number</th>
+                      <th className="col-operator">agency</th>
+                      <th className="col-trips">number of trips</th>
+                      <th className="col-dest">destination</th>
+                      <th className="col-route-pair">location &lt;-&gt; destination</th>
+                      <th className="col-status">status</th>
+                      <th className="col-actions">actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {sortedAreaRoutes.slice(0, 100).map((r, i) => {
+                      const key = `${r.route_id}\t${r.direction_id ?? ""}`;
+                      const result = props.resultByRouteId.get(key);
+                      const status = result ? getRouteResultStatus(result) : null;
+                      const isSelected = props.selectedRouteId === r.route_id;
+                      return (
+                        <tr
+                          key={key}
+                          className={`lines-table-row ${isSelected ? "selected" : ""}`}
+                          onClick={() => props.onSelectAreaRoute(r)}
+                          onDoubleClick={() => props.onFitToRoute()}
+                        >
+                          <td className="col-index">{i + 1}</td>
+                          <td className="col-num">{r.route_short_name ?? r.route_id}</td>
+                          <td className="col-operator" title={r.agency_name ?? ""}>{r.agency_name ?? "—"}</td>
+                          <td className="col-trips" title={r.first_time && r.last_time ? `${r.first_time}-${r.last_time}` : "Trip count in selected time window"}>
+                            {r.trip_count ?? 0}
+                          </td>
+                          <td className="col-dest" title={destinationLabel(r)}>{destinationLabel(r)}</td>
+                          <td className="col-route-pair" title={r.route_long_name ?? ""}>{r.route_long_name ?? "—"}</td>
+                          <td className="col-status">
+                            {status ? (
+                              <span className={`badge badge-${status}`}>
+                                {status === "detour" && (result?.used_transfers ? "Detour (transfers)" : "Detour")}
+                                {status === "no-detour" && "No detour"}
+                                {status === "error" && (result?.error ?? "Error")}
+                              </span>
+                            ) : "—"}
+                          </td>
+                          <td className="col-actions">
+                            <button
+                              type="button"
+                              className="btn-use-detour"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                props.onUseForDetour(r);
+                              }}
+                            >
+                              Use
+                            </button>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+              {sortedAreaRoutes.length > 100 && (
+                <p className="hint">Showing first 100 of {sortedAreaRoutes.length}</p>
               )}
             </div>
           ) : (
@@ -188,38 +289,37 @@ export const ExplorerWindow: React.FC<ExplorerWindowProps> = (props) => {
           <div className="lines-table-wrap">
             <h3 className="lines-table-title">טבלת קווים</h3>
             <p className="lines-table-hint">הקלק על שורה להצגת קו</p>
-            <table className="lines-table" dir="rtl">
-              <thead>
-                <tr>
-                  <th className="col-index">#</th>
-                  <th className="col-num">קו</th>
-                  <th className="col-code">מקט הקו</th>
-                  <th className="col-id">מזהה</th>
-                  <th className="col-operator">מפעיל</th>
-                  <th className="col-trips">נס&apos;</th>
-                  <th className="col-dest">יעד</th>
-                  <th className="col-desc">תיאור הקו</th>
-                </tr>
-              </thead>
-              <tbody>
-                {props.lineSearchResults.map((r, i) => (
-                  <tr
-                    key={r.route_id}
-                    className="lines-table-row"
-                    onClick={() => props.onSelectLineRoute(r)}
-                  >
-                    <td className="col-index">{i}</td>
-                    <td className="col-num">{r.route_short_name ?? r.route_id}</td>
-                    <td className="col-code">{r.route_id}</td>
-                    <td className="col-id">{r.route_id}</td>
-                    <td className="col-operator">{r.agency_name ?? "—"}</td>
-                    <td className="col-trips">—</td>
-                    <td className="col-dest">{r.route_long_name ?? "—"}</td>
-                    <td className="col-desc">{r.route_long_name ?? r.route_short_name ?? r.route_id}</td>
+            <p className="lines-table-scroll-hint">Scroll horizontally to see all columns.</p>
+            <div className="explorer-results-scroll">
+              <table className="lines-table" dir="rtl">
+                <thead>
+                  <tr>
+                    <th className="col-index">#</th>
+                    <th className="col-num">line number</th>
+                    <th className="col-operator">agency</th>
+                    <th className="col-trips">number of trips</th>
+                    <th className="col-dest">destination</th>
+                    <th className="col-route-pair">location &lt;-&gt; destination</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
+                </thead>
+                <tbody>
+                  {sortedLineRoutes.map((r, i) => (
+                    <tr
+                      key={r.route_id}
+                      className="lines-table-row"
+                      onClick={() => props.onSelectLineRoute(r)}
+                    >
+                      <td className="col-index">{i + 1}</td>
+                      <td className="col-num">{r.route_short_name ?? r.route_id}</td>
+                      <td className="col-operator" title={r.agency_name ?? ""}>{r.agency_name ?? "—"}</td>
+                      <td className="col-trips">{r.trip_count ?? 0}</td>
+                      <td className="col-dest" title={destinationLabel(r)}>{destinationLabel(r)}</td>
+                      <td className="col-route-pair" title={r.route_long_name ?? ""}>{r.route_long_name ?? "—"}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
           </div>
         </div>
       )}
@@ -319,7 +419,7 @@ export const ExplorerWindow: React.FC<ExplorerWindowProps> = (props) => {
       }}
       minWidth={280}
       minHeight={200}
-      maxWidth={600}
+      maxWidth={1000}
       maxHeight={80 * (typeof window !== "undefined" ? window.innerHeight / 100 : 80)}
       dragHandleClassName="explorer-header"
       bounds="parent"

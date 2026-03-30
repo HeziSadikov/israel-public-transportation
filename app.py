@@ -550,10 +550,27 @@ def routes_search(req: RouteSearchRequest):
     q = req.q.strip()
     if not q:
         return []
+    start_sec = None
+    end_sec = None
+    date_ymd = None
+    if req.date:
+        d = str(req.date).strip()
+        if not (len(d) == 8 and d.isdigit()):
+            raise HTTPException(status_code=400, detail="date must be YYYYMMDD")
+        date_ymd = d
+        start_sec = _parse_hhmm_to_seconds((req.start_time or "04:00").strip())
+        end_sec = _parse_hhmm_to_seconds((req.end_time or "23:59").strip())
+        if end_sec < start_sec:
+            raise HTTPException(status_code=400, detail="end_time must be greater than or equal to start_time")
     try:
-        rows = db_access_module.search_routes_pg(q, req.limit)
+        rows = db_access_module.search_routes_pg(q, req.limit, date_ymd, start_sec, end_sec)
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Could not search routes in PostGIS: {e}")
+    log(
+        "routes/search",
+        f"q={q!r} limit={req.limit} rows={len(rows)}"
+        + (f" window={date_ymd}" if date_ymd else ""),
+    )
     results: list[RouteInfo] = []
     for row in rows:
         route_type_val = None
@@ -570,6 +587,8 @@ def routes_search(req: RouteSearchRequest):
                 agency_id=row.get("agency_id"),
                 agency_name=row.get("agency_name"),
                 route_type=route_type_val,
+                trip_count=row.get("trip_count"),
+                last_stop_name=row.get("last_stop_name"),
             )
         )
     return results
@@ -2193,6 +2212,8 @@ def area_routes(req: AreaRoutesQuery):
                 agency_name=r.get("agency_name"),
                 first_time=_fmt_time(r.get("first_time_s")),
                 last_time=_fmt_time(r.get("last_time_s")),
+                trip_count=r.get("trip_count"),
+                last_stop_name=r.get("last_stop_name"),
             )
         )
 
@@ -2208,6 +2229,10 @@ def area_routes(req: AreaRoutesQuery):
     if req.max_results and len(results) > req.max_results:
         results = results[: req.max_results]
 
+    log(
+        "area/routes",
+        f"date={req.date} window={req.start_time}-{req.end_time} routes={len(results)}",
+    )
     return AreaRoutesResponse(routes=results)
 
 
