@@ -72,6 +72,9 @@ CREATE TABLE IF NOT EXISTS trips (
 CREATE INDEX IF NOT EXISTS idx_trips_route_dir_svc
     ON trips(feed_id, route_id, direction_id, service_id);
 
+CREATE INDEX IF NOT EXISTS idx_trips_feed_trip_service_route_dir
+    ON trips(feed_id, trip_id, service_id, route_id, direction_id);
+
 CREATE TABLE IF NOT EXISTS stop_times (
     feed_id             INT REFERENCES feed_versions(id) ON DELETE CASCADE,
     id                  BIGSERIAL PRIMARY KEY,
@@ -87,6 +90,9 @@ CREATE TABLE IF NOT EXISTS stop_times (
 
 CREATE INDEX IF NOT EXISTS idx_stop_times_trip_seq
     ON stop_times(feed_id, trip_id, stop_sequence);
+
+CREATE INDEX IF NOT EXISTS idx_stop_times_feed_stop_trip
+    ON stop_times(feed_id, stop_id, trip_id);
 
 CREATE TABLE IF NOT EXISTS calendar (
     feed_id     INT REFERENCES feed_versions(id) ON DELETE CASCADE,

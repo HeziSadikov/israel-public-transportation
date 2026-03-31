@@ -21,6 +21,11 @@
       "formatter": "default",
       "stream": "ext://sys.stderr"
     },
+    "app": {
+      "class": "logging.StreamHandler",
+      "formatter": "default",
+      "stream": "ext://sys.stdout"
+    },
     "access": {
       "class": "logging.StreamHandler",
       "formatter": "access",
@@ -40,6 +45,16 @@
     },
     "uvicorn.access": {
       "handlers": ["access"],
+      "level": "INFO",
+      "propagate": false
+    },
+    "app.action": {
+      "handlers": ["app"],
+      "level": "INFO",
+      "propagate": false
+    },
+    "backend": {
+      "handlers": ["app"],
       "level": "INFO",
       "propagate": false
     }

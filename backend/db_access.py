@@ -30,6 +30,11 @@ from psycopg2.extras import DictCursor
 # For backward compatibility with the existing Windows setup, fall back to
 # the previous localhost DSN if the env var is not set.
 DB_URL = os.getenv("DATABASE_URL", "postgresql://postgres@localhost:5432/israel_gtfs")
+STOP_ROUTES_STATEMENT_TIMEOUT_MS = int(os.getenv("STOP_ROUTES_STATEMENT_TIMEOUT_MS", "90000"))
+
+
+class StopRoutesQueryTimeoutError(RuntimeError):
+    pass
 
 
 def _get_conn():
@@ -1012,6 +1017,98 @@ def get_stops_in_bounds_pg(
             conn.close()
 
 
+def search_stops_pg(
+    q: str,
+    limit: int = 20,
+    conn=None,
+) -> List[Dict[str, Any]]:
+    """
+    Search active-feed stops by stop name, stop code, or stop_id.
+    Ranking: code/id prefix first, then name prefix, then contains.
+    """
+    query = (q or "").strip()
+    if not query:
+        return []
+    close = False
+    if conn is None:
+        conn = _get_conn()
+        close = True
+    try:
+        feed_id = get_active_feed_id(conn)
+        prefix = f"{query}%"
+        contains = f"%{query}%"
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT EXISTS (
+                  SELECT 1
+                  FROM information_schema.columns
+                  WHERE table_schema = current_schema()
+                    AND table_name = 'stops'
+                    AND column_name = 'stop_code'
+                ) AS has_stop_code
+                """
+            )
+            has_stop_code = bool((cur.fetchone() or {}).get("has_stop_code"))
+
+            if has_stop_code:
+                cur.execute(
+                    """
+                    SELECT stop_id, name, stop_code, lat, lon
+                    FROM stops
+                    WHERE feed_id = %s
+                      AND (
+                        name ILIKE %s
+                        OR COALESCE(stop_code, '') ILIKE %s
+                        OR stop_id ILIKE %s
+                      )
+                    ORDER BY
+                      CASE
+                        WHEN COALESCE(stop_code, '') ILIKE %s OR stop_id ILIKE %s THEN 0
+                        WHEN name ILIKE %s THEN 1
+                        ELSE 2
+                      END,
+                      name ASC
+                    LIMIT %s
+                    """,
+                    (feed_id, contains, contains, contains, prefix, prefix, prefix, max(1, int(limit))),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT stop_id, name, NULL::text AS stop_code, lat, lon
+                    FROM stops
+                    WHERE feed_id = %s
+                      AND (
+                        name ILIKE %s
+                        OR stop_id ILIKE %s
+                      )
+                    ORDER BY
+                      CASE
+                        WHEN stop_id ILIKE %s THEN 0
+                        WHEN name ILIKE %s THEN 1
+                        ELSE 2
+                      END,
+                      name ASC
+                    LIMIT %s
+                    """,
+                    (feed_id, contains, contains, prefix, prefix, max(1, int(limit))),
+                )
+            return [
+                {
+                    "stop_id": r["stop_id"],
+                    "stop_name": r["name"],
+                    "stop_code": r.get("stop_code"),
+                    "stop_lat": float(r["lat"]),
+                    "stop_lon": float(r["lon"]),
+                }
+                for r in cur.fetchall()
+            ]
+    finally:
+        if close:
+            conn.close()
+
+
 def get_trip_time_bounds_pg(conn=None) -> Dict[str, Tuple[int, int]]:
     """
     Return trip_id -> (first_sec, last_sec) from PostGIS trip_time_bounds for the active feed.
@@ -1109,6 +1206,11 @@ def get_routes_serving_stop_pg(
     try:
         feed_id = get_active_feed_id(conn)
         with conn.cursor() as cur:
+            # Guardrail: avoid long-running stop query hanging the API call.
+            # Helpful DB indexes for large feeds:
+            #   stop_times(feed_id, stop_id, trip_id)
+            #   trips(feed_id, trip_id, service_id, route_id, direction_id)
+            cur.execute("SET LOCAL statement_timeout = %s", (STOP_ROUTES_STATEMENT_TIMEOUT_MS,))
             cur.execute(
                 """
                 WITH dow AS (
@@ -1144,21 +1246,27 @@ def get_routes_serving_stop_pg(
                     EXCEPT
                     SELECT service_id FROM remove_services
                 ),
-                stop_sec AS (
+                stop_filtered AS (
                     SELECT
                         st.trip_id,
-                        t.route_id,
-                        t.direction_id,
-                        (split_part(trim(coalesce(st.departure_time, st.arrival_time, '')), ':', 1)::int * 3600
-                         + split_part(trim(coalesce(st.departure_time, st.arrival_time, '')), ':', 2)::int * 60
-                         + coalesce(nullif(trim(split_part(trim(coalesce(st.departure_time, st.arrival_time, '0:0:0')), ':', 3)), ''), '0')::int
-                        ) AS sec
+                        trim(coalesce(st.departure_time, st.arrival_time, '')) AS dep_time_raw
                     FROM stop_times st
-                    JOIN trips t ON t.feed_id = st.feed_id AND t.trip_id = st.trip_id
-                    JOIN active_services a ON a.service_id = t.service_id
                     WHERE st.feed_id = %s
                       AND st.stop_id = %s
                       AND length(trim(coalesce(st.departure_time, st.arrival_time, ''))) >= 5
+                ),
+                stop_sec AS (
+                    SELECT
+                        sf.trip_id,
+                        t.route_id,
+                        t.direction_id,
+                        (split_part(sf.dep_time_raw, ':', 1)::int * 3600
+                         + split_part(sf.dep_time_raw, ':', 2)::int * 60
+                         + coalesce(nullif(trim(split_part(sf.dep_time_raw, ':', 3)), ''), '0')::int
+                        ) AS sec
+                    FROM stop_filtered sf
+                    JOIN trips t ON t.feed_id = %s AND t.trip_id = sf.trip_id
+                    JOIN active_services a ON a.service_id = t.service_id
                 ),
                 in_window AS (
                     SELECT route_id, direction_id, min(sec) AS first_sec, max(sec) AS last_sec
@@ -1191,6 +1299,7 @@ def get_routes_serving_stop_pg(
                     date_ymd,
                     feed_id,
                     stop_id,
+                    feed_id,
                     start_sec,
                     end_sec,
                     feed_id,
@@ -1217,6 +1326,10 @@ def get_routes_serving_stop_pg(
                 }
             )
         return results
+    except psycopg2.errors.QueryCanceled as e:
+        raise StopRoutesQueryTimeoutError(
+            f"Stop routes query timed out after {STOP_ROUTES_STATEMENT_TIMEOUT_MS}ms"
+        ) from e
     finally:
         if close:
             conn.close()

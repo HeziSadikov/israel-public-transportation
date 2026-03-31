@@ -219,12 +219,13 @@ export type MapLibreMapHandle = {
 export type MapLibreMapProps = {
   /** Center as [lat, lng] (converted to [lng, lat] for MapLibre) */
   center: [number, number];
-  stops: { stop_id: string; name: string; lat: number; lon: number; sequence: number }[];
+  stops: { stop_id: string; name: string; stop_code?: string | null; lat: number; lon: number; sequence: number }[];
   routeGeojson: GeoJSON.FeatureCollection | null;
   detour: { path_geojson?: GeoJSON.FeatureCollection | null } | null;
   blockageGeojson: GeoJSON.Geometry | null;
   onBlockageChange: (geom: GeoJSON.Geometry | null) => void;
   pinPosition: [number, number] | null;
+  onStopClick?: (stop: { stop_id: string; stop_name?: string; stop_code?: string | null; lat: number; lon: number }) => void;
   /** Basemap: OSM raster, minimal Carto raster, or vector (OpenFreeMap Liberty). */
   basemap?: BasemapKind;
 };
@@ -260,7 +261,7 @@ function rolesForStops(stops: MapLibreMapProps["stops"]): Map<string, StopRole> 
 }
 
 const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(function MapLibreMap(
-  { center, stops, routeGeojson, detour, blockageGeojson, onBlockageChange, pinPosition, basemap = "osm" },
+  { center, stops, routeGeojson, detour, blockageGeojson, onBlockageChange, pinPosition, onStopClick, basemap = "osm" },
   ref
 ) {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -270,12 +271,14 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
   const routeRef = useRef<GeoJSON.FeatureCollection | null>(null);
   const detourRef = useRef<MapLibreMapProps["detour"]>(null);
   const blockagePropRef = useRef<GeoJSON.Geometry | null>(null);
+  const onStopClickRef = useRef<MapLibreMapProps["onStopClick"]>(undefined);
   const [mapReady, setMapReady] = useState(false);
 
   blockageRef.current = blockageGeojson;
   blockagePropRef.current = blockageGeojson;
   routeRef.current = routeGeojson;
   detourRef.current = detour;
+  onStopClickRef.current = onStopClick;
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -380,6 +383,30 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
           },
         });
       }
+
+      map.on("click", "stops-circles", (e) => {
+        const f = e.features?.[0];
+        const p = (f?.properties || {}) as Record<string, unknown>;
+        const geom = f?.geometry;
+        if (!geom || geom.type !== "Point") return;
+        const coords = geom.coordinates as number[];
+        if (!Array.isArray(coords) || coords.length < 2) return;
+        const stopId = typeof p.stop_id === "string" ? p.stop_id : "";
+        if (!stopId) return;
+        onStopClickRef.current?.({
+          stop_id: stopId,
+          stop_name: typeof p.stop_name === "string" ? p.stop_name : undefined,
+          stop_code: typeof p.stop_code === "string" ? p.stop_code : null,
+          lat: Number(coords[1]),
+          lon: Number(coords[0]),
+        });
+      });
+      map.on("mouseenter", "stops-circles", () => {
+        map.getCanvas().style.cursor = "pointer";
+      });
+      map.on("mouseleave", "stops-circles", () => {
+        map.getCanvas().style.cursor = "";
+      });
 
       if (!map.getSource(SOURCE_PIN)) {
         map.addSource(SOURCE_PIN, { type: "geojson", data: emptyFc });
@@ -594,7 +621,12 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
       features: stops.map((s) => ({
         type: "Feature" as const,
         geometry: { type: "Point" as const, coordinates: [s.lon, s.lat] },
-        properties: { stop_id: s.stop_id, role: roleByStopId.get(s.stop_id) ?? "middle" },
+        properties: {
+          stop_id: s.stop_id,
+          stop_name: s.name,
+          stop_code: s.stop_code ?? null,
+          role: roleByStopId.get(s.stop_id) ?? "middle",
+        },
       })),
     };
     source.setData(stopsFc as any);

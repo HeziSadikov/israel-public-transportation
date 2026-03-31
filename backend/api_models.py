@@ -172,6 +172,14 @@ class StopInBounds(BaseModel):
     stop_lon: float
 
 
+class StopSearchResult(BaseModel):
+    stop_id: str
+    stop_name: Optional[str] = None
+    stop_code: Optional[str] = None
+    stop_lat: float
+    stop_lon: float
+
+
 class StopRoutesRequest(BaseModel):
     stop_id: str
     date: str  # YYYYMMDD

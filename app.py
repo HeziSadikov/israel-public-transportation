@@ -44,6 +44,7 @@ from backend.api_models import (
     StopRoutesRequest,
     StopRoutesResponse,
     StopRouteResult,
+    StopSearchResult,
     DetourByAreaRequest,
     DetourByAreaResponse,
     DetourByAreaRouteResult,
@@ -54,6 +55,7 @@ from backend.config import (
     GRAPH_CACHE,
     GRAPH_CACHE_DIR,
     GRAPH_WARMUP_ENABLED,
+    GRAPH_WARMUP_LOG_PROGRESS,
     GRAPH_WARMUP_TIMEOUT_S,
     GRAPH_WARMUP_PROFILES,
     GRAPH_WARMUP_PREVIEWS_ENABLED,
@@ -164,7 +166,7 @@ def _warmup_route_previews(
             items_seen = 0
             for (route_id, direction_id), (sig_db, _pat_id, blob) in bulk.items():
                 items_seen += 1
-                if items_seen % 500 == 0:
+                if GRAPH_WARMUP_LOG_PROGRESS and items_seen % 500 == 0:
                     elapsed_s = round(time.time() - started, 3)
                     log(
                         "graph/cache/warmup",
@@ -390,7 +392,7 @@ def _run_graph_cache_warmup(
                 log("graph/cache/warmup", "phase=hydrate_memory_graph_cache timeout_reached")
                 break
             last_progress_log += 1
-            if last_progress_log >= 250:
+            if GRAPH_WARMUP_LOG_PROGRESS and last_progress_log >= 250:
                 last_progress_log = 0
                 elapsed_s = round(time.time() - started, 3)
                 log(
@@ -545,6 +547,22 @@ def stops_in_bounds(
     return [StopInBounds(**s) for s in stops]
 
 
+@app.get("/stops/search", response_model=list[StopSearchResult])
+def stops_search(
+    q: str,
+    limit: int = 20,
+):
+    """Search stops by name/code/id in the active feed."""
+    q = (q or "").strip()
+    if len(q) < 2:
+        return []
+    try:
+        rows = db_access_module.search_stops_pg(q=q, limit=max(1, min(limit, 100)))
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Could not search stops in PostGIS: {e}")
+    return [StopSearchResult(**r) for r in rows]
+
+
 @app.post("/routes/search", response_model=list[RouteInfo])
 def routes_search(req: RouteSearchRequest):
     q = req.q.strip()
@@ -565,6 +583,7 @@ def routes_search(req: RouteSearchRequest):
     try:
         rows = db_access_module.search_routes_pg(q, req.limit, date_ymd, start_sec, end_sec)
     except Exception as e:
+        log("routes/search", f"error q={q!r} reason={e!s}")
         raise HTTPException(status_code=503, detail=f"Could not search routes in PostGIS: {e}")
     log(
         "routes/search",
@@ -906,6 +925,11 @@ def graph_build(req: GraphBuildRequest, response: Response):
         response.headers["X-Elapsed-Ms"] = f"{elapsed:.1f}"
         response.headers["X-Cache-Hit"] = cache_hit
         response.headers["X-Graph-Cache-Hit"] = cache_hit
+        log(
+            "graph/build",
+            f"error route_id={req.route_id} dir={req.direction_id} hit={cache_hit} "
+            f"elapsed_ms={elapsed:.1f} reason={e!s}",
+        )
         raise HTTPException(
             status_code=500,
             detail=f"Graph build failed: {e!s}",
@@ -1079,6 +1103,11 @@ def detour(req: DetourRequest):
             cache_key_used = key
             break
     if cache is None:
+        log(
+            "detour",
+            f"error route_id={req.route_id!r}, direction_id={req.direction_id!r}, "
+            "reason=graph_cache_miss",
+        )
         raise HTTPException(
             status_code=400,
             detail="Graph not built yet; call /graph/build first.",
@@ -1117,6 +1146,11 @@ def detour(req: DetourRequest):
             )
         )
     except DetourComputeError as e:
+        log(
+            "detour",
+            f"error route_id={req.route_id!r}, direction_id={req.direction_id!r}, "
+            f"status_code={e.status_code} reason={e.detail!r}",
+        )
         raise HTTPException(status_code=e.status_code, detail=e.detail)
 
     log(
@@ -1550,10 +1584,12 @@ def graph_preview(
     try:
         feed_id = db_access_module.get_active_feed_id()
     except Exception as e:
+        log("graph/preview", f"error route_id={route_id} dir={direction_id} reason=active_feed_lookup_failed error={e!s}")
         raise HTTPException(status_code=503, detail=f"Could not resolve active feed: {e!s}")
     feed_version = f"postgis-{feed_id}"
     sig_hash = _resolve_route_sig_hash(feed_id, route_id, direction_id)
     if not sig_hash:
+        log("graph/preview", f"error route_id={route_id} dir={direction_id} reason=route_signature_missing")
         raise HTTPException(status_code=409, detail="Could not resolve route signature for preview cache.")
 
     preview_mem_key = _preview_mem_key(
@@ -1652,6 +1688,11 @@ def graph_preview(
                     break
 
     if not cache:
+        log(
+            "graph/preview",
+            f"error route_id={route_id} dir={direction_id} reason=preview_cache_miss_after_fallback "
+            f"graph_hit={graph_cache_hit}",
+        )
         raise HTTPException(status_code=400, detail="Preview cache miss and graph fallback failed.")
 
     preview = _build_preview_payload_from_cache_entry(cache)
@@ -2375,6 +2416,11 @@ def stop_routes(req: StopRoutesRequest):
             start_sec=start_sec,
             end_sec=end_sec,
             max_results=req.max_results,
+        )
+    except db_access_module.StopRoutesQueryTimeoutError as e:
+        raise HTTPException(
+            status_code=504,
+            detail=f"{e}. Search took too long on the backend; please try again shortly.",
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Stop routes failed: {e}")

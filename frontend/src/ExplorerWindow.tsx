@@ -1,7 +1,7 @@
 import React, { useMemo, useState } from "react";
 import { Rnd } from "react-rnd";
 
-export type ExplorerTab = "area" | "line" | "point" | "address";
+export type ExplorerTab = "area" | "line" | "point" | "address" | "stop";
 
 export type RouteInfo = {
   route_id: string;
@@ -44,11 +44,28 @@ export type GeocodeResult = {
   place_id?: number;
 };
 
+export type SelectedStopInfo = {
+  stop_id: string;
+  stop_name?: string;
+  stop_code?: string | null;
+  lat?: number;
+  lon?: number;
+};
+
+export type StopLineResult = {
+  route_id: string;
+  direction_id?: string | null;
+  route_short_name?: string | null;
+  route_long_name?: string | null;
+  agency_name?: string | null;
+  first_time?: string | null;
+  last_time?: string | null;
+};
+
 type ExplorerWindowProps = {
   activeTab: ExplorerTab;
   onTabChange: (tab: ExplorerTab) => void;
   isOpen: boolean;
-  isMinimized: boolean;
   onMinimize: () => void;
   onClose: () => void;
   position: { x: number; y: number };
@@ -81,6 +98,20 @@ type ExplorerWindowProps = {
   addressLoading: boolean;
   onAddressSearch: () => void;
   onSelectAddressResult: (r: GeocodeResult) => void;
+  // Stop tab
+  stopSearchQuery: string;
+  onStopSearchQueryChange: (q: string) => void;
+  stopSearchResults: SelectedStopInfo[];
+  stopSearchLoading: boolean;
+  stopSearchError: string | null;
+  onSelectStopResult: (s: SelectedStopInfo) => void;
+  selectedStop: SelectedStopInfo | null;
+  stopLinesLoading: boolean;
+  stopLinesResults: StopLineResult[];
+  stopLinesError: string | null;
+  stopLinesHint: string | null;
+  onSearchLinesInStop: () => void;
+  onSelectStopLineRoute: (r: StopLineResult) => void;
   sortBy: ExplorerSortBy;
 };
 
@@ -111,6 +142,7 @@ const TAB_LABELS: Record<ExplorerTab, string> = {
   line: "Line",
   point: "Point",
   address: "Address",
+  stop: "Stop",
 };
 
 export const ExplorerWindow: React.FC<ExplorerWindowProps> = (props) => {
@@ -377,6 +409,111 @@ export const ExplorerWindow: React.FC<ExplorerWindowProps> = (props) => {
           </div>
         </div>
       )}
+
+      {props.activeTab === "stop" && (
+        <div className="explorer-tab-stop">
+          <div className="row">
+            <input
+              type="text"
+              value={props.stopSearchQuery}
+              onChange={(e) => props.onStopSearchQueryChange(e.target.value)}
+              placeholder="Search stop by name, code, or ID…"
+            />
+          </div>
+          {props.stopSearchLoading && <p className="hint">Searching stops…</p>}
+          {!props.stopSearchLoading && props.stopSearchError && <p className="hint">{props.stopSearchError}</p>}
+          <div className="explorer-stop-list">
+            {props.stopSearchResults.length > 0 ? (
+              props.stopSearchResults.slice(0, 50).map((s) => (
+                <div
+                  key={`${s.stop_id}:${s.lat ?? ""}:${s.lon ?? ""}`}
+                  className={`explorer-stop-row ${
+                    props.selectedStop?.stop_id === s.stop_id ? "selected" : ""
+                  }`}
+                  onClick={() => props.onSelectStopResult(s)}
+                >
+                  <div className="explorer-stop-main">{s.stop_name || "Unnamed stop"}</div>
+                  <div className="explorer-stop-meta">
+                    <span>Code: {s.stop_code || "N/A"}</span>
+                    <span>ID: {s.stop_id}</span>
+                  </div>
+                </div>
+              ))
+            ) : props.stopSearchQuery.trim().length >= 2 && !props.stopSearchLoading ? (
+              <p className="hint">No matching stops.</p>
+            ) : (
+              <p className="hint">
+                Type at least 2 characters to search by stop name, code, or ID.
+              </p>
+            )}
+          </div>
+          <div className="explorer-stop-selected-card">
+            <h3>Selected stop</h3>
+            {props.selectedStop ? (
+              <>
+                <p>
+                  <strong>Name:</strong> {props.selectedStop.stop_name || "Unnamed stop"}
+                </p>
+                <p>
+                  <strong>Stop number (code):</strong> {props.selectedStop.stop_code || "N/A"}
+                </p>
+                <p>
+                  <strong>Stop ID:</strong> {props.selectedStop.stop_id}
+                </p>
+              </>
+            ) : (
+              <p className="hint">Click a stop on the map or choose one from the list.</p>
+            )}
+            <button
+              type="button"
+              className="btn-stop-lines"
+              onClick={props.onSearchLinesInStop}
+              disabled={!props.selectedStop || props.stopLinesLoading}
+            >
+              {props.stopLinesLoading ? "Searching…" : "Search lines in stop"}
+            </button>
+          </div>
+          {props.stopLinesHint && <p className="hint">{props.stopLinesHint}</p>}
+          {props.stopLinesError && <p className="hint">{props.stopLinesError}</p>}
+          <div className="lines-table-wrap">
+            {props.stopLinesResults.length > 0 ? (
+              <>
+                <p className="lines-table-scroll-hint">Scroll horizontally to see all columns.</p>
+                <div className="explorer-results-scroll">
+                  <table className="lines-table" dir="rtl">
+                    <thead>
+                      <tr>
+                        <th className="col-index">#</th>
+                        <th className="col-num">line number</th>
+                        <th className="col-operator">agency</th>
+                        <th className="col-dest">destination</th>
+                        <th className="col-route-pair">time window</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {props.stopLinesResults.map((r, i) => (
+                        <tr
+                          key={`${r.route_id}:${r.direction_id ?? ""}:${i}`}
+                          className="lines-table-row"
+                          onClick={() => props.onSelectStopLineRoute(r)}
+                        >
+                          <td className="col-index">{i + 1}</td>
+                          <td className="col-num">{r.route_short_name ?? r.route_id}</td>
+                          <td className="col-operator">{r.agency_name ?? "—"}</td>
+                          <td className="col-dest">{destinationLabel({ route_long_name: r.route_long_name })}</td>
+                          <td className="col-route-pair">{r.first_time && r.last_time ? `${r.first_time}-${r.last_time}` : "—"}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </>
+            ) : (
+              <p className="hint">No lines loaded for this stop yet.</p>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 
@@ -395,7 +532,7 @@ export const ExplorerWindow: React.FC<ExplorerWindowProps> = (props) => {
         ))}
       </div>
       <div className="explorer-header-actions" onPointerDown={(e) => e.stopPropagation()}>
-        <button type="button" className="btn-icon" onClick={props.onMinimize} title="Collapse">
+        <button type="button" className="btn-icon" onClick={props.onMinimize} title="Hide explorer">
           −
         </button>
         <button type="button" className="btn-icon" onClick={props.onClose} title="Close">
@@ -404,8 +541,6 @@ export const ExplorerWindow: React.FC<ExplorerWindowProps> = (props) => {
       </div>
     </div>
   );
-
-  const body = props.isMinimized ? null : content;
 
   return (
     <Rnd
@@ -423,11 +558,11 @@ export const ExplorerWindow: React.FC<ExplorerWindowProps> = (props) => {
       maxHeight={80 * (typeof window !== "undefined" ? window.innerHeight / 100 : 80)}
       dragHandleClassName="explorer-header"
       bounds="parent"
-      enableResizing={!props.isMinimized}
+      enableResizing
     >
       <div className="explorer-window">
         {header}
-        {body}
+        {content}
       </div>
     </Rnd>
   );
