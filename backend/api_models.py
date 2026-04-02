@@ -9,8 +9,9 @@ from pydantic import BaseModel, Field
 class RouteSearchRequest(BaseModel):
     q: str
     limit: int = 20
-    date: Optional[str] = None  # YYYYMMDD
+    start_date: Optional[str] = None  # YYYYMMDD
     start_time: Optional[str] = None  # HH:MM or HH:MM:SS
+    end_date: Optional[str] = None  # YYYYMMDD
     end_time: Optional[str] = None  # HH:MM or HH:MM:SS
 
 
@@ -101,8 +102,9 @@ class DetourResponse(BaseModel):
 
 
 class AreaRoutesQuery(BaseModel):
-    date: str  # YYYYMMDD
+    start_date: str  # YYYYMMDD
     start_time: str  # HH:MM or HH:MM:SS
+    end_date: str  # YYYYMMDD
     end_time: str  # HH:MM or HH:MM:SS
     polygon_geojson: Dict[str, Any]
     max_results: int = Field(default=100, ge=1)
@@ -134,8 +136,9 @@ class DetourByAreaRequest(BaseModel):
     mode: DetourByAreaMode
     route_id: Optional[str] = None  # required when mode=route
     direction_id: Optional[str] = None
-    date: str  # YYYYMMDD
+    start_date: str  # YYYYMMDD
     start_time: str  # HH:MM or HH:MM:SS
+    end_date: str  # YYYYMMDD
     end_time: str  # HH:MM or HH:MM:SS
     blockage_geojson: Dict[str, Any]
     max_routes: int = Field(default=20, ge=1)
@@ -182,8 +185,9 @@ class StopSearchResult(BaseModel):
 
 class StopRoutesRequest(BaseModel):
     stop_id: str
-    date: str  # YYYYMMDD
+    start_date: str  # YYYYMMDD
     start_time: str  # HH:MM or HH:MM:SS
+    end_date: str  # YYYYMMDD
     end_time: str  # HH:MM or HH:MM:SS
     max_results: int = Field(default=100, ge=1, le=500)
 

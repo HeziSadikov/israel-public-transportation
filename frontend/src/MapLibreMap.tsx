@@ -27,19 +27,17 @@ const RASTER_BASEMAP_PAINT: maplibregl.RasterLayerSpecification["paint"] = {
 };
 
 export type BasemapKind = "osm" | "carto_light" | "vector_liberty";
+const BASEMAP_RASTER_SOURCE = "basemap-raster-source";
+const BASEMAP_RASTER_LAYER = "basemap-raster";
 
 /** OpenFreeMap Liberty — vector tiles, crisp at all zooms (separate CDN; check terms for production). */
 const OPENFREEMAP_LIBERTY_STYLE = "https://tiles.openfreemap.org/styles/liberty";
 
-function rasterStyle(
-  sourceId: string,
-  tiles: string[],
-  attribution: string
-): maplibregl.StyleSpecification {
+function rasterStyle(tiles: string[], attribution: string): maplibregl.StyleSpecification {
   return {
     version: 8,
     sources: {
-      [sourceId]: {
+      [BASEMAP_RASTER_SOURCE]: {
         type: "raster",
         tiles,
         tileSize: 256,
@@ -49,20 +47,19 @@ function rasterStyle(
     },
     layers: [
       {
-        id: "basemap-raster",
+        id: BASEMAP_RASTER_LAYER,
         type: "raster",
-        source: sourceId,
+        source: BASEMAP_RASTER_SOURCE,
         paint: RASTER_BASEMAP_PAINT,
       },
     ],
   };
 }
 
-const OSM_STYLE = rasterStyle("osm", ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"], "© OpenStreetMap");
+const OSM_STYLE = rasterStyle(["https://tile.openstreetmap.org/{z}/{x}/{y}.png"], "© OpenStreetMap");
 
 /** Carto Positron-style light raster — less visual noise than full OSM. */
 const CARTO_LIGHT_STYLE = rasterStyle(
-  "carto",
   [
     "https://a.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png",
     "https://b.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png",
@@ -75,6 +72,21 @@ function styleForBasemap(kind: BasemapKind): string | maplibregl.StyleSpecificat
   if (kind === "vector_liberty") return OPENFREEMAP_LIBERTY_STYLE;
   if (kind === "carto_light") return CARTO_LIGHT_STYLE;
   return OSM_STYLE;
+}
+
+function isRasterBasemap(kind: BasemapKind): boolean {
+  return kind === "osm" || kind === "carto_light";
+}
+
+function rasterTilesForBasemap(kind: BasemapKind): string[] {
+  if (kind === "carto_light") {
+    return [
+      "https://a.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png",
+      "https://b.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png",
+      "https://c.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png",
+    ];
+  }
+  return ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"];
 }
 
 /**
@@ -225,7 +237,15 @@ export type MapLibreMapProps = {
   blockageGeojson: GeoJSON.Geometry | null;
   onBlockageChange: (geom: GeoJSON.Geometry | null) => void;
   pinPosition: [number, number] | null;
+  selectedStopId?: string | null;
   onStopClick?: (stop: { stop_id: string; stop_name?: string; stop_code?: string | null; lat: number; lon: number }) => void;
+  onStopOpenInExplorer?: (stop: {
+    stop_id: string;
+    stop_name?: string;
+    stop_code?: string | null;
+    lat: number;
+    lon: number;
+  }) => void;
   /** Basemap: OSM raster, minimal Carto raster, or vector (OpenFreeMap Liberty). */
   basemap?: BasemapKind;
 };
@@ -261,7 +281,19 @@ function rolesForStops(stops: MapLibreMapProps["stops"]): Map<string, StopRole> 
 }
 
 const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(function MapLibreMap(
-  { center, stops, routeGeojson, detour, blockageGeojson, onBlockageChange, pinPosition, onStopClick, basemap = "osm" },
+  {
+    center,
+    stops,
+    routeGeojson,
+    detour,
+    blockageGeojson,
+    onBlockageChange,
+    pinPosition,
+    selectedStopId = null,
+    onStopClick,
+    onStopOpenInExplorer,
+    basemap = "osm",
+  },
   ref
 ) {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -270,30 +302,45 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
   const blockageRef = useRef<GeoJSON.Geometry | null>(null);
   const routeRef = useRef<GeoJSON.FeatureCollection | null>(null);
   const detourRef = useRef<MapLibreMapProps["detour"]>(null);
+  const stopsRef = useRef<MapLibreMapProps["stops"]>([]);
+  const selectedStopIdRef = useRef<string | null>(null);
+  const pinPositionRef = useRef<[number, number] | null>(null);
   const blockagePropRef = useRef<GeoJSON.Geometry | null>(null);
   const onStopClickRef = useRef<MapLibreMapProps["onStopClick"]>(undefined);
+  const onStopOpenInExplorerRef = useRef<MapLibreMapProps["onStopOpenInExplorer"]>(undefined);
+  const stopPopupRef = useRef<maplibregl.Popup | null>(null);
+  const stopLayerClickRef = useRef<((e: maplibregl.MapMouseEvent & maplibregl.EventData) => void) | null>(null);
+  const stopLayerMouseEnterRef = useRef<(() => void) | null>(null);
+  const stopLayerMouseLeaveRef = useRef<(() => void) | null>(null);
+  const drawDetachRef = useRef<(() => void) | null>(null);
+  const styleRehydrateRef = useRef<(() => void) | null>(null);
+  const basemapRef = useRef<BasemapKind>(basemap);
+  const initialBasemapRef = useRef<BasemapKind>(basemap);
   const [mapReady, setMapReady] = useState(false);
 
   blockageRef.current = blockageGeojson;
   blockagePropRef.current = blockageGeojson;
   routeRef.current = routeGeojson;
   detourRef.current = detour;
+  stopsRef.current = stops;
+  selectedStopIdRef.current = selectedStopId;
+  pinPositionRef.current = pinPosition;
   onStopClickRef.current = onStopClick;
+  onStopOpenInExplorerRef.current = onStopOpenInExplorer;
 
   useEffect(() => {
     if (!containerRef.current) return;
-    let detachPolygonPreview: (() => void) | null = null;
     const [lat, lng] = center;
     const map = new maplibregl.Map({
       container: containerRef.current,
-      style: styleForBasemap(basemap),
+      style: styleForBasemap(initialBasemapRef.current),
       center: [lng, lat],
       zoom: 9,
       minZoom: 5,
       maxZoom: 19,
       dragRotate: false,
       pitchWithRotate: false,
-      pixelRatio: mapPixelRatioForBasemap(basemap),
+      pixelRatio: mapPixelRatioForBasemap(initialBasemapRef.current),
     });
     // Make mouse-wheel zoom a bit faster/more responsive.
     map.scrollZoom.setWheelZoomRate(1 / 180);
@@ -315,7 +362,55 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
     window.addEventListener("resize", scheduleResize);
     requestAnimationFrame(scheduleResize);
 
-    const onLoad = () => {
+    const closeStopPopup = () => {
+      stopPopupRef.current?.remove();
+      stopPopupRef.current = null;
+    };
+    const openStopPopup = (lng: number, lat: number, stopName: string, stopCode: string | null, stopId: string) => {
+      closeStopPopup();
+      const stopPayload = {
+        stop_id: stopId,
+        stop_name: stopName || undefined,
+        stop_code: stopCode,
+        lat,
+        lon: lng,
+      };
+      const content = document.createElement("div");
+      content.className = "stop-map-popup";
+      const title = document.createElement("div");
+      title.className = "stop-map-popup-title";
+      title.textContent = stopName || "Unnamed stop";
+      const codeRow = document.createElement("div");
+      codeRow.className = "stop-map-popup-meta";
+      codeRow.textContent = `Code: ${stopCode || "N/A"}`;
+      const idRow = document.createElement("div");
+      idRow.className = "stop-map-popup-meta";
+      idRow.textContent = `ID: ${stopId}`;
+      const actionBtn = document.createElement("button");
+      actionBtn.className = "stop-map-popup-action";
+      actionBtn.type = "button";
+      actionBtn.textContent = "Open in Stop tab";
+      actionBtn.onclick = (event) => {
+        event.stopPropagation();
+        onStopOpenInExplorerRef.current?.(stopPayload);
+      };
+      content.appendChild(title);
+      content.appendChild(codeRow);
+      content.appendChild(idRow);
+      content.appendChild(actionBtn);
+      stopPopupRef.current = new maplibregl.Popup({
+        closeButton: true,
+        closeOnClick: false,
+        className: "stop-map-popup-frame",
+        offset: 14,
+        maxWidth: "260px",
+      })
+        .setLngLat([lng, lat])
+        .setDOMContent(content)
+        .addTo(map);
+    };
+
+    const ensureCoreSourcesAndLayers = () => {
       // Persistent sources + layers (created once)
       const emptyFc: GeoJSONFeatureCollection = { type: "FeatureCollection", features: [] };
 
@@ -347,44 +442,46 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
           source: SOURCE_STOPS,
           paint: {
             "circle-radius": [
-              "match",
-              ["get", "role"],
-              "first",
-              7,
-              "last",
-              7,
-              "both",
-              8,
-              6,
+              "case",
+              ["boolean", ["get", "is_selected"], false],
+              9,
+              ["match", ["get", "role"], "first", 7, "last", 7, "both", 8, 6],
             ],
             "circle-color": [
-              "match",
-              ["get", "role"],
-              "first",
-              "#bbf7d0",
-              "last",
-              "#fecaca",
-              "both",
-              "#e9d5ff",
-              "#1e40af",
+              "case",
+              ["boolean", ["get", "is_selected"], false],
+              "#f59e0b",
+              ["match", ["get", "role"], "first", "#bbf7d0", "last", "#fecaca", "both", "#e9d5ff", "#1e40af"],
             ],
-            "circle-stroke-width": 2,
+            "circle-stroke-width": [
+              "case",
+              ["boolean", ["get", "is_selected"], false],
+              3,
+              2,
+            ],
             "circle-stroke-color": [
-              "match",
-              ["get", "role"],
-              "first",
-              "#22c55e",
-              "last",
-              "#ef4444",
-              "both",
-              "#7c3aed",
-              "#fff",
+              "case",
+              ["boolean", ["get", "is_selected"], false],
+              "#ffffff",
+              ["match", ["get", "role"], "first", "#22c55e", "last", "#ef4444", "both", "#7c3aed", "#fff"],
             ],
           },
         });
       }
 
-      map.on("click", "stops-circles", (e) => {
+      if (stopLayerClickRef.current) {
+        map.off("click", "stops-circles", stopLayerClickRef.current);
+        stopLayerClickRef.current = null;
+      }
+      if (stopLayerMouseEnterRef.current) {
+        map.off("mouseenter", "stops-circles", stopLayerMouseEnterRef.current);
+        stopLayerMouseEnterRef.current = null;
+      }
+      if (stopLayerMouseLeaveRef.current) {
+        map.off("mouseleave", "stops-circles", stopLayerMouseLeaveRef.current);
+        stopLayerMouseLeaveRef.current = null;
+      }
+      const onStopLayerClick = (e: maplibregl.MapMouseEvent & maplibregl.EventData) => {
         const f = e.features?.[0];
         const p = (f?.properties || {}) as Record<string, unknown>;
         const geom = f?.geometry;
@@ -393,20 +490,29 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
         if (!Array.isArray(coords) || coords.length < 2) return;
         const stopId = typeof p.stop_id === "string" ? p.stop_id : "";
         if (!stopId) return;
+        const stopName = typeof p.stop_name === "string" ? p.stop_name : "";
+        const stopCode = typeof p.stop_code === "string" ? p.stop_code : null;
+        openStopPopup(Number(coords[0]), Number(coords[1]), stopName, stopCode, stopId);
         onStopClickRef.current?.({
           stop_id: stopId,
-          stop_name: typeof p.stop_name === "string" ? p.stop_name : undefined,
-          stop_code: typeof p.stop_code === "string" ? p.stop_code : null,
+          stop_name: stopName || undefined,
+          stop_code: stopCode,
           lat: Number(coords[1]),
           lon: Number(coords[0]),
         });
-      });
-      map.on("mouseenter", "stops-circles", () => {
+      };
+      const onStopMouseEnter = () => {
         map.getCanvas().style.cursor = "pointer";
-      });
-      map.on("mouseleave", "stops-circles", () => {
+      };
+      const onStopMouseLeave = () => {
         map.getCanvas().style.cursor = "";
-      });
+      };
+      stopLayerClickRef.current = onStopLayerClick;
+      stopLayerMouseEnterRef.current = onStopMouseEnter;
+      stopLayerMouseLeaveRef.current = onStopMouseLeave;
+      map.on("click", "stops-circles", onStopLayerClick);
+      map.on("mouseenter", "stops-circles", onStopMouseEnter);
+      map.on("mouseleave", "stops-circles", onStopMouseLeave);
 
       if (!map.getSource(SOURCE_PIN)) {
         map.addSource(SOURCE_PIN, { type: "geojson", data: emptyFc });
@@ -423,153 +529,253 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
         });
       }
 
-      // Draw control: polygon only (explicitly activated by the toolbar button)
-      const draw = new MapboxDraw({
-        displayControlsDefault: false,
-        controls: {
-          polygon: true,
-          trash: true,
-        },
-        styles: DRAW_STYLES,
-      });
-      // Place controls in the top-right to avoid overlap with the explorer window.
-      map.addControl(draw as any, "top-right");
-      drawRef.current = draw;
+      if (!drawRef.current) {
+        // Draw control: polygon only (explicitly activated by the toolbar button)
+        const draw = new MapboxDraw({
+          displayControlsDefault: false,
+          controls: {
+            polygon: true,
+            trash: true,
+          },
+          styles: DRAW_STYLES,
+        });
+        // Place controls in the top-right to avoid overlap with the explorer window.
+        map.addControl(draw as any, "top-right");
+        drawRef.current = draw;
 
-      map.addSource(SOURCE_POLYGON_PREVIEW, { type: "geojson", data: EMPTY_FC });
-      // Must match MapboxDraw's suffixed layer id (see @mapbox/mapbox-gl-draw options.js addSources).
-      if (map.getLayer(DRAW_VERTEX_LAYER_HOT)) {
-        map.addLayer(
-          {
+        const drawApi = draw as MapboxDraw & { getMode?: () => string };
+        const syncPolygonPreviewLine = () => {
+          const src = map.getSource(SOURCE_POLYGON_PREVIEW) as maplibregl.GeoJSONSource | undefined;
+          if (!src) return;
+          if (typeof drawApi.getMode !== "function" || drawApi.getMode() !== "draw_polygon") {
+            src.setData(EMPTY_FC as any);
+            return;
+          }
+          const all = draw.getAll();
+          const f = all?.features?.[0];
+          if (!f || f.geometry?.type !== "Polygon") {
+            src.setData(EMPTY_FC as any);
+            return;
+          }
+          const ring = f.geometry.coordinates?.[0];
+          if (!ring || ring.length < 2) {
+            src.setData(EMPTY_FC as any);
+            return;
+          }
+          // MapboxDraw Polygon.toGeoJSON closes the ring: two in-progress verts [A,B] become [A,B,A].
+          const closedAsFirstEdge =
+            ring.length === 3 &&
+            ring[0]?.length >= 2 &&
+            ring[2]?.length >= 2 &&
+            ring[0][0] === ring[2][0] &&
+            ring[0][1] === ring[2][1];
+          const openTwoVerts = ring.length === 2;
+          if (!closedAsFirstEdge && !openTwoVerts) {
+            src.setData(EMPTY_FC as any);
+            return;
+          }
+          const a = ring[0];
+          const b = ring[1];
+          if (!a || !b || a.length < 2 || b.length < 2) {
+            src.setData(EMPTY_FC as any);
+            return;
+          }
+          src.setData({
+            type: "FeatureCollection",
+            features: [
+              {
+                type: "Feature",
+                properties: {},
+                geometry: {
+                  type: "LineString",
+                  coordinates: [
+                    [a[0], a[1]],
+                    [b[0], b[1]],
+                  ],
+                },
+              },
+            ],
+          } as any);
+        };
+
+        map.on("draw.render", syncPolygonPreviewLine);
+        map.on("mousemove", syncPolygonPreviewLine);
+        map.on("draw.modechange", syncPolygonPreviewLine);
+
+        map.on("draw.create", (e: { features?: GeoJSON.Feature[] }) => {
+          let feature = e?.features?.[0];
+          if (!feature && typeof draw.getAll === "function") {
+            const all = draw.getAll();
+            feature = all?.features?.[0];
+          }
+          if (feature?.geometry) {
+            const geom = normalizeBlockageGeometry(feature.geometry);
+            onBlockageChange(geom);
+          }
+          syncPolygonPreviewLine();
+        });
+        map.on("draw.update", (e: { features?: GeoJSON.Feature[] }) => {
+          let feature = e?.features?.[0];
+          if (!feature && typeof draw.getAll === "function") {
+            const all = draw.getAll();
+            feature = all?.features?.[0];
+          }
+          if (feature?.geometry) {
+            const geom = normalizeBlockageGeometry(feature.geometry);
+            onBlockageChange(geom);
+          }
+          syncPolygonPreviewLine();
+        });
+        map.on("draw.delete", () => {
+          onBlockageChange(null);
+          syncPolygonPreviewLine();
+        });
+        drawDetachRef.current = () => {
+          map.off("draw.render", syncPolygonPreviewLine);
+          map.off("mousemove", syncPolygonPreviewLine);
+          map.off("draw.modechange", syncPolygonPreviewLine);
+        };
+      }
+
+      if (!map.getSource(SOURCE_POLYGON_PREVIEW)) {
+        map.addSource(SOURCE_POLYGON_PREVIEW, { type: "geojson", data: EMPTY_FC });
+      }
+      if (!map.getLayer(LAYER_POLYGON_PREVIEW)) {
+        // Must match MapboxDraw's suffixed layer id (see @mapbox/mapbox-gl-draw options.js addSources).
+        if (map.getLayer(DRAW_VERTEX_LAYER_HOT)) {
+          map.addLayer(
+            {
+              id: LAYER_POLYGON_PREVIEW,
+              type: "line",
+              source: SOURCE_POLYGON_PREVIEW,
+              layout: { "line-cap": "round", "line-join": "round" },
+              paint: { "line-color": "#dc2626", "line-width": 2 },
+            },
+            DRAW_VERTEX_LAYER_HOT
+          );
+        } else {
+          map.addLayer({
             id: LAYER_POLYGON_PREVIEW,
             type: "line",
             source: SOURCE_POLYGON_PREVIEW,
             layout: { "line-cap": "round", "line-join": "round" },
             paint: { "line-color": "#dc2626", "line-width": 2 },
-          },
-          DRAW_VERTEX_LAYER_HOT
-        );
-      } else {
-        map.addLayer({
-          id: LAYER_POLYGON_PREVIEW,
-          type: "line",
-          source: SOURCE_POLYGON_PREVIEW,
-          layout: { "line-cap": "round", "line-join": "round" },
-          paint: { "line-color": "#dc2626", "line-width": 2 },
-        });
+          });
+        }
       }
+    };
 
-      const drawApi = draw as MapboxDraw & { getMode?: () => string };
-      const syncPolygonPreviewLine = () => {
-        const src = map.getSource(SOURCE_POLYGON_PREVIEW) as maplibregl.GeoJSONSource | undefined;
-        if (!src) return;
-        if (typeof drawApi.getMode !== "function" || drawApi.getMode() !== "draw_polygon") {
-          src.setData(EMPTY_FC as any);
-          return;
-        }
-        const all = draw.getAll();
-        const f = all?.features?.[0];
-        if (!f || f.geometry?.type !== "Polygon") {
-          src.setData(EMPTY_FC as any);
-          return;
-        }
-        const ring = f.geometry.coordinates?.[0];
-        if (!ring || ring.length < 2) {
-          src.setData(EMPTY_FC as any);
-          return;
-        }
-        // MapboxDraw Polygon.toGeoJSON closes the ring: two in-progress verts [A,B] become [A,B,A].
-        const closedAsFirstEdge =
-          ring.length === 3 &&
-          ring[0]?.length >= 2 &&
-          ring[2]?.length >= 2 &&
-          ring[0][0] === ring[2][0] &&
-          ring[0][1] === ring[2][1];
-        const openTwoVerts = ring.length === 2;
-        if (!closedAsFirstEdge && !openTwoVerts) {
-          src.setData(EMPTY_FC as any);
-          return;
-        }
-        const a = ring[0];
-        const b = ring[1];
-        if (!a || !b || a.length < 2 || b.length < 2) {
-          src.setData(EMPTY_FC as any);
-          return;
-        }
-        src.setData({
-          type: "FeatureCollection",
-          features: [
-            {
-              type: "Feature",
-              properties: {},
-              geometry: {
-                type: "LineString",
-                coordinates: [
-                  [a[0], a[1]],
-                  [b[0], b[1]],
+    const rehydrateMapStyle = () => {
+      ensureCoreSourcesAndLayers();
+      const routeSource = map.getSource(SOURCE_ROUTE) as maplibregl.GeoJSONSource | undefined;
+      routeSource?.setData((routeRef.current || EMPTY_FC) as any);
+      const detourSource = map.getSource(SOURCE_DETOUR) as maplibregl.GeoJSONSource | undefined;
+      detourSource?.setData((detourRef.current?.path_geojson || EMPTY_FC) as any);
+      const pinSource = map.getSource(SOURCE_PIN) as maplibregl.GeoJSONSource | undefined;
+      if (pinSource) {
+        const activePin = pinPositionRef.current;
+        pinSource.setData(
+          activePin
+            ? ({
+                type: "FeatureCollection",
+                features: [
+                  {
+                    type: "Feature",
+                    geometry: { type: "Point", coordinates: [activePin[1], activePin[0]] },
+                    properties: {},
+                  },
                 ],
-              },
+              } as any)
+            : (EMPTY_FC as any)
+        );
+      }
+      const stopSource = map.getSource(SOURCE_STOPS) as maplibregl.GeoJSONSource | undefined;
+      if (stopSource) {
+        const activeStops = stopsRef.current;
+        const roleByStopId = rolesForStops(activeStops);
+        const activeSelectedStopId = selectedStopIdRef.current;
+        stopSource.setData({
+          type: "FeatureCollection",
+          features: activeStops.map((s) => ({
+            type: "Feature" as const,
+            geometry: { type: "Point" as const, coordinates: [s.lon, s.lat] },
+            properties: {
+              stop_id: s.stop_id,
+              stop_name: s.name,
+              stop_code: s.stop_code ?? null,
+              is_selected: !!activeSelectedStopId && s.stop_id === activeSelectedStopId,
+              role: roleByStopId.get(s.stop_id) ?? "middle",
             },
-          ],
+          })),
         } as any);
-      };
-
-      map.on("draw.render", syncPolygonPreviewLine);
-      map.on("mousemove", syncPolygonPreviewLine);
-      map.on("draw.modechange", syncPolygonPreviewLine);
-
-      map.on("draw.create", (e: { features?: GeoJSON.Feature[] }) => {
-        let feature = e?.features?.[0];
-        if (!feature && typeof draw.getAll === "function") {
-          const all = draw.getAll();
-          feature = all?.features?.[0];
-        }
-        if (feature?.geometry) {
-          const geom = normalizeBlockageGeometry(feature.geometry);
-          onBlockageChange(geom);
-        }
-        syncPolygonPreviewLine();
-      });
-      map.on("draw.update", (e: { features?: GeoJSON.Feature[] }) => {
-        let feature = e?.features?.[0];
-        if (!feature && typeof draw.getAll === "function") {
-          const all = draw.getAll();
-          feature = all?.features?.[0];
-        }
-        if (feature?.geometry) {
-          const geom = normalizeBlockageGeometry(feature.geometry);
-          onBlockageChange(geom);
-        }
-        syncPolygonPreviewLine();
-      });
-      map.on("draw.delete", () => {
-        onBlockageChange(null);
-        syncPolygonPreviewLine();
-      });
-
+      }
       setMapReady(true);
       requestAnimationFrame(scheduleResize);
+    };
+    styleRehydrateRef.current = rehydrateMapStyle;
 
-      detachPolygonPreview = () => {
-        map.off("draw.render", syncPolygonPreviewLine);
-        map.off("mousemove", syncPolygonPreviewLine);
-        map.off("draw.modechange", syncPolygonPreviewLine);
-      };
+    const onLoad = () => {
+      rehydrateMapStyle();
     };
 
     map.on("load", onLoad);
     return () => {
+      styleRehydrateRef.current = null;
+      stopLayerClickRef.current && map.off("click", "stops-circles", stopLayerClickRef.current);
+      stopLayerMouseEnterRef.current && map.off("mouseenter", "stops-circles", stopLayerMouseEnterRef.current);
+      stopLayerMouseLeaveRef.current && map.off("mouseleave", "stops-circles", stopLayerMouseLeaveRef.current);
+      stopLayerClickRef.current = null;
+      stopLayerMouseEnterRef.current = null;
+      stopLayerMouseLeaveRef.current = null;
+      drawDetachRef.current?.();
+      drawDetachRef.current = null;
+      closeStopPopup();
       resizeObserver?.disconnect();
       window.removeEventListener("resize", scheduleResize);
-      detachPolygonPreview?.();
+      map.off("load", onLoad);
       map.remove();
       mapRef.current = null;
       drawRef.current = null;
       setMapReady(false);
     };
-  }, [onBlockageChange, basemap]);
+  }, [onBlockageChange]);
 
-  // After basemap remount, re-apply blockage from React state into MapboxDraw (draw is fresh).
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+    const prev = basemapRef.current;
+    if (prev === basemap) return;
+
+    const camera = {
+      center: map.getCenter(),
+      zoom: map.getZoom(),
+      bearing: map.getBearing(),
+      pitch: map.getPitch(),
+    };
+
+    const applyCamera = () => {
+      map.jumpTo(camera);
+    };
+
+    // Raster->raster: keep style/sources/layers and only swap tile URLs.
+    if (isRasterBasemap(prev) && isRasterBasemap(basemap)) {
+      const src = map.getSource(BASEMAP_RASTER_SOURCE) as (maplibregl.Source & { setTiles?: (t: string[]) => void }) | null;
+      src?.setTiles?.(rasterTilesForBasemap(basemap));
+      basemapRef.current = basemap;
+      applyCamera();
+      return;
+    }
+
+    setMapReady(false);
+    map.once("style.load", () => {
+      styleRehydrateRef.current?.();
+      applyCamera();
+      basemapRef.current = basemap;
+    });
+    map.setStyle(styleForBasemap(basemap), { diff: false });
+  }, [basemap]);
+
+  // After style reload, re-apply blockage from React state into MapboxDraw.
   useEffect(() => {
     if (!mapReady || !drawRef.current) return;
     const draw = drawRef.current;
@@ -586,7 +792,7 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
     } catch {
       /* ignore restore errors */
     }
-  }, [mapReady, basemap]);
+  }, [mapReady]);
 
   // Route source data
   useEffect(() => {
@@ -625,12 +831,13 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
           stop_id: s.stop_id,
           stop_name: s.name,
           stop_code: s.stop_code ?? null,
+          is_selected: !!selectedStopId && s.stop_id === selectedStopId,
           role: roleByStopId.get(s.stop_id) ?? "middle",
         },
       })),
     };
     source.setData(stopsFc as any);
-  }, [mapReady, stops]);
+  }, [mapReady, stops, selectedStopId]);
 
   // Pin source data
   useEffect(() => {

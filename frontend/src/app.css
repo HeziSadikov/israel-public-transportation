@@ -102,6 +102,7 @@ html, body, #root {
   color: #e2e8f0;
   font-size: 0.8rem;
   margin-bottom: 6px;
+  box-sizing: border-box;
 }
 
 .rail-select {
@@ -116,6 +117,76 @@ html, body, #root {
 
 .rail input::placeholder {
   color: #64748b;
+}
+
+.time-window-presets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.btn-time-preset {
+  padding: 4px 8px;
+  font-size: 0.72rem;
+  background: rgba(34, 197, 94, 0.2);
+  color: #dcfce7;
+  box-shadow: none;
+  border: 1px solid rgba(134, 239, 172, 0.35);
+}
+
+.time-window-validation {
+  margin: 8px 0 0 0;
+  font-size: 0.72rem;
+  color: #86efac;
+}
+
+.time-window-validation.error {
+  color: #fca5a5;
+}
+
+/* Safer fix: isolate Time Window controls to stable LTR native date/time layout. */
+.time-window-section {
+  direction: ltr;
+}
+
+.time-window-section .rail-heading,
+.time-window-section label {
+  text-align: left;
+}
+
+.time-window-section .row {
+  direction: ltr;
+}
+
+.time-window-section .row input[type="date"] {
+  flex: 0 0 7.5rem;
+  width: 7.5rem;
+  min-width: 7.5rem;
+  max-width: 7.5rem;
+  direction: ltr;
+  text-align: left;
+  padding-left: 4px;
+  padding-right: 20px;
+}
+
+.time-window-section .row input[type="time"] {
+  flex: 0 0 6.1rem;
+  min-width: 6.1rem;
+  width: 6.1rem;
+  max-width: 6.1rem;
+  direction: ltr;
+  text-align: left;
+  padding-left: 6px;
+  padding-right: 20px;
+  letter-spacing: 0;
+}
+
+.time-window-section .row input[type="date"]::-webkit-calendar-picker-indicator,
+.time-window-section .row input[type="time"]::-webkit-calendar-picker-indicator {
+  opacity: 1;
+  cursor: pointer;
+  filter: invert(1) brightness(1.35) contrast(1.05);
 }
 
 .btn-compute {
@@ -193,6 +264,74 @@ button:disabled {
   width: 100%;
   height: 100%;
   min-height: 0;
+}
+
+.map-container .maplibregl-popup.stop-map-popup-frame .maplibregl-popup-content {
+  background: rgba(15, 23, 42, 0.96);
+  color: #e2e8f0;
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  border-radius: 8px;
+  padding: 8px 32px 8px 10px;
+  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.45);
+}
+
+.map-container .maplibregl-popup.stop-map-popup-frame .maplibregl-popup-tip {
+  border-top-color: rgba(15, 23, 42, 0.96);
+}
+
+.map-container .maplibregl-popup.stop-map-popup-frame .maplibregl-popup-close-button {
+  top: 4px;
+  right: 5px;
+  width: 20px;
+  height: 20px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  box-sizing: border-box;
+  font-size: 16px;
+  line-height: 1;
+  color: #cbd5e1;
+}
+
+.map-container .maplibregl-popup.stop-map-popup-frame .maplibregl-popup-close-button:hover {
+  color: #f8fafc;
+}
+
+.stop-map-popup-title {
+  font-size: 0.84rem;
+  font-weight: 700;
+  color: #f8fafc;
+  margin-bottom: 4px;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.stop-map-popup-meta {
+  font-size: 0.75rem;
+  color: #cbd5e1;
+  line-height: 1.3;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.stop-map-popup-action {
+  margin-top: 8px;
+  width: 100%;
+  border-radius: 6px;
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  background: rgba(30, 64, 175, 0.25);
+  color: #dbeafe;
+  font-size: 0.74rem;
+  font-weight: 600;
+  line-height: 1.2;
+  padding: 6px 8px;
+  box-shadow: none;
+}
+
+.stop-map-popup-action:hover {
+  background: rgba(30, 64, 175, 0.4);
+  color: #eff6ff;
 }
 
 .explorer-rnd {
@@ -497,7 +636,8 @@ button:disabled {
 
 /* Lines table (טבלת קווים) - RTL, alternating rows */
 .lines-table-wrap {
-  margin-top: 10px;
+  margin-top: 2px;
+  margin-bottom: 0;
   font-family: Arial, sans-serif;
   display: flex;
   flex-direction: column;
@@ -505,7 +645,7 @@ button:disabled {
   min-width: 0;
   width: 100%;
   max-width: 100%;
-  flex: 1;
+  flex: 1 1 auto;
 }
 
 .explorer-results-scroll {
@@ -515,7 +655,8 @@ button:disabled {
   min-width: 0;
   width: 100%;
   max-width: 100%;
-  flex: 1;
+  flex: 1 1 auto;
+  max-height: none;
   overscroll-behavior: contain;
   -webkit-overflow-scrolling: touch;
 }
@@ -557,6 +698,18 @@ button:disabled {
   position: sticky;
   top: 0;
   z-index: 1;
+  white-space: nowrap;
+  word-break: normal;
+  overflow-wrap: normal;
+}
+
+.lines-table thead th.sortable {
+  cursor: pointer;
+  user-select: none;
+}
+
+.lines-table thead th.sortable:hover {
+  background: rgba(100, 116, 139, 0.85);
 }
 
 .lines-table tbody tr {
@@ -615,13 +768,13 @@ button:disabled {
 .lines-table .col-dest,
 .lines-table .col-route-pair {
   text-align: right;
-  min-width: 0;
+  min-width: 8rem;
   white-space: normal;
-  overflow-wrap: anywhere;
-  word-break: break-word;
+  overflow-wrap: break-word;
+  word-break: normal;
+  hyphens: auto;
 }
 
-.lines-table .col-actions,
 .lines-table .col-status {
   text-align: center;
   white-space: nowrap;

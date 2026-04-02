@@ -5,20 +5,20 @@ from typing import Dict, List, Any, Optional
 from shapely.geometry import shape
 
 from .service_calendar import ServiceCalendar
-from .db_access import get_routes_in_polygon
+from .db_access import get_routes_in_polygon_range
 
 
 def find_routes_in_polygon(
   feed: Optional[Any],
   polygon_geojson: Dict[str, Any],
-  yyyymmdd: str,
+  start_date_ymd: str,
   start_sec: int,
+  end_date_ymd: str,
   end_sec: int,
 ) -> List[Dict[str, Any]]:
   """
   Returns a list of routes whose shapes intersect the given polygon and have
-  at least one trip active on the given service date within the specified
-  time window [start_sec, end_sec].
+  at least one trip active in the given datetime range.
 
   Implementation now delegates spatial search to PostGIS via db_access,
   using the active feed recorded in feed_versions. The previous SQLite +
@@ -33,10 +33,11 @@ def find_routes_in_polygon(
   _ = ServiceCalendar  # silence unused-variable warnings
 
   wkt = poly.wkt
-  rows = get_routes_in_polygon(
+  rows = get_routes_in_polygon_range(
     polygon_wkt=wkt,
-    date_ymd=yyyymmdd,
+    start_date_ymd=start_date_ymd,
     start_sec=start_sec,
+    end_date_ymd=end_date_ymd,
     end_sec=end_sec,
   )
   return [

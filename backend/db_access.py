@@ -2298,3 +2298,568 @@ def search_routes_pg(
         if close:
             conn.close()
 
+
+def get_routes_in_polygon_range(
+    polygon_wkt: str,
+    start_date_ymd: str,
+    start_sec: int,
+    end_date_ymd: str,
+    end_sec: int,
+    conn=None,
+) -> List[RouteInAreaRow]:
+    close = False
+    if conn is None:
+        conn = _get_conn()
+        close = True
+    try:
+        feed_id = get_active_feed_id(conn)
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                WITH bounds AS (
+                    SELECT
+                        to_date(%s::text, 'YYYYMMDD') AS start_date,
+                        to_date(%s::text, 'YYYYMMDD') AS end_date,
+                        %s::int AS start_sec,
+                        %s::int AS end_sec
+                ),
+                day_windows AS (
+                    SELECT
+                        to_char(gs::date, 'YYYYMMDD')::int AS date_ymd,
+                        EXTRACT(DOW FROM gs::date)::int AS dow,
+                        CASE WHEN gs::date = b.start_date THEN b.start_sec ELSE 0 END AS day_start_sec,
+                        CASE WHEN gs::date = b.end_date THEN b.end_sec ELSE 27 * 3600 END AS day_end_sec
+                    FROM bounds b
+                    JOIN LATERAL generate_series(b.start_date, b.end_date, interval '1 day') gs ON TRUE
+                ),
+                calendar_services AS (
+                    SELECT dw.date_ymd, dw.day_start_sec, dw.day_end_sec, c.service_id
+                    FROM day_windows dw
+                    JOIN calendar c ON c.feed_id = %s
+                     AND dw.date_ymd BETWEEN c.start_date AND c.end_date
+                     AND (
+                        (dw.dow = 0 AND c.sunday = 1)
+                        OR (dw.dow = 1 AND c.monday = 1)
+                        OR (dw.dow = 2 AND c.tuesday = 1)
+                        OR (dw.dow = 3 AND c.wednesday = 1)
+                        OR (dw.dow = 4 AND c.thursday = 1)
+                        OR (dw.dow = 5 AND c.friday = 1)
+                        OR (dw.dow = 6 AND c.saturday = 1)
+                     )
+                ),
+                add_services AS (
+                    SELECT dw.date_ymd, dw.day_start_sec, dw.day_end_sec, cd.service_id
+                    FROM day_windows dw
+                    JOIN calendar_dates cd ON cd.feed_id = %s
+                     AND cd.date = dw.date_ymd
+                     AND cd.exception_type = 1
+                ),
+                remove_services AS (
+                    SELECT dw.date_ymd, cd.service_id
+                    FROM day_windows dw
+                    JOIN calendar_dates cd ON cd.feed_id = %s
+                     AND cd.date = dw.date_ymd
+                     AND cd.exception_type = 2
+                ),
+                base_services AS (
+                    SELECT date_ymd, day_start_sec, day_end_sec, service_id FROM calendar_services
+                    UNION
+                    SELECT date_ymd, day_start_sec, day_end_sec, service_id FROM add_services
+                ),
+                active_services AS (
+                    SELECT bs.date_ymd, bs.day_start_sec, bs.day_end_sec, bs.service_id
+                    FROM base_services bs
+                    LEFT JOIN remove_services r
+                      ON r.date_ymd = bs.date_ymd AND r.service_id = bs.service_id
+                    WHERE r.service_id IS NULL
+                ),
+                trips_in_window AS (
+                    SELECT t.feed_id, t.route_id, t.direction_id, t.trip_id
+                    FROM trips t
+                    JOIN active_services s ON s.service_id = t.service_id
+                    JOIN trip_time_bounds b ON b.feed_id = t.feed_id AND b.trip_id = t.trip_id
+                    WHERE t.feed_id = %s
+                      AND b.last_sec >= s.day_start_sec
+                      AND b.first_sec <= s.day_end_sec
+                ),
+                trip_last_stop AS (
+                    SELECT DISTINCT ON (tiw.route_id, tiw.direction_id)
+                        tiw.route_id,
+                        tiw.direction_id,
+                        s.name AS last_stop_name
+                    FROM trips_in_window tiw
+                    JOIN trips t ON t.feed_id = tiw.feed_id AND t.trip_id = tiw.trip_id
+                    JOIN (
+                        SELECT feed_id, trip_id, MAX(stop_sequence) AS max_seq
+                        FROM stop_times
+                        GROUP BY feed_id, trip_id
+                    ) mx ON mx.feed_id = t.feed_id AND mx.trip_id = t.trip_id
+                    JOIN stop_times st
+                        ON st.feed_id = mx.feed_id AND st.trip_id = mx.trip_id AND st.stop_sequence = mx.max_seq
+                    JOIN stops s ON s.feed_id = st.feed_id AND s.stop_id = st.stop_id
+                    WHERE t.feed_id = %s
+                    ORDER BY tiw.route_id, tiw.direction_id, t.trip_id
+                ),
+                routes_geom AS (
+                    SELECT DISTINCT
+                        tiw.route_id,
+                        tiw.direction_id,
+                        r.short_name AS route_short_name,
+                        r.long_name AS route_long_name,
+                        r.agency_id,
+                        MIN(b.first_sec) AS first_time_s,
+                        MAX(b.last_sec) AS last_time_s,
+                        COUNT(DISTINCT tiw.trip_id)::int AS trip_count
+                    FROM trips_in_window tiw
+                    JOIN trips t
+                      ON t.feed_id = tiw.feed_id AND t.trip_id = tiw.trip_id
+                    JOIN routes r
+                      ON r.feed_id = tiw.feed_id AND r.route_id = tiw.route_id
+                    JOIN trip_time_bounds b
+                      ON b.feed_id = tiw.feed_id AND b.trip_id = tiw.trip_id
+                    JOIN shapes_lines sl
+                      ON sl.feed_id = tiw.feed_id AND sl.shape_id = t.shape_id
+                    WHERE ST_Intersects(sl.geom, ST_GeomFromText(%s, 4326))
+                    GROUP BY tiw.route_id, tiw.direction_id, r.short_name, r.long_name, r.agency_id
+                )
+                SELECT
+                    rg.route_id,
+                    rg.direction_id,
+                    rg.route_short_name,
+                    rg.route_long_name,
+                    rg.agency_id,
+                    a.name AS agency_name,
+                    rg.first_time_s,
+                    rg.last_time_s,
+                    rg.trip_count,
+                    tls.last_stop_name
+                FROM routes_geom rg
+                LEFT JOIN trip_last_stop tls
+                    ON tls.route_id = rg.route_id
+                    AND tls.direction_id IS NOT DISTINCT FROM rg.direction_id
+                LEFT JOIN agencies a
+                  ON a.feed_id = %s AND a.agency_id = rg.agency_id
+                ORDER BY rg.route_short_name, rg.route_id, rg.direction_id
+                """,
+                (
+                    start_date_ymd,
+                    end_date_ymd,
+                    start_sec,
+                    end_sec,
+                    feed_id,
+                    feed_id,
+                    feed_id,
+                    feed_id,
+                    feed_id,
+                    polygon_wkt,
+                    feed_id,
+                ),
+            )
+            return [
+                RouteInAreaRow(
+                    route_id=r["route_id"],
+                    direction_id=r["direction_id"],
+                    route_short_name=r["route_short_name"],
+                    route_long_name=r["route_long_name"],
+                    agency_id=r["agency_id"],
+                    agency_name=r["agency_name"],
+                    first_time_s=r["first_time_s"],
+                    last_time_s=r["last_time_s"],
+                    trip_count=r["trip_count"],
+                    last_stop_name=r.get("last_stop_name"),
+                )
+                for r in cur.fetchall()
+            ]
+    finally:
+        if close:
+            conn.close()
+
+
+def get_routes_serving_stop_pg_range(
+    stop_id: str,
+    start_date_ymd: str,
+    start_sec: int,
+    end_date_ymd: str,
+    end_sec: int,
+    max_results: int = 100,
+) -> List[Dict[str, Any]]:
+    close = False
+    conn = _get_conn()
+    close = True
+    try:
+        feed_id = get_active_feed_id(conn)
+        with conn.cursor() as cur:
+            cur.execute("SET LOCAL statement_timeout = %s", (STOP_ROUTES_STATEMENT_TIMEOUT_MS,))
+            cur.execute(
+                """
+                WITH bounds AS (
+                    SELECT
+                        to_date(%s::text, 'YYYYMMDD') AS start_date,
+                        to_date(%s::text, 'YYYYMMDD') AS end_date,
+                        %s::int AS start_sec,
+                        %s::int AS end_sec
+                ),
+                day_windows AS (
+                    SELECT
+                        to_char(gs::date, 'YYYYMMDD')::int AS date_ymd,
+                        EXTRACT(DOW FROM gs::date)::int AS dow,
+                        CASE WHEN gs::date = b.start_date THEN b.start_sec ELSE 0 END AS day_start_sec,
+                        CASE WHEN gs::date = b.end_date THEN b.end_sec ELSE 27 * 3600 END AS day_end_sec
+                    FROM bounds b
+                    JOIN LATERAL generate_series(b.start_date, b.end_date, interval '1 day') gs ON TRUE
+                ),
+                calendar_services AS (
+                    SELECT dw.date_ymd, dw.day_start_sec, dw.day_end_sec, c.service_id
+                    FROM day_windows dw
+                    JOIN calendar c ON c.feed_id = %s
+                     AND dw.date_ymd BETWEEN c.start_date AND c.end_date
+                     AND (
+                        (dw.dow = 0 AND c.sunday = 1)
+                        OR (dw.dow = 1 AND c.monday = 1)
+                        OR (dw.dow = 2 AND c.tuesday = 1)
+                        OR (dw.dow = 3 AND c.wednesday = 1)
+                        OR (dw.dow = 4 AND c.thursday = 1)
+                        OR (dw.dow = 5 AND c.friday = 1)
+                        OR (dw.dow = 6 AND c.saturday = 1)
+                     )
+                ),
+                add_services AS (
+                    SELECT dw.date_ymd, dw.day_start_sec, dw.day_end_sec, cd.service_id
+                    FROM day_windows dw
+                    JOIN calendar_dates cd ON cd.feed_id = %s
+                     AND cd.date = dw.date_ymd
+                     AND cd.exception_type = 1
+                ),
+                remove_services AS (
+                    SELECT dw.date_ymd, cd.service_id
+                    FROM day_windows dw
+                    JOIN calendar_dates cd ON cd.feed_id = %s
+                     AND cd.date = dw.date_ymd
+                     AND cd.exception_type = 2
+                ),
+                base_services AS (
+                    SELECT date_ymd, day_start_sec, day_end_sec, service_id FROM calendar_services
+                    UNION
+                    SELECT date_ymd, day_start_sec, day_end_sec, service_id FROM add_services
+                ),
+                active_services AS (
+                    SELECT bs.date_ymd, bs.day_start_sec, bs.day_end_sec, bs.service_id
+                    FROM base_services bs
+                    LEFT JOIN remove_services r
+                      ON r.date_ymd = bs.date_ymd AND r.service_id = bs.service_id
+                    WHERE r.service_id IS NULL
+                ),
+                stop_filtered AS (
+                    SELECT
+                        st.trip_id,
+                        trim(coalesce(st.departure_time, st.arrival_time, '')) AS dep_time_raw
+                    FROM stop_times st
+                    WHERE st.feed_id = %s
+                      AND st.stop_id = %s
+                      AND length(trim(coalesce(st.departure_time, st.arrival_time, ''))) >= 5
+                ),
+                stop_sec AS (
+                    SELECT
+                        sf.trip_id,
+                        t.route_id,
+                        t.direction_id,
+                        (split_part(sf.dep_time_raw, ':', 1)::int * 3600
+                         + split_part(sf.dep_time_raw, ':', 2)::int * 60
+                         + coalesce(nullif(trim(split_part(sf.dep_time_raw, ':', 3)), ''), '0')::int
+                        ) AS sec
+                    FROM stop_filtered sf
+                    JOIN trips t ON t.feed_id = %s AND t.trip_id = sf.trip_id
+                    JOIN active_services a ON a.service_id = t.service_id
+                    WHERE (split_part(sf.dep_time_raw, ':', 1)::int * 3600
+                         + split_part(sf.dep_time_raw, ':', 2)::int * 60
+                         + coalesce(nullif(trim(split_part(sf.dep_time_raw, ':', 3)), ''), '0')::int
+                        ) BETWEEN a.day_start_sec AND a.day_end_sec
+                ),
+                in_window AS (
+                    SELECT route_id, direction_id, min(sec) AS first_sec, max(sec) AS last_sec
+                    FROM stop_sec
+                    GROUP BY route_id, direction_id
+                )
+                SELECT
+                    i.route_id,
+                    i.direction_id,
+                    i.first_sec,
+                    i.last_sec,
+                    r.short_name,
+                    r.long_name,
+                    r.agency_id,
+                    a.name AS agency_name
+                FROM in_window i
+                JOIN routes r ON r.feed_id = %s AND r.route_id = i.route_id
+                LEFT JOIN agencies a ON a.feed_id = r.feed_id AND a.agency_id = r.agency_id
+                ORDER BY r.short_name, i.route_id, i.direction_id
+                LIMIT %s
+                """,
+                (
+                    start_date_ymd,
+                    end_date_ymd,
+                    start_sec,
+                    end_sec,
+                    feed_id,
+                    feed_id,
+                    feed_id,
+                    feed_id,
+                    stop_id,
+                    feed_id,
+                    feed_id,
+                    max_results,
+                ),
+            )
+            rows = cur.fetchall()
+        return [
+            {
+                "route_id": r["route_id"],
+                "direction_id": None if r["direction_id"] is None else str(r["direction_id"]),
+                "route_short_name": r["short_name"],
+                "route_long_name": r["long_name"],
+                "agency_id": r["agency_id"],
+                "agency_name": r["agency_name"],
+                "first_time": f"{int(r['first_sec']) // 3600:02d}:{(int(r['first_sec']) % 3600) // 60:02d}",
+                "last_time": f"{int(r['last_sec']) // 3600:02d}:{(int(r['last_sec']) % 3600) // 60:02d}",
+            }
+            for r in rows
+        ]
+    except psycopg2.errors.QueryCanceled as e:
+        raise StopRoutesQueryTimeoutError(
+            f"Stop routes query timed out after {STOP_ROUTES_STATEMENT_TIMEOUT_MS}ms"
+        ) from e
+    finally:
+        if close:
+            conn.close()
+
+
+def search_routes_pg_range(
+    q: str,
+    limit: int,
+    start_date_ymd: Optional[str] = None,
+    start_sec: Optional[int] = None,
+    end_date_ymd: Optional[str] = None,
+    end_sec: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    q = (q or "").strip().lower()
+    if not q:
+        return []
+    close = False
+    conn = _get_conn()
+    close = True
+    try:
+        feed_id = get_active_feed_id(conn)
+        use_window = (
+            bool(start_date_ymd)
+            and bool(end_date_ymd)
+            and start_sec is not None
+            and end_sec is not None
+            and len(str(start_date_ymd)) == 8
+            and len(str(end_date_ymd)) == 8
+            and str(start_date_ymd).isdigit()
+            and str(end_date_ymd).isdigit()
+        )
+        window_sql = ""
+        window_params: List[Any] = []
+        if use_window:
+            window_sql = """
+                ,
+                bounds AS (
+                    SELECT
+                        to_date(%s::text, 'YYYYMMDD') AS start_date,
+                        to_date(%s::text, 'YYYYMMDD') AS end_date,
+                        %s::int AS start_sec,
+                        %s::int AS end_sec
+                ),
+                day_windows AS (
+                    SELECT
+                        to_char(gs::date, 'YYYYMMDD')::int AS date_ymd,
+                        EXTRACT(DOW FROM gs::date)::int AS dow,
+                        CASE WHEN gs::date = b.start_date THEN b.start_sec ELSE 0 END AS day_start_sec,
+                        CASE WHEN gs::date = b.end_date THEN b.end_sec ELSE 27 * 3600 END AS day_end_sec
+                    FROM bounds b
+                    JOIN LATERAL generate_series(b.start_date, b.end_date, interval '1 day') gs ON TRUE
+                ),
+                calendar_services AS (
+                    SELECT dw.date_ymd, dw.day_start_sec, dw.day_end_sec, c.service_id
+                    FROM day_windows dw
+                    JOIN calendar c ON c.feed_id = %s
+                     AND dw.date_ymd BETWEEN c.start_date AND c.end_date
+                     AND (
+                        (dw.dow = 0 AND c.sunday = 1)
+                        OR (dw.dow = 1 AND c.monday = 1)
+                        OR (dw.dow = 2 AND c.tuesday = 1)
+                        OR (dw.dow = 3 AND c.wednesday = 1)
+                        OR (dw.dow = 4 AND c.thursday = 1)
+                        OR (dw.dow = 5 AND c.friday = 1)
+                        OR (dw.dow = 6 AND c.saturday = 1)
+                     )
+                ),
+                add_services AS (
+                    SELECT dw.date_ymd, dw.day_start_sec, dw.day_end_sec, cd.service_id
+                    FROM day_windows dw
+                    JOIN calendar_dates cd ON cd.feed_id = %s
+                     AND cd.date = dw.date_ymd
+                     AND cd.exception_type = 1
+                ),
+                remove_services AS (
+                    SELECT dw.date_ymd, cd.service_id
+                    FROM day_windows dw
+                    JOIN calendar_dates cd ON cd.feed_id = %s
+                     AND cd.date = dw.date_ymd
+                     AND cd.exception_type = 2
+                ),
+                base_services AS (
+                    SELECT date_ymd, day_start_sec, day_end_sec, service_id FROM calendar_services
+                    UNION
+                    SELECT date_ymd, day_start_sec, day_end_sec, service_id FROM add_services
+                ),
+                active_services AS (
+                    SELECT bs.date_ymd, bs.day_start_sec, bs.day_end_sec, bs.service_id
+                    FROM base_services bs
+                    LEFT JOIN remove_services r
+                      ON r.date_ymd = bs.date_ymd AND r.service_id = bs.service_id
+                    WHERE r.service_id IS NULL
+                ),
+                trips_in_window AS (
+                    SELECT t.route_id, COUNT(DISTINCT t.trip_id)::int AS trip_count
+                    FROM trips t
+                    JOIN active_services s ON s.service_id = t.service_id
+                    JOIN trip_time_bounds b ON b.feed_id = t.feed_id AND b.trip_id = t.trip_id
+                    WHERE t.feed_id = %s
+                      AND b.last_sec >= s.day_start_sec
+                      AND b.first_sec <= s.day_end_sec
+                    GROUP BY t.route_id
+                )
+            """
+            window_params = [
+                str(start_date_ymd),
+                str(end_date_ymd),
+                int(start_sec),
+                int(end_sec),
+                feed_id,
+                feed_id,
+                feed_id,
+                feed_id,
+            ]
+        with conn.cursor() as cur:
+            if q.isdigit():
+                cur.execute(
+                    f"""
+                    WITH route_last_stop AS (
+                      SELECT DISTINCT ON (t.route_id)
+                        t.route_id,
+                        s.name AS last_stop_name
+                      FROM trips t
+                      JOIN (
+                        SELECT feed_id, trip_id, MAX(stop_sequence) AS max_seq
+                        FROM stop_times
+                        GROUP BY feed_id, trip_id
+                      ) mx ON mx.feed_id = t.feed_id AND mx.trip_id = t.trip_id
+                      JOIN stop_times st
+                        ON st.feed_id = mx.feed_id AND st.trip_id = mx.trip_id AND st.stop_sequence = mx.max_seq
+                      JOIN stops s ON s.feed_id = st.feed_id AND s.stop_id = st.stop_id
+                      WHERE t.feed_id = %s
+                      ORDER BY t.route_id, t.trip_id
+                    ),
+                    filtered_routes AS (
+                      SELECT
+                        r.route_id,
+                        r.short_name,
+                        r.long_name,
+                        r.agency_id,
+                        r.route_type
+                      FROM routes r
+                      WHERE r.feed_id = %s
+                        AND (LOWER(r.route_id) = %s OR LOWER(r.short_name) = %s)
+                      LIMIT %s
+                    )
+                    {window_sql}
+                    SELECT
+                      fr.route_id,
+                      fr.short_name,
+                      fr.long_name,
+                      fr.agency_id,
+                      fr.route_type,
+                      a.name AS agency_name,
+                      {"COALESCE(tw.trip_count, 0)::int AS trip_count" if use_window else "NULL::int AS trip_count"},
+                      rls.last_stop_name
+                    FROM filtered_routes fr
+                    LEFT JOIN route_last_stop rls ON rls.route_id = fr.route_id
+                    LEFT JOIN agencies a
+                      ON a.feed_id = %s AND a.agency_id = fr.agency_id
+                    {"LEFT JOIN trips_in_window tw ON tw.route_id = fr.route_id" if use_window else ""}
+                    """,
+                    [feed_id, feed_id, q, q, limit, *window_params, feed_id],
+                )
+            else:
+                like = f"%{q}%"
+                cur.execute(
+                    f"""
+                    WITH route_last_stop AS (
+                      SELECT DISTINCT ON (t.route_id)
+                        t.route_id,
+                        s.name AS last_stop_name
+                      FROM trips t
+                      JOIN (
+                        SELECT feed_id, trip_id, MAX(stop_sequence) AS max_seq
+                        FROM stop_times
+                        GROUP BY feed_id, trip_id
+                      ) mx ON mx.feed_id = t.feed_id AND mx.trip_id = t.trip_id
+                      JOIN stop_times st
+                        ON st.feed_id = mx.feed_id AND st.trip_id = mx.trip_id AND st.stop_sequence = mx.max_seq
+                      JOIN stops s ON s.feed_id = st.feed_id AND s.stop_id = st.stop_id
+                      WHERE t.feed_id = %s
+                      ORDER BY t.route_id, t.trip_id
+                    ),
+                    filtered_routes AS (
+                      SELECT
+                        r.route_id,
+                        r.short_name,
+                        r.long_name,
+                        r.agency_id,
+                        r.route_type
+                      FROM routes r
+                      WHERE r.feed_id = %s
+                        AND (
+                          LOWER(COALESCE(r.route_id, ''))    LIKE %s OR
+                          LOWER(COALESCE(r.short_name, ''))  LIKE %s OR
+                          LOWER(COALESCE(r.long_name, ''))   LIKE %s
+                        )
+                      LIMIT %s
+                    )
+                    {window_sql}
+                    SELECT
+                      fr.route_id,
+                      fr.short_name,
+                      fr.long_name,
+                      fr.agency_id,
+                      fr.route_type,
+                      a.name AS agency_name,
+                      {"COALESCE(tw.trip_count, 0)::int AS trip_count" if use_window else "NULL::int AS trip_count"},
+                      rls.last_stop_name
+                    FROM filtered_routes fr
+                    LEFT JOIN route_last_stop rls ON rls.route_id = fr.route_id
+                    LEFT JOIN agencies a
+                      ON a.feed_id = %s AND a.agency_id = fr.agency_id
+                    {"LEFT JOIN trips_in_window tw ON tw.route_id = fr.route_id" if use_window else ""}
+                    """,
+                    [feed_id, feed_id, like, like, like, limit, *window_params, feed_id],
+                )
+            return [
+                {
+                    "route_id": r["route_id"],
+                    "route_short_name": r["short_name"],
+                    "route_long_name": r["long_name"],
+                    "agency_id": r["agency_id"],
+                    "route_type": r["route_type"],
+                    "agency_name": r["agency_name"],
+                    "trip_count": r["trip_count"],
+                    "last_stop_name": r.get("last_stop_name"),
+                }
+                for r in cur.fetchall()
+            ]
+    finally:
+        if close:
+            conn.close()
+

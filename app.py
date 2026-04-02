@@ -568,27 +568,25 @@ def routes_search(req: RouteSearchRequest):
     q = req.q.strip()
     if not q:
         return []
-    start_sec = None
-    end_sec = None
-    date_ymd = None
-    if req.date:
-        d = str(req.date).strip()
-        if not (len(d) == 8 and d.isdigit()):
-            raise HTTPException(status_code=400, detail="date must be YYYYMMDD")
-        date_ymd = d
-        start_sec = _parse_hhmm_to_seconds((req.start_time or "04:00").strip())
-        end_sec = _parse_hhmm_to_seconds((req.end_time or "23:59").strip())
-        if end_sec < start_sec:
-            raise HTTPException(status_code=400, detail="end_time must be greater than or equal to start_time")
+    window = _parse_window_range(
+        req.start_date, req.start_time, req.end_date, req.end_time, allow_empty=True
+    )
     try:
-        rows = db_access_module.search_routes_pg(q, req.limit, date_ymd, start_sec, end_sec)
+        rows = db_access_module.search_routes_pg_range(
+            q,
+            req.limit,
+            start_date_ymd=window[0] if window else None,
+            start_sec=window[1] if window else None,
+            end_date_ymd=window[2] if window else None,
+            end_sec=window[3] if window else None,
+        )
     except Exception as e:
         log("routes/search", f"error q={q!r} reason={e!s}")
         raise HTTPException(status_code=503, detail=f"Could not search routes in PostGIS: {e}")
     log(
         "routes/search",
         f"q={q!r} limit={req.limit} rows={len(rows)}"
-        + (f" window={date_ymd}" if date_ymd else ""),
+        + (f" window={window[0]} {req.start_time}-{window[2]} {req.end_time}" if window else ""),
     )
     results: list[RouteInfo] = []
     for row in rows:
@@ -1780,6 +1778,53 @@ def _parse_hhmm_to_seconds(value: str) -> int:
         return 0
 
 
+def _parse_window_range(
+    start_date: Optional[str],
+    start_time: Optional[str],
+    end_date: Optional[str],
+    end_time: Optional[str],
+    *,
+    allow_empty: bool = False,
+) -> Optional[tuple[str, int, str, int]]:
+    start_date = (start_date or "").strip()
+    start_time = (start_time or "").strip()
+    end_date = (end_date or "").strip()
+    end_time = (end_time or "").strip()
+    if allow_empty and not start_date and not start_time and not end_date and not end_time:
+        return None
+    if not (start_date and start_time and end_date and end_time):
+        raise HTTPException(
+            status_code=400,
+            detail="start_date/start_time/end_date/end_time are required together",
+        )
+    if not (len(start_date) == 8 and start_date.isdigit()):
+        raise HTTPException(status_code=400, detail="start_date must be YYYYMMDD")
+    if not (len(end_date) == 8 and end_date.isdigit()):
+        raise HTTPException(status_code=400, detail="end_date must be YYYYMMDD")
+    start_sec = _parse_hhmm_to_seconds(start_time)
+    end_sec = _parse_hhmm_to_seconds(end_time)
+    if start_sec < 0 or end_sec < 0:
+        raise HTTPException(status_code=400, detail="time values must be non-negative")
+    try:
+        start_dt = datetime.strptime(start_date, "%Y%m%d").replace(
+            hour=start_sec // 3600,
+            minute=(start_sec % 3600) // 60,
+            second=start_sec % 60,
+        )
+        end_dt = datetime.strptime(end_date, "%Y%m%d").replace(
+            hour=end_sec // 3600,
+            minute=(end_sec % 3600) // 60,
+            second=end_sec % 60,
+        )
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date/time values")
+    if end_dt < start_dt:
+        raise HTTPException(
+            status_code=400, detail="end date/time must be greater than or equal to start date/time"
+        )
+    return start_date, start_sec, end_date, end_sec
+
+
 def _segment_line_from_edges(
     pattern_id: str,
     stop_ids: List[str],
@@ -2189,22 +2234,16 @@ def _normalize_area_geometry(geojson: dict) -> dict:
 @app.post("/area/routes", response_model=AreaRoutesResponse)
 def area_routes(req: AreaRoutesQuery):
     """
-    Given a polygon and time window on a specific service date, return the list
+    Given a polygon and datetime range, return the list
     of routes whose shapes intersect that polygon and have at least one trip
     running during that window. Accepts Polygon, LineString, or Point (buffered).
     """
     if not req.polygon_geojson:
         raise HTTPException(status_code=400, detail="polygon_geojson is required")
 
-    if not (req.date and len(req.date) == 8 and req.date.isdigit()):
-        raise HTTPException(status_code=400, detail="date must be YYYYMMDD (e.g. 20250303)")
-
-    start_sec = _parse_hhmm_to_seconds(req.start_time)
-    end_sec = _parse_hhmm_to_seconds(req.end_time)
-    if end_sec < start_sec:
-        raise HTTPException(
-            status_code=400, detail="end_time must be greater than or equal to start_time"
-        )
+    start_date_ymd, start_sec, end_date_ymd, end_sec = _parse_window_range(
+        req.start_date, req.start_time, req.end_date, req.end_time
+    )
 
     try:
         polygon_geojson = _normalize_area_geometry(req.polygon_geojson)
@@ -2217,8 +2256,9 @@ def area_routes(req: AreaRoutesQuery):
         routes_raw = find_routes_in_polygon(
             feed=None,
             polygon_geojson=polygon_geojson,
-            yyyymmdd=req.date,
+            start_date_ymd=start_date_ymd,
             start_sec=start_sec,
+            end_date_ymd=end_date_ymd,
             end_sec=end_sec,
         )
     except HTTPException:
@@ -2272,7 +2312,7 @@ def area_routes(req: AreaRoutesQuery):
 
     log(
         "area/routes",
-        f"date={req.date} window={req.start_time}-{req.end_time} routes={len(results)}",
+        f"window={start_date_ymd} {req.start_time}-{end_date_ymd} {req.end_time} routes={len(results)}",
     )
     return AreaRoutesResponse(routes=results)
 
@@ -2293,15 +2333,9 @@ def detours_by_area(req: DetourByAreaRequest):
     if not req.blockage_geojson:
         raise HTTPException(status_code=400, detail="blockage_geojson is required")
 
-    if not (req.date and len(req.date) == 8 and req.date.isdigit()):
-        raise HTTPException(status_code=400, detail="date must be YYYYMMDD (e.g. 20250303)")
-
-    start_sec = _parse_hhmm_to_seconds(req.start_time)
-    end_sec = _parse_hhmm_to_seconds(req.end_time)
-    if end_sec < start_sec:
-        raise HTTPException(
-            status_code=400, detail="end_time must be greater than or equal to start_time"
-        )
+    start_date_ymd, start_sec, end_date_ymd, end_sec = _parse_window_range(
+        req.start_date, req.start_time, req.end_date, req.end_time
+    )
 
     try:
         polygon_geojson = _normalize_area_geometry(req.blockage_geojson)
@@ -2320,7 +2354,7 @@ def detours_by_area(req: DetourByAreaRequest):
 
     log(
         "detours/by-area",
-        f"mode={req.mode}, date={req.date}, "
+        f"mode={req.mode}, start_date={start_date_ymd}, end_date={end_date_ymd}, "
         f"time_window={req.start_time}-{req.end_time}, "
         f"max_routes={req.max_routes}, transfer_radius_m={req.transfer_radius_m}",
     )
@@ -2330,7 +2364,7 @@ def detours_by_area(req: DetourByAreaRequest):
             raise HTTPException(status_code=400, detail="route_id is required when mode='route'")
         result = _compute_route_detour_by_area(
             feed=feed,
-            date_str=req.date,
+            date_str=start_date_ymd,
             start_sec=start_sec,
             end_sec=end_sec,
             blockage_geojson=polygon_geojson,
@@ -2355,8 +2389,9 @@ def detours_by_area(req: DetourByAreaRequest):
         routes_raw = find_routes_in_polygon(
             feed=feed,
             polygon_geojson=polygon_geojson,
-            yyyymmdd=req.date,
+            start_date_ymd=start_date_ymd,
             start_sec=start_sec,
+            end_date_ymd=end_date_ymd,
             end_sec=end_sec,
         )
     except Exception as e:
@@ -2378,7 +2413,7 @@ def detours_by_area(req: DetourByAreaRequest):
     for route_id, direction_id in candidates:
         res = _compute_route_detour_by_area(
             feed=feed,
-            date_str=req.date,
+            date_str=start_date_ymd,
             start_sec=start_sec,
             end_sec=end_sec,
             blockage_geojson=polygon_geojson,
@@ -2392,7 +2427,7 @@ def detours_by_area(req: DetourByAreaRequest):
     log(
         "detours/by-area",
         f"computed {len(results)} route detours "
-        f"for blockage on date={req.date}, "
+        f"for blockage on start_date={start_date_ymd}, end_date={end_date_ymd}, "
         f"time_window={req.start_time}-{req.end_time}",
     )
 
@@ -2401,19 +2436,16 @@ def detours_by_area(req: DetourByAreaRequest):
 
 @app.post("/stop/routes", response_model=StopRoutesResponse)
 def stop_routes(req: StopRoutesRequest):
-    """Return routes that serve the given stop on the given date within the time window."""
-    start_sec = _parse_hhmm_to_seconds(req.start_time)
-    end_sec = _parse_hhmm_to_seconds(req.end_time)
-    if end_sec < start_sec:
-        raise HTTPException(
-            status_code=400,
-            detail="end_time must be greater than or equal to start_time",
-        )
+    """Return routes that serve the given stop within the selected datetime range."""
+    start_date_ymd, start_sec, end_date_ymd, end_sec = _parse_window_range(
+        req.start_date, req.start_time, req.end_date, req.end_time
+    )
     try:
-        routes_raw = db_access_module.get_routes_serving_stop_pg(
+        routes_raw = db_access_module.get_routes_serving_stop_pg_range(
             stop_id=req.stop_id,
-            yyyymmdd=req.date,
+            start_date_ymd=start_date_ymd,
             start_sec=start_sec,
+            end_date_ymd=end_date_ymd,
             end_sec=end_sec,
             max_results=req.max_results,
         )

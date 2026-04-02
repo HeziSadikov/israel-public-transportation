@@ -83,9 +83,47 @@ const API_BASE: string =
 const DEFAULT_EXPLORER_POSITION = { x: 24, y: 24 };
 const DEFAULT_EXPLORER_SIZE = { width: 620, height: 420 };
 
+const HHMM_RE = /^([01]\d|2[0-3]):([0-5]\d)$/;
+const YMD_RE = /^\d{8}$/;
+
+const toIsoDate = (yyyymmdd: string): string => {
+  if (!YMD_RE.test(yyyymmdd)) return "";
+  return `${yyyymmdd.slice(0, 4)}-${yyyymmdd.slice(4, 6)}-${yyyymmdd.slice(6, 8)}`;
+};
+
+const fromIsoDate = (isoDate: string): string => isoDate.replaceAll("-", "");
+
+const isValidYmd = (yyyymmdd: string): boolean => {
+  if (!YMD_RE.test(yyyymmdd)) return false;
+  const iso = toIsoDate(yyyymmdd);
+  const d = new Date(`${iso}T00:00:00`);
+  if (Number.isNaN(d.getTime())) return false;
+  return (
+    d.getFullYear() === Number(yyyymmdd.slice(0, 4)) &&
+    d.getMonth() + 1 === Number(yyyymmdd.slice(4, 6)) &&
+    d.getDate() === Number(yyyymmdd.slice(6, 8))
+  );
+};
+
+const toLocalDateTime = (yyyymmdd: string, hhmm: string): Date | null => {
+  if (!isValidYmd(yyyymmdd) || !HHMM_RE.test(hhmm)) return null;
+  const y = Number(yyyymmdd.slice(0, 4));
+  const m = Number(yyyymmdd.slice(4, 6)) - 1;
+  const d = Number(yyyymmdd.slice(6, 8));
+  const hh = Number(hhmm.slice(0, 2));
+  const mm = Number(hhmm.slice(3, 5));
+  const dt = new Date(y, m, d, hh, mm, 0, 0);
+  if (Number.isNaN(dt.getTime())) return null;
+  return dt;
+};
+
 const App: React.FC = () => {
   const [blockageGeojson, setBlockageGeojson] = useState<GeoJSON.Geometry | null>(null);
-  const [areaDate, setAreaDate] = useState(() => {
+  const [areaStartDate, setAreaStartDate] = useState(() => {
+    const d = new Date();
+    return `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, "0")}${String(d.getDate()).padStart(2, "0")}`;
+  });
+  const [areaEndDate, setAreaEndDate] = useState(() => {
     const d = new Date();
     return `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, "0")}${String(d.getDate()).padStart(2, "0")}`;
   });
@@ -137,8 +175,43 @@ const App: React.FC = () => {
   const latestRouteLoadIdRef = useRef(0);
   const stopLinesAbortRef = useRef<AbortController | null>(null);
   const stopLinesRequestIdRef = useRef(0);
+  const timeStartDateInputRef = useRef<HTMLInputElement | null>(null);
+  const timeStartInputRef = useRef<HTMLInputElement | null>(null);
+  const timeEndDateInputRef = useRef<HTMLInputElement | null>(null);
+  const timeEndInputRef = useRef<HTMLInputElement | null>(null);
 
   const center: [number, number] = [31.5, 35.0];
+  const timeWindowError = useMemo(() => {
+    if (!isValidYmd(areaStartDate.trim())) return "Start date must be valid and formatted as YYYYMMDD.";
+    if (!isValidYmd(areaEndDate.trim())) return "End date must be valid and formatted as YYYYMMDD.";
+    if (!HHMM_RE.test(areaStartTime.trim())) return "Start time must be in HH:MM (24h).";
+    if (!HHMM_RE.test(areaEndTime.trim())) return "End time must be in HH:MM (24h).";
+    const startDt = toLocalDateTime(areaStartDate.trim(), areaStartTime.trim());
+    const endDt = toLocalDateTime(areaEndDate.trim(), areaEndTime.trim());
+    if (!startDt || !endDt) return "Invalid date/time value.";
+    if (endDt.getTime() < startDt.getTime()) return "End date/time must be later than or equal to start date/time.";
+    return null;
+  }, [areaStartDate, areaEndDate, areaStartTime, areaEndTime]);
+  const isTimeWindowValid = timeWindowError == null;
+
+  const timePresets: { label: string; start: string; end: string }[] = [
+    { label: "All day", start: "04:00", end: "23:59" },
+    { label: "AM", start: "06:00", end: "10:00" },
+    { label: "Midday", start: "10:00", end: "16:00" },
+    { label: "PM", start: "16:00", end: "22:00" },
+  ];
+
+  const applyRelativePreset = (hoursAhead: number) => {
+    const now = new Date();
+    const end = new Date(now.getTime() + hoursAhead * 60 * 60 * 1000);
+    const toHHMM = (d: Date) => `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+    const toYMD = (d: Date) =>
+      `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, "0")}${String(d.getDate()).padStart(2, "0")}`;
+    setAreaStartDate(toYMD(now));
+    setAreaEndDate(toYMD(end));
+    setAreaStartTime(toHHMM(now));
+    setAreaEndTime(toHHMM(end));
+  };
 
   const loadRouteOnMap = async (routeId: string, directionId?: string | null) => {
     const loadId = ++latestRouteLoadIdRef.current;
@@ -149,7 +222,7 @@ const App: React.FC = () => {
     try {
       const previewParams: Record<string, string | boolean> = {
         route_id: routeId,
-        date: areaDate,
+        date: areaStartDate,
         pretty_osm: prettyOSM,
       };
       if (directionId != null && directionId !== "") (previewParams as any).direction_id = directionId;
@@ -212,6 +285,10 @@ const App: React.FC = () => {
   };
 
   const handleFindAreaRoutes = async () => {
+    if (!isTimeWindowValid) {
+      setMessage(timeWindowError);
+      return;
+    }
     if (!blockageGeojson) {
       setMessage("Draw a blockage first.");
       return;
@@ -224,8 +301,9 @@ const App: React.FC = () => {
     try {
       const res = await axios.post<{ routes: AreaRouteResult[] }>(`${API_BASE}/area/routes`, {
         polygon_geojson: blockageGeojson,
-        date: areaDate.trim(),
+        start_date: areaStartDate.trim(),
         start_time: areaStartTime.trim() || "04:00",
+        end_date: areaEndDate.trim(),
         end_time: areaEndTime.trim() || "23:59",
         max_results: 200,
       }, { timeout: 120000, headers: { "Content-Type": "application/json" } });
@@ -243,6 +321,10 @@ const App: React.FC = () => {
   };
 
   const handleLineSearch = async () => {
+    if (!isTimeWindowValid) {
+      setMessage(timeWindowError);
+      return;
+    }
     if (!lineSearchQuery.trim()) return;
     setLineSearchLoading(true);
     setMessage(null);
@@ -250,8 +332,9 @@ const App: React.FC = () => {
       const res = await axios.post<RouteInfo[]>(`${API_BASE}/routes/search`, {
         q: lineSearchQuery.trim(),
         limit: 20,
-        date: areaDate.trim(),
+        start_date: areaStartDate.trim(),
         start_time: areaStartTime.trim() || "04:00",
+        end_date: areaEndDate.trim(),
         end_time: areaEndTime.trim() || "23:59",
       });
       setLineSearchResults(res.data);
@@ -357,6 +440,15 @@ const App: React.FC = () => {
     setExplorerTab("stop");
   };
 
+  const handleOpenStopInExplorer = (s: SelectedStopInfo) => {
+    setSelectedStop(s);
+    setStopSearchQuery(s.stop_id);
+    setStopSearchResults([]);
+    setStopSearchError(null);
+    setExplorerTab("stop");
+    setExplorerOpen(true);
+  };
+
   useEffect(() => {
     stopLinesAbortRef.current?.abort();
     stopLinesAbortRef.current = null;
@@ -367,6 +459,10 @@ const App: React.FC = () => {
   }, [selectedStop?.stop_id]);
 
   const handleSearchLinesInStop = async () => {
+    if (!isTimeWindowValid) {
+      setStopLinesError(timeWindowError);
+      return;
+    }
     if (!selectedStop?.stop_id) return;
     stopLinesAbortRef.current?.abort();
     const controller = new AbortController();
@@ -384,8 +480,9 @@ const App: React.FC = () => {
     try {
       const res = await axios.post<StopRoutesResponse>(`${API_BASE}/stop/routes`, {
         stop_id: selectedStop.stop_id,
-        date: areaDate.trim(),
+        start_date: areaStartDate.trim(),
         start_time: areaStartTime.trim() || "04:00",
+        end_date: areaEndDate.trim(),
         end_time: areaEndTime.trim() || "23:59",
         max_results: 100,
       }, {
@@ -427,6 +524,10 @@ const App: React.FC = () => {
   };
 
   const handleComputeDetour = async () => {
+    if (!isTimeWindowValid) {
+      setMessage(timeWindowError);
+      return;
+    }
     if (!blockageGeojson) {
       setMessage("Draw a blockage first.");
       return;
@@ -442,8 +543,9 @@ const App: React.FC = () => {
     try {
       const body: any = {
         mode: detourMode,
-        date: areaDate.trim(),
+        start_date: areaStartDate.trim(),
         start_time: areaStartTime.trim() || "04:00",
+        end_date: areaEndDate.trim(),
         end_time: areaEndTime.trim() || "23:59",
         blockage_geojson: blockageGeojson,
         max_routes: 20,
@@ -520,7 +622,7 @@ const App: React.FC = () => {
       <aside className="rail">
         <h1 className="rail-title">Detour Router</h1>
 
-        <section className="rail-section">
+        <section className="rail-section time-window-section">
           <h2 className="rail-heading">Blockage</h2>
           <div className="rail-buttons">
             <button type="button" onClick={() => mapRef.current?.startPolygon()} title="Draw polygon blockage">
@@ -534,15 +636,84 @@ const App: React.FC = () => {
           </div>
         </section>
 
-        <section className="rail-section">
+        <section className="rail-section time-window-section">
           <h2 className="rail-heading">Time window</h2>
-          <label>Date</label>
-          <input type="text" value={areaDate} onChange={(e) => setAreaDate(e.target.value)} placeholder="YYYYMMDD" />
-          <label>Start – End</label>
+          <label>Start date/time</label>
           <div className="row">
-            <input type="text" value={areaStartTime} onChange={(e) => setAreaStartTime(e.target.value)} placeholder="04:00" />
-            <input type="text" value={areaEndTime} onChange={(e) => setAreaEndTime(e.target.value)} placeholder="23:59" />
+            <input
+              ref={timeStartDateInputRef}
+              type="date"
+              value={toIsoDate(areaStartDate.trim())}
+              onChange={(e) => setAreaStartDate(fromIsoDate(e.target.value))}
+              onKeyDown={(e) => {
+                if (e.key !== "Enter") return;
+                e.preventDefault();
+                timeStartInputRef.current?.focus();
+              }}
+            />
+            <input
+              ref={timeStartInputRef}
+              type="time"
+              value={HHMM_RE.test(areaStartTime.trim()) ? areaStartTime.trim() : ""}
+              onChange={(e) => setAreaStartTime(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key !== "Enter") return;
+                e.preventDefault();
+                timeEndDateInputRef.current?.focus();
+              }}
+            />
           </div>
+          <label>End date/time</label>
+          <div className="row">
+            <input
+              ref={timeEndDateInputRef}
+              type="date"
+              value={toIsoDate(areaEndDate.trim())}
+              onChange={(e) => setAreaEndDate(fromIsoDate(e.target.value))}
+              onKeyDown={(e) => {
+                if (e.key !== "Enter") return;
+                e.preventDefault();
+                timeEndInputRef.current?.focus();
+              }}
+            />
+            <input
+              ref={timeEndInputRef}
+              type="time"
+              value={HHMM_RE.test(areaEndTime.trim()) ? areaEndTime.trim() : ""}
+              onChange={(e) => setAreaEndTime(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key !== "Enter") return;
+                e.preventDefault();
+                timeStartDateInputRef.current?.focus();
+              }}
+            />
+          </div>
+          <div className="time-window-presets">
+            {timePresets.map((preset) => (
+              <button
+                key={preset.label}
+                type="button"
+                className="btn-time-preset"
+                onClick={() => {
+                  setAreaStartTime(preset.start);
+                  setAreaEndTime(preset.end);
+                }}
+              >
+                {preset.label}
+              </button>
+            ))}
+            <button type="button" className="btn-time-preset" onClick={() => applyRelativePreset(1)}>
+              +1h
+            </button>
+            <button type="button" className="btn-time-preset" onClick={() => applyRelativePreset(2)}>
+              +2h
+            </button>
+          </div>
+          {timeWindowError ? (
+            <p className="time-window-validation error">{timeWindowError}</p>
+          ) : (
+            <p className="time-window-validation">Time window looks good.</p>
+          )}
         </section>
 
         <section className="rail-section">
@@ -569,7 +740,7 @@ const App: React.FC = () => {
             type="button"
             className="btn-compute"
             onClick={handleComputeDetour}
-            disabled={detourLoading || !blockageGeojson}
+            disabled={detourLoading || !blockageGeojson || !isTimeWindowValid}
           >
             {detourLoading ? "Computing…" : "Compute detour"}
           </button>
@@ -640,8 +811,10 @@ const App: React.FC = () => {
           blockageGeojson={blockageGeojson as GeoJSON.Geometry | null}
           onBlockageChange={setBlockageGeojson}
           pinPosition={pinPosition}
+          selectedStopId={selectedStop?.stop_id ?? null}
           basemap={basemap}
           onStopClick={handleMapStopClick}
+          onStopOpenInExplorer={handleOpenStopInExplorer}
         />
         {explorerOpen && (
           <ExplorerWindow
@@ -656,6 +829,7 @@ const App: React.FC = () => {
             onSizeChange={setExplorerSize}
             areaRoutes={areaRoutes}
             areaLoading={areaLoading}
+            timeWindowValid={isTimeWindowValid}
             resultByRouteId={resultByRouteId}
             selectedRouteId={selectedRoute?.route_id ?? null}
             onFindAreaRoutes={handleFindAreaRoutes}

@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import { Rnd } from "react-rnd";
 
 export type ExplorerTab = "area" | "line" | "point" | "address" | "stop";
@@ -27,6 +27,9 @@ export type AreaRouteResult = {
 };
 
 export type ExplorerSortBy = "line_asc" | "line_desc" | "agency_asc" | "agency_desc" | "trips_desc" | "destination_asc";
+type SortDir = "asc" | "desc";
+type SortTable = "area" | "line" | "stop";
+type SortColumn = "line" | "agency" | "trips" | "destination" | "route_pair" | "detour" | "time_window";
 
 export type DetourByAreaRouteResult = {
   route_id: string;
@@ -75,6 +78,7 @@ type ExplorerWindowProps = {
   // Area tab
   areaRoutes: AreaRouteResult[] | null;
   areaLoading: boolean;
+  timeWindowValid: boolean;
   resultByRouteId: Map<string, DetourByAreaRouteResult>;
   selectedRouteId: string | null;
   onFindAreaRoutes: () => void;
@@ -148,8 +152,40 @@ const TAB_LABELS: Record<ExplorerTab, string> = {
 export const ExplorerWindow: React.FC<ExplorerWindowProps> = (props) => {
   const [pointLat, setPointLat] = useState("");
   const [pointLng, setPointLng] = useState("");
+  const [sortByTable, setSortByTable] = useState<Record<SortTable, { column: SortColumn; dir: SortDir }>>({
+    area: { column: "line", dir: "asc" },
+    line: { column: "line", dir: "asc" },
+    stop: { column: "line", dir: "asc" },
+  });
+  const [sortMemory, setSortMemory] = useState<Record<SortTable, Partial<Record<SortColumn, SortDir>>>>({
+    area: { line: "asc", agency: "asc", trips: "desc", destination: "asc", route_pair: "asc", detour: "asc" },
+    line: { line: "asc", agency: "asc", trips: "desc", destination: "asc", route_pair: "asc" },
+    stop: { line: "asc", agency: "asc", destination: "asc", time_window: "asc" },
+  });
 
   if (!props.isOpen) return null;
+
+  useEffect(() => {
+    const fromLegacySort = (): { column: SortColumn; dir: SortDir } => {
+      switch (props.sortBy) {
+        case "line_desc":
+          return { column: "line", dir: "desc" };
+        case "agency_asc":
+          return { column: "agency", dir: "asc" };
+        case "agency_desc":
+          return { column: "agency", dir: "desc" };
+        case "trips_desc":
+          return { column: "trips", dir: "desc" };
+        case "destination_asc":
+          return { column: "destination", dir: "asc" };
+        case "line_asc":
+        default:
+          return { column: "line", dir: "asc" };
+      }
+    };
+    const s = fromLegacySort();
+    setSortByTable((prev) => ({ ...prev, area: s, line: s }));
+  }, [props.sortBy]);
 
   const handleGoToPoint = () => {
     const lat = parseFloat(pointLat.replace(",", "."));
@@ -159,34 +195,59 @@ export const ExplorerWindow: React.FC<ExplorerWindowProps> = (props) => {
     }
   };
 
+  const handleSortHeaderClick = (table: SortTable, column: SortColumn, defaultDir: SortDir = "asc") => {
+    setSortByTable((prev) => {
+      const active = prev[table];
+      let nextDir: SortDir;
+      if (active.column === column) {
+        nextDir = active.dir === "asc" ? "desc" : "asc";
+      } else {
+        nextDir = sortMemory[table][column] ?? defaultDir;
+      }
+      setSortMemory((mem) => ({ ...mem, [table]: { ...mem[table], [column]: nextDir } }));
+      return { ...prev, [table]: { column, dir: nextDir } };
+    });
+  };
+
+  const sortArrow = (table: SortTable, column: SortColumn): string =>
+    sortByTable[table].column === column ? (sortByTable[table].dir === "asc" ? "▲" : "▼") : "";
+
   const sortedAreaRoutes = useMemo(() => {
     const rows = [...(props.areaRoutes ?? [])];
     const cmpText = (a: string | null | undefined, b: string | null | undefined) =>
       (a ?? "").localeCompare(b ?? "", "he", { sensitivity: "base", numeric: true });
     const cmpLine = (a: string | null | undefined, b: string | null | undefined) =>
       (a ?? "").localeCompare(b ?? "", "he", { sensitivity: "base", numeric: true });
+    const detourRank = (r: AreaRouteResult): number => {
+      const key = `${r.route_id}\t${r.direction_id ?? ""}`;
+      const result = props.resultByRouteId.get(key);
+      if (!result) return 9;
+      const status = getRouteResultStatus(result);
+      if (status === "detour") return 1;
+      if (status === "no-detour") return 2;
+      return 3;
+    };
     rows.sort((a, b) => {
-      switch (props.sortBy) {
-        case "line_desc":
-          return cmpLine(b.route_short_name ?? b.route_id, a.route_short_name ?? a.route_id);
-        case "agency_asc":
-          return cmpText(a.agency_name, b.agency_name) || cmpLine(a.route_short_name ?? a.route_id, b.route_short_name ?? b.route_id);
-        case "agency_desc":
-          return cmpText(b.agency_name, a.agency_name) || cmpLine(a.route_short_name ?? a.route_id, b.route_short_name ?? b.route_id);
-        case "trips_desc":
-          return Number(b.trip_count ?? 0) - Number(a.trip_count ?? 0) || cmpLine(a.route_short_name ?? a.route_id, b.route_short_name ?? b.route_id);
-        case "destination_asc":
-          return (
-            cmpText(destinationSortKey(a), destinationSortKey(b)) ||
-            cmpLine(a.route_short_name ?? a.route_id, b.route_short_name ?? b.route_id)
-          );
-        case "line_asc":
+      const { column, dir } = sortByTable.area;
+      const s = dir === "asc" ? 1 : -1;
+      switch (column) {
+        case "agency":
+          return s * cmpText(a.agency_name, b.agency_name) || cmpLine(a.route_short_name ?? a.route_id, b.route_short_name ?? b.route_id);
+        case "trips":
+          return s * (Number(a.trip_count ?? 0) - Number(b.trip_count ?? 0)) || cmpLine(a.route_short_name ?? a.route_id, b.route_short_name ?? b.route_id);
+        case "destination":
+          return s * cmpText(destinationSortKey(a), destinationSortKey(b)) || cmpLine(a.route_short_name ?? a.route_id, b.route_short_name ?? b.route_id);
+        case "route_pair":
+          return s * cmpText(a.route_long_name, b.route_long_name) || cmpLine(a.route_short_name ?? a.route_id, b.route_short_name ?? b.route_id);
+        case "detour":
+          return s * (detourRank(a) - detourRank(b)) || cmpLine(a.route_short_name ?? a.route_id, b.route_short_name ?? b.route_id);
+        case "line":
         default:
-          return cmpLine(a.route_short_name ?? a.route_id, b.route_short_name ?? b.route_id);
+          return s * cmpLine(a.route_short_name ?? a.route_id, b.route_short_name ?? b.route_id);
       }
     });
     return rows;
-  }, [props.areaRoutes, props.sortBy]);
+  }, [props.areaRoutes, props.resultByRouteId, sortByTable.area]);
 
   const sortedLineRoutes = useMemo(() => {
     const rows = [...props.lineSearchResults];
@@ -195,27 +256,50 @@ export const ExplorerWindow: React.FC<ExplorerWindowProps> = (props) => {
     const cmpLine = (a: string | null | undefined, b: string | null | undefined) =>
       (a ?? "").localeCompare(b ?? "", "he", { sensitivity: "base", numeric: true });
     rows.sort((a, b) => {
-      switch (props.sortBy) {
-        case "line_desc":
-          return cmpLine(b.route_short_name ?? b.route_id, a.route_short_name ?? a.route_id);
-        case "agency_asc":
-          return cmpText(a.agency_name, b.agency_name) || cmpLine(a.route_short_name ?? a.route_id, b.route_short_name ?? b.route_id);
-        case "agency_desc":
-          return cmpText(b.agency_name, a.agency_name) || cmpLine(a.route_short_name ?? a.route_id, b.route_short_name ?? b.route_id);
-        case "trips_desc":
-          return Number(b.trip_count ?? 0) - Number(a.trip_count ?? 0) || cmpLine(a.route_short_name ?? a.route_id, b.route_short_name ?? b.route_id);
-        case "destination_asc":
-          return (
-            cmpText(destinationSortKey(a), destinationSortKey(b)) ||
-            cmpLine(a.route_short_name ?? a.route_id, b.route_short_name ?? b.route_id)
-          );
-        case "line_asc":
+      const { column, dir } = sortByTable.line;
+      const s = dir === "asc" ? 1 : -1;
+      switch (column) {
+        case "agency":
+          return s * cmpText(a.agency_name, b.agency_name) || cmpLine(a.route_short_name ?? a.route_id, b.route_short_name ?? b.route_id);
+        case "trips":
+          return s * (Number(a.trip_count ?? 0) - Number(b.trip_count ?? 0)) || cmpLine(a.route_short_name ?? a.route_id, b.route_short_name ?? b.route_id);
+        case "destination":
+          return s * cmpText(destinationSortKey(a), destinationSortKey(b)) || cmpLine(a.route_short_name ?? a.route_id, b.route_short_name ?? b.route_id);
+        case "route_pair":
+          return s * cmpText(a.route_long_name, b.route_long_name) || cmpLine(a.route_short_name ?? a.route_id, b.route_short_name ?? b.route_id);
+        case "line":
         default:
-          return cmpLine(a.route_short_name ?? a.route_id, b.route_short_name ?? b.route_id);
+          return s * cmpLine(a.route_short_name ?? a.route_id, b.route_short_name ?? b.route_id);
       }
     });
     return rows;
-  }, [props.lineSearchResults, props.sortBy]);
+  }, [props.lineSearchResults, sortByTable.line]);
+
+  const sortedStopLineRoutes = useMemo(() => {
+    const rows = [...props.stopLinesResults];
+    const cmpText = (a: string | null | undefined, b: string | null | undefined) =>
+      (a ?? "").localeCompare(b ?? "", "he", { sensitivity: "base", numeric: true });
+    const cmpLine = (a: string | null | undefined, b: string | null | undefined) =>
+      (a ?? "").localeCompare(b ?? "", "he", { sensitivity: "base", numeric: true });
+    rows.sort((a, b) => {
+      const { column, dir } = sortByTable.stop;
+      const s = dir === "asc" ? 1 : -1;
+      switch (column) {
+        case "agency":
+          return s * cmpText(a.agency_name, b.agency_name) || cmpLine(a.route_short_name ?? a.route_id, b.route_short_name ?? b.route_id);
+        case "destination":
+          return s * cmpText(destinationLabel({ route_long_name: a.route_long_name }), destinationLabel({ route_long_name: b.route_long_name })) ||
+            cmpLine(a.route_short_name ?? a.route_id, b.route_short_name ?? b.route_id);
+        case "time_window":
+          return s * cmpText(`${a.first_time ?? ""}-${a.last_time ?? ""}`, `${b.first_time ?? ""}-${b.last_time ?? ""}`) ||
+            cmpLine(a.route_short_name ?? a.route_id, b.route_short_name ?? b.route_id);
+        case "line":
+        default:
+          return s * cmpLine(a.route_short_name ?? a.route_id, b.route_short_name ?? b.route_id);
+      }
+    });
+    return rows;
+  }, [props.stopLinesResults, sortByTable.stop]);
 
   const content = (
     <div className="explorer-content">
@@ -225,7 +309,7 @@ export const ExplorerWindow: React.FC<ExplorerWindowProps> = (props) => {
             type="button"
             className="btn-find-area"
             onClick={props.onFindAreaRoutes}
-            disabled={!props.hasBlockage || props.areaLoading}
+            disabled={!props.hasBlockage || props.areaLoading || !props.timeWindowValid}
           >
             {props.areaLoading ? "Searching…" : "Find lines in polygon"}
           </button>
@@ -237,13 +321,12 @@ export const ExplorerWindow: React.FC<ExplorerWindowProps> = (props) => {
                   <thead>
                     <tr>
                       <th className="col-index">#</th>
-                      <th className="col-num">line number</th>
-                      <th className="col-operator">agency</th>
-                      <th className="col-trips">number of trips</th>
-                      <th className="col-dest">destination</th>
-                      <th className="col-route-pair">location &lt;-&gt; destination</th>
-                      <th className="col-status">status</th>
-                      <th className="col-actions">actions</th>
+                      <th className="col-num sortable" onClick={() => handleSortHeaderClick("area", "line", "asc")}>line {sortArrow("area", "line")}</th>
+                      <th className="col-operator sortable" onClick={() => handleSortHeaderClick("area", "agency", "asc")}>agency {sortArrow("area", "agency")}</th>
+                      <th className="col-trips sortable" onClick={() => handleSortHeaderClick("area", "trips", "desc")}>trips {sortArrow("area", "trips")}</th>
+                      <th className="col-dest sortable" onClick={() => handleSortHeaderClick("area", "destination", "asc")}>destination {sortArrow("area", "destination")}</th>
+                      <th className="col-route-pair sortable" onClick={() => handleSortHeaderClick("area", "route_pair", "asc")}>location &lt;-&gt; destination {sortArrow("area", "route_pair")}</th>
+                      <th className="col-status sortable" onClick={() => handleSortHeaderClick("area", "detour", "asc")}>detour {sortArrow("area", "detour")}</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -276,18 +359,6 @@ export const ExplorerWindow: React.FC<ExplorerWindowProps> = (props) => {
                               </span>
                             ) : "—"}
                           </td>
-                          <td className="col-actions">
-                            <button
-                              type="button"
-                              className="btn-use-detour"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                props.onUseForDetour(r);
-                              }}
-                            >
-                              Use
-                            </button>
-                          </td>
                         </tr>
                       );
                     })}
@@ -314,7 +385,7 @@ export const ExplorerWindow: React.FC<ExplorerWindowProps> = (props) => {
               placeholder="Line number or route name…"
               onKeyDown={(e) => e.key === "Enter" && props.onLineSearch()}
             />
-            <button type="button" onClick={props.onLineSearch} disabled={props.lineSearchLoading}>
+            <button type="button" onClick={props.onLineSearch} disabled={props.lineSearchLoading || !props.timeWindowValid}>
               {props.lineSearchLoading ? "Searching…" : "Search"}
             </button>
           </div>
@@ -327,11 +398,11 @@ export const ExplorerWindow: React.FC<ExplorerWindowProps> = (props) => {
                 <thead>
                   <tr>
                     <th className="col-index">#</th>
-                    <th className="col-num">line number</th>
-                    <th className="col-operator">agency</th>
-                    <th className="col-trips">number of trips</th>
-                    <th className="col-dest">destination</th>
-                    <th className="col-route-pair">location &lt;-&gt; destination</th>
+                    <th className="col-num sortable" onClick={() => handleSortHeaderClick("line", "line", "asc")}>line {sortArrow("line", "line")}</th>
+                    <th className="col-operator sortable" onClick={() => handleSortHeaderClick("line", "agency", "asc")}>agency {sortArrow("line", "agency")}</th>
+                    <th className="col-trips sortable" onClick={() => handleSortHeaderClick("line", "trips", "desc")}>trips {sortArrow("line", "trips")}</th>
+                    <th className="col-dest sortable" onClick={() => handleSortHeaderClick("line", "destination", "asc")}>destination {sortArrow("line", "destination")}</th>
+                    <th className="col-route-pair sortable" onClick={() => handleSortHeaderClick("line", "route_pair", "asc")}>location &lt;-&gt; destination {sortArrow("line", "route_pair")}</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -468,7 +539,7 @@ export const ExplorerWindow: React.FC<ExplorerWindowProps> = (props) => {
               type="button"
               className="btn-stop-lines"
               onClick={props.onSearchLinesInStop}
-              disabled={!props.selectedStop || props.stopLinesLoading}
+              disabled={!props.selectedStop || props.stopLinesLoading || !props.timeWindowValid}
             >
               {props.stopLinesLoading ? "Searching…" : "Search lines in stop"}
             </button>
@@ -484,14 +555,14 @@ export const ExplorerWindow: React.FC<ExplorerWindowProps> = (props) => {
                     <thead>
                       <tr>
                         <th className="col-index">#</th>
-                        <th className="col-num">line number</th>
-                        <th className="col-operator">agency</th>
-                        <th className="col-dest">destination</th>
-                        <th className="col-route-pair">time window</th>
+                        <th className="col-num sortable" onClick={() => handleSortHeaderClick("stop", "line", "asc")}>line {sortArrow("stop", "line")}</th>
+                        <th className="col-operator sortable" onClick={() => handleSortHeaderClick("stop", "agency", "asc")}>agency {sortArrow("stop", "agency")}</th>
+                        <th className="col-dest sortable" onClick={() => handleSortHeaderClick("stop", "destination", "asc")}>destination {sortArrow("stop", "destination")}</th>
+                        <th className="col-route-pair sortable" onClick={() => handleSortHeaderClick("stop", "time_window", "asc")}>time window {sortArrow("stop", "time_window")}</th>
                       </tr>
                     </thead>
                     <tbody>
-                      {props.stopLinesResults.map((r, i) => (
+                      {sortedStopLineRoutes.map((r, i) => (
                         <tr
                           key={`${r.route_id}:${r.direction_id ?? ""}:${i}`}
                           className="lines-table-row"
@@ -552,8 +623,8 @@ export const ExplorerWindow: React.FC<ExplorerWindowProps> = (props) => {
         props.onSizeChange({ width: ref.offsetWidth, height: ref.offsetHeight });
         props.onPositionChange({ x: pos.x, y: pos.y });
       }}
-      minWidth={280}
-      minHeight={200}
+      minWidth={560}
+      minHeight={320}
       maxWidth={1000}
       maxHeight={80 * (typeof window !== "undefined" ? window.innerHeight / 100 : 80)}
       dragHandleClassName="explorer-header"
