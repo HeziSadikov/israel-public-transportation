@@ -111,8 +111,9 @@ class TestAreaSearch(unittest.TestCase):
         results = find_routes_in_polygon(
             feed=feed,
             polygon_geojson=polygon_geojson,
-            yyyymmdd="20250303",
+            start_date_ymd="20250303",
             start_sec=7 * 3600,
+            end_date_ymd="20250303",
             end_sec=10 * 3600,
         )
         self.assertEqual(len(results), 1)
@@ -134,8 +135,9 @@ class TestAreaSearch(unittest.TestCase):
         results = find_routes_in_polygon(
             feed=feed,
             polygon_geojson=polygon_geojson,
-            yyyymmdd="20250303",
+            start_date_ymd="20250303",
             start_sec=7 * 3600,
+            end_date_ymd="20250303",
             end_sec=10 * 3600,
         )
         self.assertEqual(len(results), 0)
@@ -152,8 +154,9 @@ class TestAreaSearch(unittest.TestCase):
         results = find_routes_in_polygon(
             feed=feed,
             polygon_geojson=polygon_geojson,
-            yyyymmdd="20250303",
+            start_date_ymd="20250303",
             start_sec=12 * 3600,
+            end_date_ymd="20250303",
             end_sec=13 * 3600,
         )
         self.assertEqual(len(results), 0)
@@ -170,8 +173,9 @@ class TestAreaSearch(unittest.TestCase):
         results = find_routes_in_polygon(
             feed=feed,
             polygon_geojson=polygon_geojson,
-            yyyymmdd="20250101",
+            start_date_ymd="20250101",
             start_sec=7 * 3600,
+            end_date_ymd="20250101",
             end_sec=10 * 3600,
         )
         self.assertEqual(len(results), 0)
@@ -184,8 +188,9 @@ class TestAreaSearch(unittest.TestCase):
         results = find_routes_in_polygon(
             feed=feed,
             polygon_geojson=polygon_geojson,
-            yyyymmdd="20250303",
+            start_date_ymd="20250303",
             start_sec=7 * 3600,
+            end_date_ymd="20250303",
             end_sec=10 * 3600,
         )
         self.assertEqual(len(results), 0)

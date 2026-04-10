@@ -31,6 +31,9 @@ from psycopg2.extras import DictCursor
 # the previous localhost DSN if the env var is not set.
 DB_URL = os.getenv("DATABASE_URL", "postgresql://postgres@localhost:5432/israel_gtfs")
 STOP_ROUTES_STATEMENT_TIMEOUT_MS = int(os.getenv("STOP_ROUTES_STATEMENT_TIMEOUT_MS", "90000"))
+# Area polygon search can be heavy on full national feeds. 0 = no PostgreSQL limit (override server
+# default); cap long runs with the HTTP client or set AREA_ROUTES_STATEMENT_TIMEOUT_MS to e.g. 600000.
+AREA_ROUTES_STATEMENT_TIMEOUT_MS = int(os.getenv("AREA_ROUTES_STATEMENT_TIMEOUT_MS", "0"))
 
 
 class StopRoutesQueryTimeoutError(RuntimeError):
@@ -57,6 +60,35 @@ def get_active_feed_id(conn=None) -> int:
                 return int(row["id"])  # type: ignore[index]
             except Exception:
                 return int(row[0])
+    finally:
+        if close:
+            conn.close()
+
+
+def get_active_feed_calendar_span(conn=None) -> Tuple[Optional[int], Optional[int]]:
+    """
+    MIN(start_date) and MAX(end_date) across calendar rows for the active feed.
+    Returns (None, None) if there is no calendar data (e.g. calendar_dates-only feeds).
+    """
+    close = False
+    if conn is None:
+        conn = _get_conn()
+        close = True
+    try:
+        feed_id = get_active_feed_id(conn)
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT MIN(start_date) AS mn, MAX(end_date) AS mx
+                FROM calendar
+                WHERE feed_id = %s
+                """,
+                (feed_id,),
+            )
+            row = cur.fetchone()
+            if not row or row["mn"] is None or row["mx"] is None:
+                return (None, None)
+            return (int(row["mn"]), int(row["mx"]))
     finally:
         if close:
             conn.close()
@@ -96,6 +128,9 @@ def get_routes_in_polygon(
         feed_id = get_active_feed_id(conn)
         with conn.cursor() as cur:
             cur.execute(
+                "SET LOCAL statement_timeout = %s", (AREA_ROUTES_STATEMENT_TIMEOUT_MS,)
+            )
+            cur.execute(
                 """
                 WITH active_services AS (
                     SELECT c.service_id
@@ -118,34 +153,29 @@ def get_routes_in_polygon(
                       AND cd.date = %s
                       AND cd.exception_type = 1
                 ),
-                trips_in_window AS (
-                    SELECT t.feed_id, t.route_id, t.direction_id, t.trip_id
-                    FROM trips t
-                    JOIN active_services s
-                      ON s.service_id = t.service_id
-                    JOIN trip_time_bounds b
-                      ON b.feed_id = t.feed_id AND b.trip_id = t.trip_id
+                shapes_in_area AS (
+                    SELECT sl.feed_id, sl.shape_id
+                    FROM shapes_lines sl
+                    WHERE sl.feed_id = %s
+                      AND ST_Intersects(sl.geom, ST_GeomFromText(%s, 4326))
+                ),
+                shape_hit_trips AS MATERIALIZED (
+                    SELECT DISTINCT t.feed_id, t.trip_id, t.route_id, t.direction_id, t.service_id
+                    FROM shapes_in_area sia
+                    JOIN trips t
+                      ON t.feed_id = sia.feed_id
+                      AND t.shape_id = sia.shape_id
+                      AND t.shape_id IS NOT NULL
                     WHERE t.feed_id = %s
+                ),
+                trips_in_window AS MATERIALIZED (
+                    SELECT sht.feed_id, sht.trip_id, sht.route_id, sht.direction_id
+                    FROM shape_hit_trips sht
+                    JOIN active_services s ON s.service_id = sht.service_id
+                    JOIN trip_time_bounds b ON b.feed_id = sht.feed_id AND b.trip_id = sht.trip_id
+                    WHERE sht.feed_id = %s
                       AND b.last_sec >= %s
                       AND b.first_sec <= %s
-                ),
-                trip_last_stop AS (
-                    SELECT DISTINCT ON (tiw.route_id, tiw.direction_id)
-                        tiw.route_id,
-                        tiw.direction_id,
-                        s.name AS last_stop_name
-                    FROM trips_in_window tiw
-                    JOIN trips t ON t.feed_id = tiw.feed_id AND t.trip_id = tiw.trip_id
-                    JOIN (
-                        SELECT feed_id, trip_id, MAX(stop_sequence) AS max_seq
-                        FROM stop_times
-                        GROUP BY feed_id, trip_id
-                    ) mx ON mx.feed_id = t.feed_id AND mx.trip_id = t.trip_id
-                    JOIN stop_times st
-                        ON st.feed_id = mx.feed_id AND st.trip_id = mx.trip_id AND st.stop_sequence = mx.max_seq
-                    JOIN stops s ON s.feed_id = st.feed_id AND s.stop_id = st.stop_id
-                    WHERE t.feed_id = %s
-                    ORDER BY tiw.route_id, tiw.direction_id, t.trip_id
                 ),
                 routes_geom AS (
                     SELECT DISTINCT
@@ -158,18 +188,10 @@ def get_routes_in_polygon(
                         MAX(b.last_sec) AS last_time_s,
                         COUNT(DISTINCT tiw.trip_id)::int AS trip_count
                     FROM trips_in_window tiw
-                    JOIN trips t
-                      ON t.feed_id = tiw.feed_id AND t.trip_id = tiw.trip_id
-                    JOIN routes r
-                      ON r.feed_id = tiw.feed_id AND r.route_id = tiw.route_id
                     JOIN trip_time_bounds b
                       ON b.feed_id = tiw.feed_id AND b.trip_id = tiw.trip_id
-                    JOIN shapes_lines sl
-                      ON sl.feed_id = tiw.feed_id AND sl.shape_id = t.shape_id
-                    WHERE ST_Intersects(
-                        sl.geom,
-                        ST_GeomFromText(%s, 4326)
-                    )
+                    JOIN routes r
+                      ON r.feed_id = tiw.feed_id AND r.route_id = tiw.route_id
                     GROUP BY tiw.route_id, tiw.direction_id,
                              r.short_name, r.long_name, r.agency_id
                 )
@@ -183,11 +205,8 @@ def get_routes_in_polygon(
                     rg.first_time_s,
                     rg.last_time_s,
                     rg.trip_count,
-                    tls.last_stop_name
+                    NULL::text AS last_stop_name
                 FROM routes_geom rg
-                LEFT JOIN trip_last_stop tls
-                    ON tls.route_id = rg.route_id
-                    AND tls.direction_id IS NOT DISTINCT FROM rg.direction_id
                 LEFT JOIN agencies a
                   ON a.feed_id = %s AND a.agency_id = rg.agency_id
                 ORDER BY rg.route_short_name, rg.route_id, rg.direction_id
@@ -199,10 +218,11 @@ def get_routes_in_polygon(
                     feed_id,
                     int(date_ymd),
                     feed_id,
+                    polygon_wkt,
+                    feed_id,
+                    feed_id,
                     start_sec,
                     end_sec,
-                    feed_id,
-                    polygon_wkt,
                     feed_id,
                 ),
             )
@@ -2315,6 +2335,9 @@ def get_routes_in_polygon_range(
         feed_id = get_active_feed_id(conn)
         with conn.cursor() as cur:
             cur.execute(
+                "SET LOCAL statement_timeout = %s", (AREA_ROUTES_STATEMENT_TIMEOUT_MS,)
+            )
+            cur.execute(
                 """
                 WITH bounds AS (
                     SELECT
@@ -2373,32 +2396,29 @@ def get_routes_in_polygon_range(
                       ON r.date_ymd = bs.date_ymd AND r.service_id = bs.service_id
                     WHERE r.service_id IS NULL
                 ),
-                trips_in_window AS (
-                    SELECT t.feed_id, t.route_id, t.direction_id, t.trip_id
-                    FROM trips t
-                    JOIN active_services s ON s.service_id = t.service_id
-                    JOIN trip_time_bounds b ON b.feed_id = t.feed_id AND b.trip_id = t.trip_id
+                shapes_in_area AS (
+                    SELECT sl.feed_id, sl.shape_id
+                    FROM shapes_lines sl
+                    WHERE sl.feed_id = %s
+                      AND ST_Intersects(sl.geom, ST_GeomFromText(%s, 4326))
+                ),
+                shape_hit_trips AS MATERIALIZED (
+                    SELECT DISTINCT t.feed_id, t.trip_id, t.route_id, t.direction_id, t.service_id
+                    FROM shapes_in_area sia
+                    JOIN trips t
+                      ON t.feed_id = sia.feed_id
+                      AND t.shape_id = sia.shape_id
+                      AND t.shape_id IS NOT NULL
                     WHERE t.feed_id = %s
+                ),
+                trips_in_window AS MATERIALIZED (
+                    SELECT sht.feed_id, sht.trip_id, sht.route_id, sht.direction_id
+                    FROM shape_hit_trips sht
+                    JOIN active_services s ON s.service_id = sht.service_id
+                    JOIN trip_time_bounds b ON b.feed_id = sht.feed_id AND b.trip_id = sht.trip_id
+                    WHERE sht.feed_id = %s
                       AND b.last_sec >= s.day_start_sec
                       AND b.first_sec <= s.day_end_sec
-                ),
-                trip_last_stop AS (
-                    SELECT DISTINCT ON (tiw.route_id, tiw.direction_id)
-                        tiw.route_id,
-                        tiw.direction_id,
-                        s.name AS last_stop_name
-                    FROM trips_in_window tiw
-                    JOIN trips t ON t.feed_id = tiw.feed_id AND t.trip_id = tiw.trip_id
-                    JOIN (
-                        SELECT feed_id, trip_id, MAX(stop_sequence) AS max_seq
-                        FROM stop_times
-                        GROUP BY feed_id, trip_id
-                    ) mx ON mx.feed_id = t.feed_id AND mx.trip_id = t.trip_id
-                    JOIN stop_times st
-                        ON st.feed_id = mx.feed_id AND st.trip_id = mx.trip_id AND st.stop_sequence = mx.max_seq
-                    JOIN stops s ON s.feed_id = st.feed_id AND s.stop_id = st.stop_id
-                    WHERE t.feed_id = %s
-                    ORDER BY tiw.route_id, tiw.direction_id, t.trip_id
                 ),
                 routes_geom AS (
                     SELECT DISTINCT
@@ -2411,15 +2431,10 @@ def get_routes_in_polygon_range(
                         MAX(b.last_sec) AS last_time_s,
                         COUNT(DISTINCT tiw.trip_id)::int AS trip_count
                     FROM trips_in_window tiw
-                    JOIN trips t
-                      ON t.feed_id = tiw.feed_id AND t.trip_id = tiw.trip_id
-                    JOIN routes r
-                      ON r.feed_id = tiw.feed_id AND r.route_id = tiw.route_id
                     JOIN trip_time_bounds b
                       ON b.feed_id = tiw.feed_id AND b.trip_id = tiw.trip_id
-                    JOIN shapes_lines sl
-                      ON sl.feed_id = tiw.feed_id AND sl.shape_id = t.shape_id
-                    WHERE ST_Intersects(sl.geom, ST_GeomFromText(%s, 4326))
+                    JOIN routes r
+                      ON r.feed_id = tiw.feed_id AND r.route_id = tiw.route_id
                     GROUP BY tiw.route_id, tiw.direction_id, r.short_name, r.long_name, r.agency_id
                 )
                 SELECT
@@ -2432,11 +2447,8 @@ def get_routes_in_polygon_range(
                     rg.first_time_s,
                     rg.last_time_s,
                     rg.trip_count,
-                    tls.last_stop_name
+                    NULL::text AS last_stop_name
                 FROM routes_geom rg
-                LEFT JOIN trip_last_stop tls
-                    ON tls.route_id = rg.route_id
-                    AND tls.direction_id IS NOT DISTINCT FROM rg.direction_id
                 LEFT JOIN agencies a
                   ON a.feed_id = %s AND a.agency_id = rg.agency_id
                 ORDER BY rg.route_short_name, rg.route_id, rg.direction_id
@@ -2450,8 +2462,9 @@ def get_routes_in_polygon_range(
                     feed_id,
                     feed_id,
                     feed_id,
-                    feed_id,
                     polygon_wkt,
+                    feed_id,
+                    feed_id,
                     feed_id,
                 ),
             )

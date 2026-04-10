@@ -35,7 +35,7 @@ from psycopg2.extras import DictCursor
 from backend.config import GRAPH_CACHE
 from backend.db_access import DB_URL
 from backend.graph_builder import build_graph_for_pattern_from_postgis
-from backend.logging_utils import log
+from backend.logging_utils import ensure_cli_action_logging, log
 from backend.osm_pretty import map_match_pattern
 from backend import db_access as db_access_module
 from backend.route_preview_payload import build_route_preview_cache_dict
@@ -585,6 +585,8 @@ def _build_chunk(
 
 
 def main():
+    ensure_cli_action_logging()
+    log("precompute_graphs", "phase=main start")
     # So progress shows immediately when output is redirected (e.g. tee)
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(line_buffering=True)
@@ -642,10 +644,10 @@ def main():
     ap.add_argument(
         "--worker-heartbeat-seconds",
         type=int,
-        default=15,
+        default=0,
         help=(
             "Per-worker liveness heartbeat interval in seconds during parallel build "
-            "(0 = disable heartbeats)."
+            "(0 = disable; default)."
         ),
     )
     ap.add_argument(
@@ -695,7 +697,9 @@ def main():
 
     conn = _connect(args.database_url)
     try:
+        log("precompute_graphs", "phase=resolve_active_feed start")
         feed_id = db_access_module.get_active_feed_id(conn)
+        log("precompute_graphs", f"phase=resolve_active_feed done feed_id={feed_id}")
         log("precompute_graphs", f"feed_id={feed_id}")
         force_signatures = bool(args.force_signatures)
         with conn.cursor() as cur:
@@ -711,18 +715,24 @@ def main():
                 reference_date_ymd = pick_default_pattern_build_date(cur, feed_id)
         log("precompute_graphs", f"reference date_ymd (metadata for graph cache)={reference_date_ymd}")
 
+        log("precompute_graphs", "phase=load_route_direction_pairs start")
         pairs = _iter_route_directions(conn)
+        log("precompute_graphs", f"phase=load_route_direction_pairs done pairs={len(pairs)}")
         total = len(pairs)
         log("precompute_graphs", f"{total} (route_id, direction_id) pairs.")
 
         # 1) All patterns for feed (one query)
+        log("precompute_graphs", "phase=load_patterns start")
         patterns = db_access_module.get_patterns_for_feed(feed_id, conn)
+        log("precompute_graphs", f"phase=load_patterns done patterns={len(patterns)}")
         log("precompute_graphs", f"Loaded {len(patterns)} patterns.")
 
         # 2) Existing cache for this feed (one query, GTFS-only).
+        log("precompute_graphs", "phase=load_cached_graphs start")
         cache = db_access_module.get_cached_graphs_bulk(
             feed_id, False, conn
         )
+        log("precompute_graphs", f"phase=load_cached_graphs done cache_rows={len(cache)}")
         log("precompute_graphs", f"Loaded {len(cache)} cached graphs (GTFS).")
 
         # 3) Route signatures: either load from route_signatures (fast) or full bulk scan.
@@ -1188,6 +1198,7 @@ def main():
             "precompute_graphs",
             f"Done. built={built}, skipped_unchanged={reused_count}, no_pattern={no_pattern_count}, profiles={profiles}",
         )
+        log("precompute_graphs", "phase=main done")
     finally:
         conn.close()
 

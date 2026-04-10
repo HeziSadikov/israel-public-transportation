@@ -2,16 +2,23 @@ import json
 import sqlite3
 from pathlib import Path
 
+from backend.logging_utils import ensure_cli_action_logging, log
+
 
 def main() -> None:
+    ensure_cli_action_logging()
+    log("check_db_schema", "phase=main start")
     db = Path(r"c:\Users\חל\Desktop\israel-public-transportation\data\gtfs.db")
     print("DB exists:", db.exists())
     if not db.exists():
+        log("check_db_schema", "phase=main done db_missing=true")
         return
 
+    log("check_db_schema", "phase=sqlite_connect start")
     conn = sqlite3.connect(str(db))
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
+    log("check_db_schema", "phase=sqlite_connect done")
 
     # stop_times columns
     cur.execute("PRAGMA table_info(stop_times)")
@@ -27,6 +34,7 @@ def main() -> None:
     print("EXTRA_TABLES:", json.dumps(tables, ensure_ascii=False))
 
     conn.close()
+    log("check_db_schema", "phase=main done")
 
 
 if __name__ == "__main__":

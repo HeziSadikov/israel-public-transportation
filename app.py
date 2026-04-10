@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Tuple, Optional
 import hashlib
 import logging.config
@@ -625,7 +625,33 @@ def feed_update():
 @app.get("/feed/status", response_model=FeedStatusResponse)
 def feed_status():
     status = get_feed_status()
-    return FeedStatusResponse(**status)
+    cal_min: Optional[int] = None
+    cal_max: Optional[int] = None
+    coverage_note: Optional[str] = None
+    try:
+        cal_min, cal_max = db_access_module.get_active_feed_calendar_span()
+    except Exception:
+        cal_min, cal_max = None, None
+    if cal_min is not None and cal_max is not None:
+        today_utc_ymd = int(datetime.now(timezone.utc).strftime("%Y%m%d"))
+        if today_utc_ymd < cal_min or today_utc_ymd > cal_max:
+
+            def _ymd_disp(x: int) -> str:
+                s = f"{x:08d}"
+                return f"{s[:4]}-{s[4:6]}-{s[6:8]}"
+
+            coverage_note = (
+                f"UTC date {_ymd_disp(today_utc_ymd)} is outside the loaded GTFS calendar "
+                f"({_ymd_disp(cal_min)} to {_ymd_disp(cal_max)}). "
+                "Place a newer israel-public-transportation.zip in the project root and call "
+                "POST /feed/update, or pick service dates in that range for area search and graphs."
+            )
+    return FeedStatusResponse(
+        **status,
+        calendar_min_ymd=cal_min,
+        calendar_max_ymd=cal_max,
+        calendar_coverage_note=coverage_note,
+    )
 
 
 def _graph_cache_key(
@@ -2310,11 +2336,34 @@ def area_routes(req: AreaRoutesQuery):
     if req.max_results and len(results) > req.max_results:
         results = results[: req.max_results]
 
+    calendar_hint: Optional[str] = None
+    if not results:
+        try:
+            cal_min, cal_max = db_access_module.get_active_feed_calendar_span()
+        except Exception:
+            cal_min, cal_max = None, None
+        if cal_min is not None and cal_max is not None:
+            rs = int(start_date_ymd)
+            re = int(end_date_ymd)
+            overlaps = not (re < cal_min or rs > cal_max)
+            if not overlaps:
+
+                def _ymd_disp(x: int) -> str:
+                    s = f"{x:08d}"
+                    return f"{s[:4]}-{s[4:6]}-{s[6:8]}"
+
+                calendar_hint = (
+                    "The selected dates are outside the loaded GTFS calendar "
+                    f"({_ymd_disp(cal_min)} to {_ymd_disp(cal_max)}). "
+                    "Update the feed or pick dates in that range. "
+                    "Area search only includes trips on scheduled service days."
+                )
+
     log(
         "area/routes",
         f"window={start_date_ymd} {req.start_time}-{end_date_ymd} {req.end_time} routes={len(results)}",
     )
-    return AreaRoutesResponse(routes=results)
+    return AreaRoutesResponse(routes=results, calendar_hint=calendar_hint)
 
 
 @app.post("/detours/by-area", response_model=DetourByAreaResponse)

@@ -1,6 +1,10 @@
 // Basic configuration
 const BACKEND_BASE_URL = "http://127.0.0.1:8000";
 
+/** Set from GET /feed/status when available; used for empty area-search hints. */
+let feedCalendarMin = null;
+let feedCalendarMax = null;
+
 const state = {
   selectedRoute: null,
   patternId: null,
@@ -791,7 +795,8 @@ async function handleComputeDetour() {
     mode,
     route_id: state.selectedRoute ? state.selectedRoute.route_id : null,
     direction_id: state.directionId || null,
-    date: dateYMD,
+    start_date: dateYMD,
+    end_date: dateYMD,
     start_time: timeStart,
     end_time: timeEnd,
     blockage_geojson: state.areaGeoJSON,
@@ -933,7 +938,8 @@ async function handleAreaRoutesSearch() {
 
   try {
     const req = {
-      date: ymd,
+      start_date: ymd,
+      end_date: ymd,
       start_time: timeStart,
       end_time: timeEnd,
       polygon_geojson: state.areaGeoJSON,
@@ -947,8 +953,25 @@ async function handleAreaRoutesSearch() {
     state.areaRoutes = routes;
 
     if (!routes.length) {
-      areaResultsEl.innerHTML =
-        "<div class='result-item'><em>No lines found in this area/time window.</em></div>";
+      areaResultsEl.innerHTML = "";
+      const emptyDiv = document.createElement("div");
+      emptyDiv.className = "result-item";
+      const em = document.createElement("em");
+      const hint = res.calendar_hint && String(res.calendar_hint).trim();
+      let text =
+        hint || "No lines found in this area/time window.";
+      if (
+        !hint &&
+        feedCalendarMin != null &&
+        feedCalendarMax != null
+      ) {
+        text += ` Loaded GTFS calendar: ${ymdIntToDateInputValue(
+          feedCalendarMin
+        )} to ${ymdIntToDateInputValue(feedCalendarMax)}.`;
+      }
+      em.textContent = text;
+      emptyDiv.appendChild(em);
+      areaResultsEl.appendChild(emptyDiv);
       return;
     }
 
@@ -1040,6 +1063,51 @@ function handleFitToBlockage() {
   }
 }
 
+function ymdIntToDateInputValue(ymdInt) {
+  const s = String(ymdInt).padStart(8, "0");
+  return `${s.slice(0, 4)}-${s.slice(4, 6)}-${s.slice(6, 8)}`;
+}
+
+function localTodayYmdInt() {
+  const today = new Date();
+  return (
+    today.getFullYear() * 10000 +
+    (today.getMonth() + 1) * 100 +
+    today.getDate()
+  );
+}
+
+function clampYmdInt(ymdInt, calMin, calMax) {
+  if (calMin == null || calMax == null) return ymdInt;
+  if (ymdInt < calMin) return calMin;
+  if (ymdInt > calMax) return calMax;
+  return ymdInt;
+}
+
+async function clampRouteDateInputToFeedCalendar() {
+  const dateInput = document.getElementById("route-date");
+  if (!dateInput) return;
+  try {
+    const res = await fetch(`${BACKEND_BASE_URL}/feed/status`);
+    if (!res.ok) return;
+    const data = await res.json();
+    const mn = data.calendar_min_ymd;
+    const mx = data.calendar_max_ymd;
+    if (mn == null || mx == null) return;
+    feedCalendarMin = mn;
+    feedCalendarMax = mx;
+    const todayInt = localTodayYmdInt();
+    const clamped = clampYmdInt(todayInt, mn, mx);
+    dateInput.value = ymdIntToDateInputValue(clamped);
+    const note = data.calendar_coverage_note && String(data.calendar_coverage_note).trim();
+    if (note) {
+      showToast(note, { error: false, timeout: 8000 });
+    }
+  } catch {
+    /* backend down — keep default local date */
+  }
+}
+
 function initUI() {
   const today = new Date();
   const yyyy = today.getFullYear();
@@ -1082,6 +1150,7 @@ function initUI() {
 window.addEventListener("DOMContentLoaded", () => {
   initMap();
   initUI();
+  void clampRouteDateInputToFeedCalendar();
   showToast("Backend detected at http://127.0.0.1:8000. Start by searching for a route.", {
     timeout: 3500,
   });

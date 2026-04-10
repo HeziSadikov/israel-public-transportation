@@ -72,6 +72,10 @@ CREATE TABLE IF NOT EXISTS trips (
 CREATE INDEX IF NOT EXISTS idx_trips_route_dir_svc
     ON trips(feed_id, route_id, direction_id, service_id);
 
+-- Area search: join shapes_in_area -> trips by shape_id
+CREATE INDEX IF NOT EXISTS idx_trips_feed_shape
+    ON trips(feed_id, shape_id);
+
 CREATE INDEX IF NOT EXISTS idx_trips_feed_trip_service_route_dir
     ON trips(feed_id, trip_id, service_id, route_id, direction_id);
 

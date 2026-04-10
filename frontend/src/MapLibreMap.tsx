@@ -165,6 +165,18 @@ const DRAW_STYLES: any[] = [
       "circle-stroke-color": "#dc2626",
     },
   },
+  // Edge midpoints (direct_select: add vertices along edges)
+  {
+    id: "gl-draw-midpoint",
+    type: "circle",
+    filter: ["all", ["==", "meta", "midpoint"]],
+    paint: {
+      "circle-radius": 3,
+      "circle-color": "#f97316",
+      "circle-stroke-width": 1,
+      "circle-stroke-color": "#dc2626",
+    },
+  },
 ];
 
 const SOURCE_ROUTE = "route";
@@ -217,11 +229,19 @@ function normalizeBlockageGeometry(geom: GeoJSON.Geometry): GeoJSON.Geometry {
   return geom;
 }
 
+function firstPolygonFeatureIdFromDrawAll(all: GeoJSON.FeatureCollection): string | null {
+  const f = all.features?.find((x) => x.geometry?.type === "Polygon");
+  const id = f?.id;
+  if (id === undefined || id === null) return null;
+  return String(id);
+}
+
 export type MapLibreMapHandle = {
   clearBlockage: () => void;
   cancelDrawing: () => void;
   undoLastPoint: () => void;
   startPolygon: () => void;
+  editBlockagePolygon: () => void;
   fitToBlockage: () => void;
   fitToRoute: () => void;
   fitToDetour: () => void;
@@ -248,6 +268,8 @@ export type MapLibreMapProps = {
   }) => void;
   /** Basemap: OSM raster, minimal Carto raster, or vector (OpenFreeMap Liberty). */
   basemap?: BasemapKind;
+  /** Fired when MapboxDraw mode changes (e.g. draw_polygon, direct_select, simple_select). */
+  onDrawModeChange?: (mode: string) => void;
 };
 
 type StopRole = "first" | "last" | "middle" | "both";
@@ -293,6 +315,7 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
     onStopClick,
     onStopOpenInExplorer,
     basemap = "osm",
+    onDrawModeChange,
   },
   ref
 ) {
@@ -308,6 +331,7 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
   const blockagePropRef = useRef<GeoJSON.Geometry | null>(null);
   const onStopClickRef = useRef<MapLibreMapProps["onStopClick"]>(undefined);
   const onStopOpenInExplorerRef = useRef<MapLibreMapProps["onStopOpenInExplorer"]>(undefined);
+  const onDrawModeChangeRef = useRef<MapLibreMapProps["onDrawModeChange"]>(undefined);
   const stopPopupRef = useRef<maplibregl.Popup | null>(null);
   const stopLayerClickRef = useRef<((e: maplibregl.MapMouseEvent & maplibregl.EventData) => void) | null>(null);
   const stopLayerMouseEnterRef = useRef<(() => void) | null>(null);
@@ -327,6 +351,7 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
   pinPositionRef.current = pinPosition;
   onStopClickRef.current = onStopClick;
   onStopOpenInExplorerRef.current = onStopOpenInExplorer;
+  onDrawModeChangeRef.current = onDrawModeChange;
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -544,6 +569,10 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
         drawRef.current = draw;
 
         const drawApi = draw as MapboxDraw & { getMode?: () => string };
+        const notifyDrawMode = () => {
+          if (typeof drawApi.getMode !== "function") return;
+          onDrawModeChangeRef.current?.(drawApi.getMode()!);
+        };
         const syncPolygonPreviewLine = () => {
           const src = map.getSource(SOURCE_POLYGON_PREVIEW) as maplibregl.GeoJSONSource | undefined;
           if (!src) return;
@@ -601,6 +630,8 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
         map.on("draw.render", syncPolygonPreviewLine);
         map.on("mousemove", syncPolygonPreviewLine);
         map.on("draw.modechange", syncPolygonPreviewLine);
+        map.on("draw.modechange", notifyDrawMode);
+        notifyDrawMode();
 
         map.on("draw.create", (e: { features?: GeoJSON.Feature[] }) => {
           let feature = e?.features?.[0];
@@ -634,6 +665,7 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
           map.off("draw.render", syncPolygonPreviewLine);
           map.off("mousemove", syncPolygonPreviewLine);
           map.off("draw.modechange", syncPolygonPreviewLine);
+          map.off("draw.modechange", notifyDrawMode);
         };
       }
 
@@ -708,6 +740,10 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
             },
           })),
         } as any);
+      }
+      const drawAfterRehydrate = drawRef.current as MapboxDraw & { getMode?: () => string };
+      if (drawAfterRehydrate && typeof drawAfterRehydrate.getMode === "function") {
+        onDrawModeChangeRef.current?.(drawAfterRehydrate.getMode());
       }
       setMapReady(true);
       requestAnimationFrame(scheduleResize);
@@ -791,6 +827,10 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
       }
     } catch {
       /* ignore restore errors */
+    }
+    const drawNotify = drawRef.current as MapboxDraw & { getMode?: () => string };
+    if (drawNotify && typeof drawNotify.getMode === "function") {
+      onDrawModeChangeRef.current?.(drawNotify.getMode());
     }
   }, [mapReady]);
 
@@ -893,6 +933,33 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
           draw.changeMode("draw_polygon");
         } catch (e) {
           console.error("Failed to start draw_polygon mode", e);
+        }
+      },
+      editBlockagePolygon() {
+        const draw = drawRef.current;
+        if (!draw) return;
+        let all = draw.getAll() as GeoJSON.FeatureCollection;
+        if (!all.features?.length && blockagePropRef.current) {
+          try {
+            draw.deleteAll();
+            draw.add({
+              type: "Feature",
+              geometry: blockagePropRef.current as GeoJSON.Geometry,
+              properties: {},
+            } as GeoJSON.Feature);
+            all = draw.getAll() as GeoJSON.FeatureCollection;
+          } catch (e) {
+            console.error("Failed to re-seed blockage for edit", e);
+            return;
+          }
+        }
+        const featureId = firstPolygonFeatureIdFromDrawAll(all);
+        if (!featureId) return;
+        try {
+          // @ts-expect-error direct_select + featureId at runtime
+          draw.changeMode("direct_select", { featureId });
+        } catch (e) {
+          console.error("Failed to enter direct_select mode", e);
         }
       },
       cancelDrawing() {

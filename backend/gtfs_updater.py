@@ -7,15 +7,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, Any
 
-import httpx
-
-from .logging_utils import log, now_ts
-from .config import (
-    GTFS_DATA_DIR,
-    FEED_METADATA_PATH,
-    GTFS_REMOTE_BASE,
-    GTFS_REMOTE_FILENAME,
-)
+from .gtfs_download import download_gtfs_zip
+from .logging_utils import log
+from .config import GTFS_DATA_DIR, FEED_METADATA_PATH
 from .db_access import DB_URL
 from .scripts.ingest_gtfs_postgis import ingest_gtfs
 from .scripts.build_patterns_postgis import build_patterns
@@ -85,31 +79,11 @@ def update_feed() -> Dict[str, Any]:
     target_dir.mkdir(parents=True, exist_ok=True)
     zip_path = target_dir / "gtfs.zip"
 
-    url = f"{GTFS_REMOTE_BASE.rstrip('/')}/{GTFS_REMOTE_FILENAME}"
     updated = False
     online_ok = False
 
     try:
-        log("feed/update", f"Downloading GTFS from {url} ...")
-        with httpx.stream("GET", url, timeout=60.0) as resp:
-            resp.raise_for_status()
-            total = int(resp.headers.get("Content-Length") or 0)
-            downloaded = 0
-            next_log = 5 * 1024 * 1024  # log every ~5 MB
-            with zip_path.open("wb") as f:
-                for chunk in resp.iter_bytes():
-                    f.write(chunk)
-                    downloaded += len(chunk)
-                    if downloaded >= next_log:
-                        mb = downloaded / (1024 * 1024)
-                        if total > 0:
-                            pct = downloaded * 100.0 / total
-                            log("feed/update", f"Downloaded {mb:.1f} MB ({pct:.1f}%) ...")
-                        else:
-                            log("feed/update", f"Downloaded {mb:.1f} MB ...")
-                        next_log += 5 * 1024 * 1024
-        size_mb = zip_path.stat().st_size / (1024 * 1024)
-        log("feed/update", f"Download complete: {size_mb:.1f} MB saved to {zip_path}")
+        download_gtfs_zip(zip_path, log_tag="feed/update", timeout=60.0)
         online_ok = True
     except Exception:
         # Online update failed; fall back to last active

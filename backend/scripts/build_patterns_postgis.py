@@ -15,18 +15,29 @@ Usage:
   python -m backend.scripts.build_patterns_postgis \\
       --database-url postgresql://user:pass@localhost:5432/israel_gtfs \\
       --date 20260308
+
+  # Topology / shape work only — ignore GTFS calendar when selecting trips (not for operational accuracy):
+  python -m backend.scripts.build_patterns_postgis --ignore-calendar
+
+When run as a CLI (not via Uvicorn), progress and timestamps go to stderr through
+the ``app.action`` logger (see ``ensure_cli_action_logging`` in ``backend.logging_utils``).
 """
 
 from __future__ import annotations
 
 import argparse
 from datetime import datetime, timedelta
-from typing import Optional
+import time
+from typing import Any, Dict, List, Optional, Set
 
 import psycopg2
+from psycopg2 import errors as pg_errors
 from psycopg2.extras import DictCursor
 
-from backend.logging_utils import log
+from backend.logging_utils import ensure_cli_action_logging, log
+
+_ROUTE_PROGRESS_EVERY = 25
+_RIDE_NETWORK_PROGRESS_EVERY = 25
 from backend.graph_builder import build_graph_for_pattern_from_postgis
 from backend.pattern_builder import PatternBuilder, RoutePattern
 from backend.db_access import (
@@ -35,7 +46,6 @@ from backend.db_access import (
   compute_route_signature,
   get_route_signature,
   upsert_route_signature,
-  get_all_stop_times_for_feed,
   PatternMeta,
   get_pattern_stops_bulk,
   get_stop_times_bulk,
@@ -53,18 +63,103 @@ def _ensure_patterns_built_checksum_column(conn) -> None:
   conn.autocommit = True
   try:
     with conn.cursor() as cur:
-      cur.execute(
-        "ALTER TABLE feed_versions ADD COLUMN IF NOT EXISTS patterns_built_checksum TEXT"
-      )
+      cur.execute("SET lock_timeout = '5s'")
+      try:
+        cur.execute(
+          "ALTER TABLE feed_versions ADD COLUMN IF NOT EXISTS patterns_built_checksum TEXT"
+        )
+        log("patterns", "phase=ensure_patterns_built_checksum_column done")
+      except (pg_errors.LockNotAvailable, pg_errors.QueryCanceled) as e:
+        # If another session holds DDL-sensitive locks, avoid hanging here.
+        # Continue only when the column already exists.
+        cur.execute(
+          """
+          SELECT 1
+          FROM information_schema.columns
+          WHERE table_schema = 'public'
+            AND table_name = 'feed_versions'
+            AND column_name = 'patterns_built_checksum'
+          LIMIT 1
+          """
+        )
+        exists = cur.fetchone() is not None
+        if exists:
+          log(
+            "patterns",
+            (
+              "phase=ensure_patterns_built_checksum_column done "
+              f"column_exists=true ddl_skipped_reason={type(e).__name__}"
+            ),
+          )
+        else:
+          raise
   finally:
     conn.autocommit = prev
 
 
-def _load_feed_from_postgis(cur, feed_id: int) -> GTFSFeed:
+def _trip_row_from_db(r: Any) -> dict:
+  """Normalize a trips-table row to the dict shape PatternBuilder expects."""
+  dir_val = r["direction_id"]
+  return {
+    "trip_id": r["trip_id"],
+    "route_id": r["route_id"],
+    "service_id": r["service_id"],
+    "direction_id": None if dir_val is None or dir_val == "" else str(dir_val),
+    "shape_id": r["shape_id"],
+    "trip_headsign": r["headsign"],
+    "block_id": r["block_id"],
+  }
+
+
+def _direction_ids_by_route(cur, feed_id: int) -> Dict[str, Set[Optional[str]]]:
   """
-  Load core GTFS tables for the given feed_id from PostGIS and construct a
-  GTFSFeed object compatible with PatternBuilder and ServiceCalendar.
+  DISTINCT (route_id, direction_id) from trips — small vs full trips fetch.
+  Normalizes direction_id like the previous in-Python scan (None/'' -> None).
   """
+  cur.execute(
+    """
+    SELECT DISTINCT route_id, direction_id
+    FROM trips
+    WHERE feed_id = %s
+    """,
+    (feed_id,),
+  )
+  out: Dict[str, Set[Optional[str]]] = {}
+  for row in cur.fetchall():
+    rid = row["route_id"]
+    if not rid:
+      continue
+    dir_val = row["direction_id"]
+    d: Optional[str]
+    if dir_val is None or dir_val == "":
+      d = None
+    else:
+      d = str(dir_val)
+    out.setdefault(rid, set()).add(d)
+  return out
+
+
+def _trips_for_routes(cur, feed_id: int, route_ids: List[str]) -> List[dict]:
+  """Load trips only for the given route_ids (one query per batch)."""
+  if not route_ids:
+    return []
+  cur.execute(
+    """
+    SELECT trip_id, route_id, service_id, direction_id, shape_id, headsign, block_id
+    FROM trips
+    WHERE feed_id = %s AND route_id = ANY(%s)
+    """,
+    (feed_id, route_ids),
+  )
+  return [_trip_row_from_db(r) for r in cur.fetchall()]
+
+
+def _load_feed_core_from_postgis(cur, feed_id: int) -> GTFSFeed:
+  """
+  Load agencies, routes, stops, calendar, calendar_dates — no trips (loaded per route batch).
+  GTFSFeed-compatible stub for PatternBuilder and ServiceCalendar.
+  """
+  log("patterns", f"feed load: querying agencies (feed_id={feed_id}) ...")
   # Agencies
   cur.execute(
     """
@@ -85,6 +180,7 @@ def _load_feed_from_postgis(cur, feed_id: int) -> GTFSFeed:
     }
     for r in cur.fetchall()
   ]
+  log("patterns", f"feed load: loaded {len(agencies)} agencies")
 
   # Routes
   cur.execute(
@@ -107,6 +203,7 @@ def _load_feed_from_postgis(cur, feed_id: int) -> GTFSFeed:
     }
     for r in cur.fetchall()
   ]
+  log("patterns", f"feed load: loaded {len(routes)} routes")
 
   # Stops
   cur.execute(
@@ -128,31 +225,12 @@ def _load_feed_from_postgis(cur, feed_id: int) -> GTFSFeed:
     }
     for r in cur.fetchall()
   ]
-
-  # Trips
-  cur.execute(
-    """
-    SELECT trip_id, route_id, service_id, direction_id, shape_id, headsign, block_id
-    FROM trips
-    WHERE feed_id = %s
-    """,
-    (feed_id,),
+  log("patterns", f"feed load: loaded {len(stops)} stops")
+  log(
+    "patterns",
+    "feed load: skipping full trips table — trips + stop_times load per route batch",
   )
-  trips = []
-  for r in cur.fetchall():
-    dir_val = r["direction_id"]
-    trips.append(
-      {
-        "trip_id": r["trip_id"],
-        "route_id": r["route_id"],
-        "service_id": r["service_id"],
-        # PatternBuilder expects direction_id as string or None
-        "direction_id": None if dir_val is None else str(dir_val),
-        "shape_id": r["shape_id"],
-        "trip_headsign": r["headsign"],
-        "block_id": r["block_id"],
-      }
-    )
+  trips: List[dict] = []
 
   # Calendar
   cur.execute(
@@ -180,6 +258,7 @@ def _load_feed_from_postgis(cur, feed_id: int) -> GTFSFeed:
     }
     for r in cur.fetchall()
   ]
+  log("patterns", f"feed load: loaded {len(calendar)} calendar rows")
 
   # Calendar dates
   cur.execute(
@@ -198,6 +277,7 @@ def _load_feed_from_postgis(cur, feed_id: int) -> GTFSFeed:
     }
     for r in cur.fetchall()
   ]
+  log("patterns", f"feed load: loaded {len(calendar_dates)} calendar_dates rows")
 
   # For pattern building we don't need full shapes; keep shape_id on trips and let
   # graph building fetch shapes lazily from PostGIS when needed.
@@ -219,16 +299,24 @@ def _load_feed_from_postgis(cur, feed_id: int) -> GTFSFeed:
   return feed
 
 
-def _upsert_patterns_for_feed(cur, feed_id: int, old_feed_id: int | None, yyyymmdd: str) -> None:
+def _upsert_patterns_for_feed(
+    cur,
+    feed_id: int,
+    old_feed_id: int | None,
+    yyyymmdd: str,
+    *,
+    ignore_calendar: bool = False,
+    route_batch_size: int = 200,
+) -> None:
+  route_batch_size = max(1, int(route_batch_size))
   log("patterns", f"Loading active GTFS feed from PostGIS for date {yyyymmdd} ...")
-  feed = _load_feed_from_postgis(cur, feed_id)
+  feed = _load_feed_core_from_postgis(cur, feed_id)
   patterns_builder = PatternBuilder(feed)
 
-  # Load all stop_times for the feed once (one query) so we avoid per-trip DB calls.
   conn = cur.connection
-  log("patterns", f"Loading all stop_times for feed_id={feed_id} (one query) ...")
-  stop_times_by_trip = get_all_stop_times_for_feed(feed_id, conn)
-  log("patterns", f"Loaded stop_times for {len(stop_times_by_trip)} trips.")
+  log("patterns", "Loading distinct (route_id, direction_id) from trips ...")
+  direction_map = _direction_ids_by_route(cur, feed_id)
+  log("patterns", f"Distinct routes-with-trips={len(direction_map)} (direction keys only, not full trips).")
 
   # Clear existing patterns for this feed so we can rebuild deterministically.
   log("patterns", f"Clearing existing patterns for feed_id={feed_id} ...")
@@ -239,138 +327,159 @@ def _upsert_patterns_for_feed(cur, feed_id: int, old_feed_id: int | None, yyyymm
   cur.execute("DELETE FROM pattern_edges WHERE feed_id = %s", (feed_id,))
 
   routes = feed.routes
-  log("patterns", f"Building patterns for {len(routes)} routes ...")
+  n_routes = len(routes)
+  log("patterns", f"Building patterns for {n_routes} routes (batch_size={route_batch_size}) ...")
+  log(
+    "patterns",
+    f"This phase often takes many minutes on a full feed; progress every {_ROUTE_PROGRESS_EVERY} routes.",
+  )
   processed_routes = 0
-  for r in routes:
-    route_id = r.get("route_id")
-    if not route_id:
-      continue
+  for batch_start in range(0, n_routes, route_batch_size):
+    chunk = routes[batch_start : batch_start + route_batch_size]
+    route_ids = [r["route_id"] for r in chunk if r.get("route_id")]
+    chunk_trips = _trips_for_routes(cur, feed_id, route_ids)
+    trip_ids = [t["trip_id"] for t in chunk_trips]
+    stop_times_chunk = get_stop_times_bulk(feed_id, trip_ids, conn)
+    feed.trips = chunk_trips
+    log(
+      "patterns",
+      f"route batch [{batch_start}:{batch_start + len(chunk)}/{n_routes}] "
+      f"trips={len(chunk_trips)} stop_times_trips={len(stop_times_chunk)}",
+    )
 
-    # We build patterns separately for each direction_id we observe on trips,
-    # plus a None case to catch routes without direction_id set.
-    direction_ids = set()
-    for t in feed.trips:
-      if t.get("route_id") != route_id:
+    for r in chunk:
+      route_id = r.get("route_id")
+      if not route_id:
         continue
-      d = t.get("direction_id")
-      direction_ids.add(d if d not in ("", None) else None)
 
-    if not direction_ids:
-      direction_ids = {None}
+      direction_ids = direction_map.get(route_id)
+      if not direction_ids:
+        direction_ids = {None}
 
-    for dir_id in direction_ids:
-      # Compute per-route/direction signature for the new feed (reuse conn).
-      sig_new = compute_route_signature(route_id, dir_id, conn)
+      for dir_id in direction_ids:
+        # Compute per-route/direction signature for the new feed (reuse conn).
+        sig_new = compute_route_signature(route_id, dir_id, conn)
 
-      reused = False
-      if old_feed_id is not None:
-        sig_old = get_route_signature(old_feed_id, route_id, dir_id, conn)
-        if sig_old is not None and sig_old == sig_new:
-          # Route unchanged between feeds: copy existing patterns and pattern_stops
-          # from old_feed_id to the new feed.
-          log(
-            "patterns",
-            f"Reusing patterns for route_id={route_id!r}, direction_id={dir_id!r} from old_feed_id={old_feed_id}",
-          )
-          # Copy patterns
-          cur.execute(
-            """
-            INSERT INTO patterns (
-              feed_id,
-              pattern_id,
-              route_id,
-              direction_id,
-              repr_trip_id,
-              repr_shape_id,
-              stop_ids,
-              frequency,
-              used_shape
+        reused = False
+        if old_feed_id is not None:
+          sig_old = get_route_signature(old_feed_id, route_id, dir_id, conn)
+          if sig_old is not None and sig_old == sig_new:
+            # Route unchanged between feeds: copy existing patterns and pattern_stops
+            # from old_feed_id to the new feed.
+            log(
+              "patterns",
+              f"Reusing patterns for route_id={route_id!r}, direction_id={dir_id!r} from old_feed_id={old_feed_id}",
             )
-            SELECT
-              %s AS feed_id,
-              pattern_id,
-              route_id,
-              direction_id,
-              repr_trip_id,
-              repr_shape_id,
-              stop_ids,
-              frequency,
-              used_shape
-            FROM patterns
-            WHERE feed_id = %s
-              AND route_id = %s
-              AND COALESCE(direction_id, -1) = COALESCE(%s::int, -1)
-            """,
-            (feed_id, old_feed_id, route_id, int(dir_id) if dir_id is not None else None),
-          )
-          # Copy pattern_stops for the copied patterns
-          cur.execute(
-            """
-            INSERT INTO pattern_stops (
-              feed_id,
-              pattern_id,
-              seq,
-              stop_id
+            # Copy patterns
+            cur.execute(
+              """
+              INSERT INTO patterns (
+                feed_id,
+                pattern_id,
+                route_id,
+                direction_id,
+                repr_trip_id,
+                repr_shape_id,
+                stop_ids,
+                frequency,
+                used_shape
+              )
+              SELECT
+                %s AS feed_id,
+                pattern_id,
+                route_id,
+                direction_id,
+                repr_trip_id,
+                repr_shape_id,
+                stop_ids,
+                frequency,
+                used_shape
+              FROM patterns
+              WHERE feed_id = %s
+                AND route_id = %s
+                AND COALESCE(direction_id, -1) = COALESCE(%s::int, -1)
+              """,
+              (feed_id, old_feed_id, route_id, int(dir_id) if dir_id is not None else None),
             )
-            SELECT
-              %s AS feed_id,
-              ps.pattern_id,
-              ps.seq,
-              ps.stop_id
-            FROM pattern_stops ps
-            JOIN patterns p
-              ON p.feed_id = ps.feed_id AND p.pattern_id = ps.pattern_id
-            WHERE ps.feed_id = %s
-              AND p.feed_id = %s
-              AND p.route_id = %s
-              AND COALESCE(p.direction_id, -1) = COALESCE(%s::int, -1)
-            """,
-            (feed_id, old_feed_id, old_feed_id, route_id, int(dir_id) if dir_id is not None else None),
-          )
-          reused = True
+            # Copy pattern_stops for the copied patterns
+            cur.execute(
+              """
+              INSERT INTO pattern_stops (
+                feed_id,
+                pattern_id,
+                seq,
+                stop_id
+              )
+              SELECT
+                %s AS feed_id,
+                ps.pattern_id,
+                ps.seq,
+                ps.stop_id
+              FROM pattern_stops ps
+              JOIN patterns p
+                ON p.feed_id = ps.feed_id AND p.pattern_id = ps.pattern_id
+              WHERE ps.feed_id = %s
+                AND p.feed_id = %s
+                AND p.route_id = %s
+                AND COALESCE(p.direction_id, -1) = COALESCE(%s::int, -1)
+              """,
+              (feed_id, old_feed_id, old_feed_id, route_id, int(dir_id) if dir_id is not None else None),
+            )
+            reused = True
 
-      if not reused:
-        # Build fresh patterns for this route/direction. If the build date has no
-        # service for this route (e.g. weekday vs weekend), try the next 7 days
-        # so every route that runs on any day gets a pattern.
-        pats = patterns_builder.build_patterns_for_route(
-          route_id=route_id,
-          direction_id=dir_id,
-          yyyymmdd=yyyymmdd,
-          max_trips=None,
-          stop_times_preloaded=stop_times_by_trip,
-        )
-        if not pats:
-          base = datetime.strptime(yyyymmdd, "%Y%m%d").date()
-          for d in range(1, 8):
-            try_date = (base + timedelta(days=d)).strftime("%Y%m%d")
+        if not reused:
+          # Build fresh patterns for this route/direction. If the build date has no
+          # service for this route (e.g. weekday vs weekend), try the next 7 days
+          # so every route that runs on any day gets a pattern.
+          if ignore_calendar:
             pats = patterns_builder.build_patterns_for_route(
               route_id=route_id,
               direction_id=dir_id,
-              yyyymmdd=try_date,
+              yyyymmdd=yyyymmdd,
               max_trips=None,
-              stop_times_preloaded=stop_times_by_trip,
+              use_all_trips=True,
+              stop_times_preloaded=stop_times_chunk,
             )
-            if pats:
-              break
-        if not pats:
-          # Still no pattern (e.g. route only runs outside the 8-day window). Use all trips.
-          pats = patterns_builder.build_patterns_for_route(
-            route_id=route_id,
-            direction_id=dir_id,
-            yyyymmdd=yyyymmdd,
-            max_trips=None,
-            use_all_trips=True,
-            stop_times_preloaded=stop_times_by_trip,
-          )
-        for pid, pat in pats.items():
-          _insert_pattern(cur, feed_id, pat)
+          else:
+            pats = patterns_builder.build_patterns_for_route(
+              route_id=route_id,
+              direction_id=dir_id,
+              yyyymmdd=yyyymmdd,
+              max_trips=None,
+              stop_times_preloaded=stop_times_chunk,
+            )
+            if not pats:
+              base = datetime.strptime(yyyymmdd, "%Y%m%d").date()
+              for d in range(1, 8):
+                try_date = (base + timedelta(days=d)).strftime("%Y%m%d")
+                pats = patterns_builder.build_patterns_for_route(
+                  route_id=route_id,
+                  direction_id=dir_id,
+                  yyyymmdd=try_date,
+                  max_trips=None,
+                  stop_times_preloaded=stop_times_chunk,
+                )
+                if pats:
+                  break
+            if not pats:
+              # Still no pattern (e.g. route only runs outside the 8-day window). Use all trips.
+              pats = patterns_builder.build_patterns_for_route(
+                route_id=route_id,
+                direction_id=dir_id,
+                yyyymmdd=yyyymmdd,
+                max_trips=None,
+                use_all_trips=True,
+                stop_times_preloaded=stop_times_chunk,
+              )
+          for pid, pat in pats.items():
+            _insert_pattern(cur, feed_id, pat)
 
-      # Record the new signature for this route/direction in the new feed.
-      upsert_route_signature(feed_id, route_id, dir_id, sig_new, conn)
-    processed_routes += 1
-    if processed_routes % 50 == 0:
-      log("patterns", f"Processed {processed_routes}/{len(routes)} routes ...")
+        # Record the new signature for this route/direction in the new feed.
+        upsert_route_signature(feed_id, route_id, dir_id, sig_new, conn)
+
+      processed_routes += 1
+      if processed_routes % _ROUTE_PROGRESS_EVERY == 0:
+        log("patterns", f"Processed {processed_routes}/{n_routes} routes ...")
 
   _build_pattern_ride_network(cur=cur, feed_id=feed_id, yyyymmdd=yyyymmdd)
 
@@ -567,7 +676,7 @@ def _build_pattern_ride_network(cur, feed_id: int, yyyymmdd: str) -> None:
       )
       edges_inserted += len(edge_rows)
 
-    if (idx + 1) % 50 == 0:
+    if (idx + 1) % _RIDE_NETWORK_PROGRESS_EVERY == 0:
       log("patterns", f"Ride network build progress: {idx + 1}/{len(pattern_rows)} patterns ...")
 
   log(
@@ -686,14 +795,26 @@ def build_patterns(
   date_ymd: Optional[str] = None,
   *,
   force: bool = False,
+  ignore_calendar: bool = False,
+  route_batch_size: int = 200,
 ) -> str:
   """
   Populate patterns / pattern_stops (and ride network) for the active feed.
   If date_ymd is None, picks a reference date from calendar coverage (see pick_default_pattern_build_date).
   Skips work when feed_versions.checksum matches patterns_built_checksum (same zip as last pattern build),
   unless force=True.
+  If ignore_calendar=True, pattern selection uses all trips (use_all_trips); date_ymd is still used for
+  ride-network graph metadata — not for operational timetable accuracy.
+  route_batch_size controls how many routes share one trips + stop_times bulk load from PostGIS.
   Returns the YYYYMMDD reference date (for logging / metadata).
   """
+  ensure_cli_action_logging()
+  log(
+    "patterns",
+    "build_patterns_postgis: connecting to PostGIS and resolving active feed (checksum gate) ...",
+  )
+  log("patterns", "phase=checksum_gate start")
+  t_gate = time.perf_counter()
   conn = _connect(database_url)
   conn.autocommit = False
   try:
@@ -725,9 +846,17 @@ def build_patterns(
           "patterns",
           f"Skip: patterns already built for this feed zip (feed_id={feed_id})",
         )
+        log(
+          "patterns",
+          f"phase=checksum_gate done skip=true feed_id={feed_id} elapsed_s={time.perf_counter() - t_gate:.2f}",
+        )
         return ref_date
 
     conn.rollback()
+    log(
+      "patterns",
+      f"phase=checksum_gate done skip=false feed_id={feed_id} elapsed_s={time.perf_counter() - t_gate:.2f}",
+    )
 
     with conn:
       with conn.cursor() as cur:
@@ -739,7 +868,8 @@ def build_patterns(
           )
       log(
         "patterns",
-        f"Starting pattern build for date {date_ymd} using {database_url or 'DEFAULT_DB_URL'}",
+        f"Starting pattern build for date {date_ymd} using {database_url or 'DEFAULT_DB_URL'}"
+        f"{' (ignore_calendar=True)' if ignore_calendar else ''}",
       )
       # Find the most recent previous feed (if any) to reuse patterns from.
       with conn.cursor() as cur:
@@ -757,7 +887,14 @@ def build_patterns(
         old_feed_id = int(row[0]) if row else None
       log("patterns", f"Active PostGIS feed_id={feed_id}, old_feed_id={old_feed_id}")
       with conn.cursor() as cur:
-        _upsert_patterns_for_feed(cur, feed_id, old_feed_id, date_ymd)
+        _upsert_patterns_for_feed(
+          cur,
+          feed_id,
+          old_feed_id,
+          date_ymd,
+          ignore_calendar=ignore_calendar,
+          route_batch_size=route_batch_size,
+        )
         cur.execute(
           """
           UPDATE feed_versions
@@ -773,6 +910,8 @@ def build_patterns(
 
 
 def main() -> None:
+  ensure_cli_action_logging()
+  log("patterns", "build_patterns_postgis CLI starting ...")
   ap = argparse.ArgumentParser(description="Precompute route patterns into Postgres/PostGIS.")
   ap.add_argument(
     "--database-url",
@@ -794,9 +933,35 @@ def main() -> None:
     action="store_true",
     help="Rebuild patterns even when they already match the active feed zip checksum.",
   )
+  ap.add_argument(
+    "--ignore-calendar",
+    action="store_true",
+    help=(
+      "Build patterns using all trips per route/direction (skip GTFS service-day filter). "
+      "For topology/shape tooling only, not operational schedules."
+    ),
+  )
+  ap.add_argument(
+    "--route-batch-size",
+    type=int,
+    default=200,
+    metavar="N",
+    help=(
+      "Number of routes per batch when loading trips/stop_times from PostGIS "
+      "(lower if trip_id = ANY(...) hits size limits). Default: 200."
+    ),
+  )
   args = ap.parse_args()
+  if args.route_batch_size < 1:
+    ap.error("--route-batch-size must be >= 1")
 
-  build_patterns(args.database_url, args.date, force=args.force)
+  build_patterns(
+    args.database_url,
+    args.date,
+    force=args.force,
+    ignore_calendar=args.ignore_calendar,
+    route_batch_size=args.route_batch_size,
+  )
 
 
 if __name__ == "__main__":

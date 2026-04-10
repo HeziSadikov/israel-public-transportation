@@ -112,19 +112,31 @@ From the project root, with `DATABASE_URL` set (or pass `--database-url`):
 ```bash
 # All-in-one: patterns (auto date) + graph/preview precompute. Add --with-ingest to run GTFS ingest first.
 # Ingest / patterns / graphs each skip their own work when unchanged (--ingest-force / --force-patterns override patterns+ingest).
+# Add --ingest-fetch to download only if missing, --ingest-fetch-if-newer to refresh only when remote changed,
+# or --ingest-fetch-always to always re-download.
 python -m scripts.precompute_all_postgis --workers 4
 python -m scripts.precompute_all_postgis --with-ingest --workers 4
+python -m scripts.precompute_all_postgis --with-ingest --ingest-fetch-if-newer --workers 4
+python -m scripts.precompute_all_postgis --with-ingest --ingest-fetch-always --workers 4
 ```
 
 ```bash
 # Ingest (defaults: repo-root israel-public-transportation.zip, DATABASE_URL, MOT source URL).
 # Skips reload if the active feed's stored SHA-256 matches the zip; use --force to ingest anyway.
+# --fetch downloads from --source-url only if zip is missing.
+# --fetch-if-newer probes remote metadata (etag/last-modified/content-length) and downloads when changed
+# (or when metadata is unavailable/inconclusive, for safety).
+# During --fetch-if-newer, ingest prints metadata probe/decision logs, and downloader prints MB/% progress.
+# --fetch-always always downloads first.
 python -m backend.scripts.ingest_gtfs_postgis
+python -m backend.scripts.ingest_gtfs_postgis --fetch
+python -m backend.scripts.ingest_gtfs_postgis --fetch-if-newer
 # Override paths / DB if needed:
 python -m backend.scripts.ingest_gtfs_postgis --gtfs-zip ./other.zip --database-url "postgresql://user:pass@localhost:5432/israel_gtfs"
 
 # Precompute route patterns (--date optional; skips if patterns already match active feed zip checksum; --force to rebuild).
 # Adds feed_versions.patterns_built_checksum via ALTER if your DB predates that column.
+# Pattern + graph precompute CLIs log to stderr with timestamps (app.action); ingest continues to use stdout prints.
 python -m backend.scripts.build_patterns_postgis
 python -m backend.scripts.build_patterns_postgis --date 20260308 --database-url "postgresql://user:pass@localhost:5432/israel_gtfs"
 
@@ -174,6 +186,7 @@ For realistic latency checks, avoid `--reload`:
 
 - Remote base: `https://gtfs.mot.gov.il/gtfsfiles/` (configurable via `GTFS_REMOTE_BASE`).
 - Dataset file: `israel-public-transportation.zip` (configurable via `GTFS_REMOTE_FILENAME`).
+- `backend/gtfs_download.py`: shared HTTPS streaming download used by `gtfs_updater` and by `ingest_gtfs_postgis --fetch` / `--fetch-always`.
 - `backend/gtfs_updater.py`:
   - Downloads the daily feed into `./data/gtfs/YYYYMMDD/gtfs.zip`.
   - Computes SHA‑256 and builds `version_id = YYYYMMDD-<sha8>`.

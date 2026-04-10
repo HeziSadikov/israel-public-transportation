@@ -76,6 +76,13 @@ html, body, #root {
   border: 1px solid rgba(248, 113, 113, 0.3);
 }
 
+.rail-status-feed {
+  color: #fcd34d;
+  background: rgba(245, 158, 11, 0.12);
+  border-color: rgba(251, 191, 36, 0.35);
+  margin-bottom: 6px;
+}
+
 .row {
   display: flex;
   gap: 8px;

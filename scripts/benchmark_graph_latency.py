@@ -17,6 +17,8 @@ import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
 
+from backend.logging_utils import ensure_cli_action_logging, log
+
 
 def _post_json(
     url: str, payload: Dict[str, Any], timeout_s: float = 60.0
@@ -68,6 +70,8 @@ def _fmt(ms: float) -> str:
 
 
 def main() -> None:
+    ensure_cli_action_logging()
+    log("benchmark_graph_latency", "phase=main start")
     ap = argparse.ArgumentParser(description="Benchmark /graph/build or /graph/preview cold-vs-warm latency.")
     ap.add_argument("--base-url", type=str, default="http://127.0.0.1:8000")
     ap.add_argument("--route-id", type=str, required=True)
@@ -96,10 +100,14 @@ def main() -> None:
     status_url = urllib.parse.urljoin(args.base_url.rstrip("/") + "/", "graph/cache/status")
 
     if args.trigger_warmup:
+        log("benchmark_graph_latency", "phase=trigger_warmup start")
         st, data, dt, _ = _post_json(warmup_url, {}, timeout_s=args.timeout_s)
         print(f"warmup: status={st}, took={_fmt(dt)}")
         if st >= 400:
             print(f"warmup_error: {data}")
+            log("benchmark_graph_latency", f"phase=trigger_warmup error status={st}")
+        else:
+            log("benchmark_graph_latency", f"phase=trigger_warmup done status={st} elapsed_ms={dt:.1f}")
 
     st, status_data, _ = _get_json(status_url)
     if st == 200:
@@ -149,6 +157,10 @@ def main() -> None:
             failures += 1
             detail = data.get("detail", data)
             print(f"    detail={detail}")
+    log(
+        "benchmark_graph_latency",
+        f"phase=benchmark_loop done runs={runs} failures={failures}",
+    )
 
     first = times[0]
     warm = times[1:]
@@ -166,6 +178,7 @@ def main() -> None:
     print(f"  backend_avg:{_fmt(warm_backend_avg)}")
     print(f"  speedup_x:  {speedup:.2f}x")
     print(f"  failures:   {failures}/{runs}")
+    log("benchmark_graph_latency", "phase=main done")
 
 
 if __name__ == "__main__":

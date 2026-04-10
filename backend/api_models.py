@@ -38,6 +38,11 @@ class FeedStatusResponse(BaseModel):
     history_len: int
     last_update_attempt: Optional[str] = None
     last_update_ok: Optional[bool] = None
+    # MIN/MAX of calendar.start_date / end_date for the active PostGIS feed (None if no calendar rows).
+    calendar_min_ymd: Optional[int] = None
+    calendar_max_ymd: Optional[int] = None
+    # When UTC “today” falls outside [calendar_min_ymd, calendar_max_ymd], hints to refresh GTFS or pick in-range dates.
+    calendar_coverage_note: Optional[str] = None
 
 
 class GraphBuildRequest(BaseModel):
@@ -125,6 +130,7 @@ class AreaRouteResult(BaseModel):
 
 class AreaRoutesResponse(BaseModel):
     routes: List[AreaRouteResult]
+    calendar_hint: Optional[str] = None
 
 
 class DetourByAreaMode(str, Enum):

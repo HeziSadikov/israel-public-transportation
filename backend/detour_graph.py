@@ -337,8 +337,9 @@ def build_detour_graph(
     routes_raw = find_routes_in_polygon(
         feed=feed,
         polygon_geojson=aoi_geojson,
-        yyyymmdd=date_ymd,
+        start_date_ymd=date_ymd,
         start_sec=day_start,
+        end_date_ymd=date_ymd,
         end_sec=day_end,
     )
     route_ids: Set[str] = {r["route_id"] for r in routes_raw}

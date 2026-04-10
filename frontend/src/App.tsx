@@ -117,6 +117,21 @@ const toLocalDateTime = (yyyymmdd: string, hhmm: string): Date | null => {
   return dt;
 };
 
+/** Clamp YYYYMMDD string to loaded GTFS calendar span when min/max are known (from /feed/status). */
+const clampYmdToCalendar = (yyyymmdd: string, calMin: number | null, calMax: number | null): string => {
+  if (calMin == null || calMax == null || !YMD_RE.test(yyyymmdd)) return yyyymmdd;
+  let n = parseInt(yyyymmdd, 10);
+  if (Number.isNaN(n)) return yyyymmdd;
+  if (n < calMin) n = calMin;
+  if (n > calMax) n = calMax;
+  return String(n).padStart(8, "0");
+};
+
+const formatYmdInt = (n: number): string => {
+  const s = String(n).padStart(8, "0");
+  return `${s.slice(0, 4)}-${s.slice(4, 6)}-${s.slice(6, 8)}`;
+};
+
 const App: React.FC = () => {
   const [blockageGeojson, setBlockageGeojson] = useState<GeoJSON.Geometry | null>(null);
   const [areaStartDate, setAreaStartDate] = useState(() => {
@@ -143,6 +158,9 @@ const App: React.FC = () => {
   const [detourLoading, setDetourLoading] = useState(false);
   const [detour, setDetour] = useState<DetourResponse | null>(null);
   const [message, setMessage] = useState<string | null>(null);
+  const [feedCalendarNotice, setFeedCalendarNotice] = useState<string | null>(null);
+  const [feedCalMin, setFeedCalMin] = useState<number | null>(null);
+  const [feedCalMax, setFeedCalMax] = useState<number | null>(null);
   const [useOSMDetour, setUseOSMDetour] = useState(false);
 
   const [explorerOpen, setExplorerOpen] = useState(true);
@@ -170,6 +188,7 @@ const App: React.FC = () => {
 
   const [pinPosition, setPinPosition] = useState<[number, number] | null>(null);
   const [basemap, setBasemap] = useState<BasemapKind>("osm");
+  const [drawMode, setDrawMode] = useState<string>("simple_select");
 
   const mapRef = useRef<MapLibreMapHandle | null>(null);
   const latestRouteLoadIdRef = useRef(0);
@@ -181,6 +200,36 @@ const App: React.FC = () => {
   const timeEndInputRef = useRef<HTMLInputElement | null>(null);
 
   const center: [number, number] = [31.5, 35.0];
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await axios.get<{
+          calendar_min_ymd?: number | null;
+          calendar_max_ymd?: number | null;
+          calendar_coverage_note?: string | null;
+        }>(`${API_BASE}/feed/status`);
+        if (cancelled) return;
+        const mn = res.data.calendar_min_ymd ?? null;
+        const mx = res.data.calendar_max_ymd ?? null;
+        setFeedCalMin(mn);
+        setFeedCalMax(mx);
+        if (mn != null && mx != null) {
+          setAreaStartDate((prev) => clampYmdToCalendar(prev, mn, mx));
+          setAreaEndDate((prev) => clampYmdToCalendar(prev, mn, mx));
+        }
+        const note = res.data.calendar_coverage_note?.trim();
+        if (note) setFeedCalendarNotice(note);
+      } catch {
+        /* offline or CORS — keep defaults */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   const timeWindowError = useMemo(() => {
     if (!isValidYmd(areaStartDate.trim())) return "Start date must be valid and formatted as YYYYMMDD.";
     if (!isValidYmd(areaEndDate.trim())) return "End date must be valid and formatted as YYYYMMDD.";
@@ -207,8 +256,8 @@ const App: React.FC = () => {
     const toHHMM = (d: Date) => `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
     const toYMD = (d: Date) =>
       `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, "0")}${String(d.getDate()).padStart(2, "0")}`;
-    setAreaStartDate(toYMD(now));
-    setAreaEndDate(toYMD(end));
+    setAreaStartDate(clampYmdToCalendar(toYMD(now), feedCalMin, feedCalMax));
+    setAreaEndDate(clampYmdToCalendar(toYMD(end), feedCalMin, feedCalMax));
     setAreaStartTime(toHHMM(now));
     setAreaEndTime(toHHMM(end));
   };
@@ -299,17 +348,26 @@ const App: React.FC = () => {
     setDetourAreaResults(null);
     setDetour(null);
     try {
-      const res = await axios.post<{ routes: AreaRouteResult[] }>(`${API_BASE}/area/routes`, {
+      const res = await axios.post<{
+        routes: AreaRouteResult[];
+        calendar_hint?: string | null;
+      }>(`${API_BASE}/area/routes`, {
         polygon_geojson: blockageGeojson,
         start_date: areaStartDate.trim(),
         start_time: areaStartTime.trim() || "04:00",
         end_date: areaEndDate.trim(),
         end_time: areaEndTime.trim() || "23:59",
         max_results: 200,
-      }, { timeout: 120000, headers: { "Content-Type": "application/json" } });
+      }, { timeout: 600000, headers: { "Content-Type": "application/json" } });
       setAreaRoutes(res.data.routes);
       if (res.data.routes.length === 0) {
-        setMessage("No routes in this area for the chosen date/time.");
+        const hint = res.data.calendar_hint?.trim();
+        const base = hint || "No routes in this area for the chosen date/time.";
+        const spanExtra =
+          !hint && feedCalMin != null && feedCalMax != null
+            ? ` Loaded GTFS calendar: ${formatYmdInt(feedCalMin)} to ${formatYmdInt(feedCalMax)}.`
+            : "";
+        setMessage(base + spanExtra);
       }
     } catch (err: unknown) {
       console.error(err);
@@ -628,10 +686,30 @@ const App: React.FC = () => {
             <button type="button" onClick={() => mapRef.current?.startPolygon()} title="Draw polygon blockage">
               Draw polygon
             </button>
+            <button
+              type="button"
+              onClick={() => mapRef.current?.editBlockagePolygon()}
+              disabled={!blockageGeojson}
+              title="Drag vertices to reshape; use Done editing when the Cancel button shows that label."
+            >
+              Edit polygon
+            </button>
             <button type="button" onClick={() => mapRef.current?.clearBlockage()} title="Clear blockage">
               Clear
             </button>
-            <button type="button" onClick={() => mapRef.current?.cancelDrawing()}>Cancel</button>
+            <button
+              type="button"
+              onClick={() => mapRef.current?.cancelDrawing()}
+              title={
+                drawMode === "direct_select"
+                  ? "Leave vertex edit mode; polygon stays."
+                  : drawMode === "draw_polygon"
+                    ? "Stop drawing (discards in-progress polygon)."
+                    : "Cancel drawing or return to map view."
+              }
+            >
+              {drawMode === "direct_select" ? "Done editing" : "Cancel"}
+            </button>
             <button type="button" onClick={() => mapRef.current?.undoLastPoint()}>Undo</button>
           </div>
         </section>
@@ -798,6 +876,7 @@ const App: React.FC = () => {
           </button>
         </section>
 
+        {feedCalendarNotice && <div className="rail-status rail-status-feed">{feedCalendarNotice}</div>}
         {message && <div className="rail-status">{message}</div>}
       </aside>
 
@@ -815,6 +894,7 @@ const App: React.FC = () => {
           basemap={basemap}
           onStopClick={handleMapStopClick}
           onStopOpenInExplorer={handleOpenStopInExplorer}
+          onDrawModeChange={setDrawMode}
         />
         {explorerOpen && (
           <ExplorerWindow
