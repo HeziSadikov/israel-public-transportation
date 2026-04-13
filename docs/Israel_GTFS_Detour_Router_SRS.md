@@ -173,8 +173,10 @@ Endpoints may evolve; the SRS defines the expected semantics.
 ## 7.2 Multi-route detour graph construction
 
 - Include primary route corridor plus additional corridors that intersect the AOI and are active in the time window.
-- Add transfer edges between nearby stops within transfer_radius_m with a fixed + walking-time penalty.
-- Do not introduce street-based driving edges; only GTFS corridor edges are used for bus movement.
+- Optionally insert **virtual junction nodes** on precomputed corridor LineStrings where two different patterns cross or pass very close in the AOI, splitting the ride edge so paths can traverse that corner without a GTFS stop there.
+- Optionally snap **geocoded** operator turn steps (intersection / street queries) onto the nearest corridor edge within a distance threshold and split there, so named corners align with the same graph.
+- Add transfer edges between nearby graph nodes (stops and junctions) within transfer_radius_m with a fixed + walking-time penalty.
+- Do not introduce arbitrary OSM-only driving edges; bus movement remains on GTFS-derived corridor geometry (with the optional splits above).
 ## 7.3 Path selection
 
 - Run shortest path (A* or Dijkstra) on the detour graph with blocked edges removed/penalized.

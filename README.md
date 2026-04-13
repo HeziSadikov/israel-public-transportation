@@ -161,6 +161,41 @@ Warmup behavior:
   - `GET /graph/cache/status` (includes `warmup.loaded_previews_gtfs`, `loaded_previews_osm`, `previews_skipped_stale`)
   - `POST /graph/cache/warmup?profiles=weekday,friday` — add `include_previews=false` to warm graphs only
 
+Detour-by-area weighted routing + cache:
+- `/detours/by-area` now uses a dedicated weighted routing policy (separate from `/detour` defaults).
+- Route-level detour answers are cached in `detour_by_area_cache` (PostGIS) with key fields:
+  - feed/version context
+  - mode + route_id + direction_id
+  - date/time window + transfer radius + `use_osm_detour`
+  - policy profile + normalized blockage geometry hash
+- Cache entries are guarded by `route_sig_hash`, so route changes automatically invalidate stale rows.
+- New by-area policy env knobs:
+  - `BY_AREA_ROUTING_POLICY_PROFILE=weighted-v1` (cache-key profile token)
+  - `BY_AREA_ROUTING_PER_EDGE_PENALTY_S=20`
+  - `BY_AREA_ROUTING_TRANSFER_PENALTY_S=420`
+  - `BY_AREA_ROUTING_TRANSFER_DISTANCE_PENALTY_PER_M_S=0.30`
+  - `BY_AREA_ROUTING_PATTERN_SWITCH_PENALTY_S=120`
+  - `BY_AREA_ROUTING_FREQ_DISCOUNT_COEF=0.0`
+  - `BY_AREA_ROUTING_FREQ_CAP=60`
+  - `BY_AREA_ROUTING_HEURISTIC_MAX_SPEED_M_S=22.22`
+- Optional global routing knobs (all A* paths):
+  - `ROUTING_TRANSFER_DISTANCE_PENALTY_PER_M_S=0`
+  - `ROUTING_PATTERN_SWITCH_PENALTY_S=0`
+
+Hybrid intersection-aware detours:
+- `POST /detour` now attempts hybrid OSM bypass first (when enabled), then falls back to GTFS detour.
+- `POST /detours/by-area` (`use_osm_detour=true`) uses the same shared hybrid bypass segment builder.
+- Hybrid behavior:
+  - derives entry/exit near blockage from route geometry crossing points
+  - routes around polygon on road graph (Valhalla), then optional map-match polish
+  - rejects bypass segments that still overlap blockage interior
+- Config:
+  - `HYBRID_DETOUR_ENABLED=true|false` (default true)
+  - `VALHALLA_URL=http://localhost:8002` (required for OSM hybrid routing)
+- Logs:
+  - `/detour`: `hybrid=hit` or `hybrid=fallback_gtfs`
+  - `/detours/by-area`: cache profile includes `|hybrid-osm-v1` when OSM hybrid is requested
+
 **Optional later optimization:** if `built_fallback` remains costly after precompute + preview warmup, a slimmer stored preview (for example one merged centerline instead of per-edge GeoJSON features) can shrink pickles and client parse time; `backend/route_preview_payload.py` is the single place to evolve the persisted dict shape alongside the API.
 
 Benchmark helper:

@@ -232,6 +232,60 @@ CREATE TABLE IF NOT EXISTS route_preview_cache (
 CREATE INDEX IF NOT EXISTS idx_route_preview_cache_feed_profile
     ON route_preview_cache(feed_id, profile_key, pretty_osm);
 
+-- Optional cache for /detours/by-area route-level detour answers.
+CREATE TABLE IF NOT EXISTS detour_by_area_cache (
+    feed_id          INT REFERENCES feed_versions(id) ON DELETE CASCADE,
+    mode             TEXT NOT NULL,
+    route_id         TEXT NOT NULL,
+    direction_id     INT,
+    date_ymd         INT NOT NULL,
+    start_sec        INT NOT NULL,
+    end_sec          INT NOT NULL,
+    transfer_radius_m DOUBLE PRECISION NOT NULL,
+    use_osm_detour   BOOLEAN NOT NULL,
+    policy_profile   TEXT NOT NULL,
+    blockage_hash    TEXT NOT NULL,
+    route_sig_hash   TEXT NOT NULL,
+    result_json      TEXT NOT NULL,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (
+        feed_id,
+        mode,
+        route_id,
+        direction_id,
+        date_ymd,
+        start_sec,
+        end_sec,
+        transfer_radius_m,
+        use_osm_detour,
+        policy_profile,
+        blockage_hash
+    )
+);
+
+CREATE INDEX IF NOT EXISTS idx_detour_by_area_cache_lookup
+    ON detour_by_area_cache(feed_id, mode, date_ymd, start_sec, end_sec, blockage_hash);
+
+-- Operator-provided street detours (replay / learning) keyed by feed + blockage + route endpoints.
+CREATE TABLE IF NOT EXISTS detour_street_override (
+    feed_id            INT NOT NULL REFERENCES feed_versions(id) ON DELETE CASCADE,
+    override_key       TEXT NOT NULL,
+    scope              TEXT NOT NULL,
+    route_id           TEXT NOT NULL,
+    direction_id       INT,
+    blockage_hash      TEXT NOT NULL,
+    entry_stop_id      TEXT NOT NULL,
+    exit_stop_id       TEXT NOT NULL,
+    route_sig_hash     TEXT NOT NULL DEFAULT '',
+    road_geojson       TEXT NOT NULL,
+    turn_by_turn_json  TEXT NOT NULL,
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (feed_id, override_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_detour_street_override_lookup
+    ON detour_street_override (feed_id, blockage_hash, route_id);
+
 -- ---------------------------------------------------------------------------
 -- Precomputed directional ride network (pattern_nodes / pattern_edges)
 -- ---------------------------------------------------------------------------

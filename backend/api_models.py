@@ -1,9 +1,21 @@
 from __future__ import annotations
 
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Literal
 from enum import Enum
 
 from pydantic import BaseModel, Field
+
+
+class DetourTurnStep(BaseModel):
+    """Street-oriented turn; at least one text or structured field should be set."""
+
+    instruction_he: Optional[str] = None
+    instruction_en: Optional[str] = None
+    street: Optional[str] = None
+    toward_street: Optional[str] = None
+    intersection_with: Optional[str] = None
+    turn: Optional[str] = None  # e.g. left, right, straight, uturn
+    distance_m: Optional[float] = None
 
 
 class RouteSearchRequest(BaseModel):
@@ -88,6 +100,14 @@ class DetourRequest(BaseModel):
     # Omit both for full extended service day (same as historical /detour behavior).
     start_time: Optional[str] = None
     end_time: Optional[str] = None
+    # Manual street detour (after auto failure or to replace); LineString/MultiLineString geometry.
+    detour_road_geojson: Optional[Dict[str, Any]] = None
+    turn_by_turn: Optional[List[DetourTurnStep]] = None
+    # Single narrative; split server-side into steps if turn_by_turn omitted.
+    instructions_text_he: Optional[str] = None
+    remember_override: bool = False
+    # GTFS graph routing: A* (default) or DFS with optional fallback to A*.
+    routing_engine: Literal["astar", "dfs", "dijkstra"] = "astar"
 
 
 class DetourResponse(BaseModel):
@@ -104,6 +124,13 @@ class DetourResponse(BaseModel):
     used_shape: bool
     used_osm_snapping: bool
     feed_version: str
+    turn_by_turn: Optional[List[DetourTurnStep]] = None
+    from_override: bool = False
+    instructions_only: bool = False
+    reason_code: Optional[str] = None
+    strategy_used: Optional[str] = None
+    confidence: Optional[float] = None
+    diagnostics: Optional[Dict[str, Any]] = None
 
 
 class AreaRoutesQuery(BaseModel):
@@ -148,8 +175,18 @@ class DetourByAreaRequest(BaseModel):
     end_time: str  # HH:MM or HH:MM:SS
     blockage_geojson: Dict[str, Any]
     max_routes: int = Field(default=20, ge=1)
-    transfer_radius_m: float = Field(default=200.0, ge=10.0, le=1000.0)
+    transfer_radius_m: float = Field(default=280.0, ge=10.0, le=1000.0)
     use_osm_detour: bool = False
+    # When True, run Valhalla hybrid before GTFS multi-route A* (legacy order).
+    prefer_osm_detour: bool = False
+    detour_road_geojson: Optional[Dict[str, Any]] = None
+    turn_by_turn: Optional[List[DetourTurnStep]] = None
+    remember_override: bool = False
+    # When applying a manual override for a specific route, pass entry/exit from last failed result.
+    stop_before: Optional[str] = None
+    stop_after: Optional[str] = None
+    instructions_text_he: Optional[str] = None
+    routing_engine: Literal["astar", "dfs", "dijkstra"] = "astar"
 
 
 class DetourByAreaRouteResult(BaseModel):
@@ -164,6 +201,13 @@ class DetourByAreaRouteResult(BaseModel):
     replaced_segment_geojson: Optional[Dict[str, Any]] = None
     used_transfers: bool = False
     error: Optional[str] = None
+    turn_by_turn: Optional[List[DetourTurnStep]] = None
+    from_override: bool = False
+    instructions_only: bool = False
+    reason_code: Optional[str] = None
+    strategy_used: Optional[str] = None
+    confidence: Optional[float] = None
+    diagnostics: Optional[Dict[str, Any]] = None
 
 
 class DetourByAreaResponse(BaseModel):

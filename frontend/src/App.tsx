@@ -12,6 +12,7 @@ import {
 } from "./ExplorerWindow";
 import type { AreaRouteResult, RouteInfo } from "./ExplorerWindow";
 import MapLibreMap, { type BasemapKind, type MapLibreMapHandle } from "./MapLibreMap";
+import { isGovmapBasemapConfigured } from "./govmapBasemapEnv";
 
 type StopInfo = {
   stop_id: string;
@@ -30,6 +31,16 @@ type GraphPreviewResponse = {
   feed_version: string;
 };
 
+type DetourTurnStep = {
+  instruction_he?: string | null;
+  instruction_en?: string | null;
+  street?: string | null;
+  toward_street?: string | null;
+  intersection_with?: string | null;
+  turn?: string | null;
+  distance_m?: number | null;
+};
+
 type DetourResponse = {
   blocked_edges_count: number;
   stop_path: string[];
@@ -40,6 +51,13 @@ type DetourResponse = {
   used_shape: boolean;
   used_osm_snapping: boolean;
   feed_version: string;
+  turn_by_turn?: DetourTurnStep[] | null;
+  from_override?: boolean;
+  instructions_only?: boolean;
+  reason_code?: string | null;
+  strategy_used?: string | null;
+  confidence?: number | null;
+  diagnostics?: Record<string, unknown> | null;
 };
 
 type DetourByAreaMode = "route" | "all";
@@ -56,11 +74,18 @@ type DetourByAreaRouteResult = {
   replaced_segment_geojson?: GeoJSON.FeatureCollection | null;
   used_transfers: boolean;
   error?: string | null;
+  turn_by_turn?: DetourTurnStep[] | null;
+  from_override?: boolean;
+  instructions_only?: boolean;
+  reason_code?: string | null;
+  strategy_used?: string | null;
+  confidence?: number | null;
+  diagnostics?: Record<string, unknown> | null;
 };
 
 type DetourByAreaResponse =
-  | { mode: "route"; result: DetourByAreaRouteResult | null }
-  | { mode: "all"; results: DetourByAreaRouteResult[] | null };
+  | { mode: "route"; result: DetourByAreaRouteResult | null; feed_version?: string | null }
+  | { mode: "all"; results: DetourByAreaRouteResult[] | null; feed_version?: string | null };
 
 type StopRoutesResponse = {
   stop_id: string;
@@ -162,6 +187,20 @@ const App: React.FC = () => {
   const [feedCalMin, setFeedCalMin] = useState<number | null>(null);
   const [feedCalMax, setFeedCalMax] = useState<number | null>(null);
   const [useOSMDetour, setUseOSMDetour] = useState(false);
+  const [detourRoutingEngine, setDetourRoutingEngine] = useState<"astar" | "dijkstra">("astar");
+  const [manualDetourOpen, setManualDetourOpen] = useState(false);
+  const [instructionsTextHe, setInstructionsTextHe] = useState("");
+  const [manualGeoAdvancedOpen, setManualGeoAdvancedOpen] = useState(false);
+  /** Lon/lat LineString from map draw or pasted GeoJSON; sent as detour_road_geojson when applying. */
+  const [manualDetourDraftLine, setManualDetourDraftLine] = useState<GeoJSON.LineString | null>(null);
+  const [manualRoadGeoJsonText, setManualRoadGeoJsonText] = useState("");
+  const [manualTurnRows, setManualTurnRows] = useState<{ instruction_he: string; instruction_en: string }[]>([
+    { instruction_he: "", instruction_en: "" },
+  ]);
+  const [rememberStreetOverride, setRememberStreetOverride] = useState(false);
+  const [manualStopBefore, setManualStopBefore] = useState("");
+  const [manualStopAfter, setManualStopAfter] = useState("");
+  const [showDiagnostics, setShowDiagnostics] = useState(false);
 
   const [explorerOpen, setExplorerOpen] = useState(true);
   const [explorerTab, setExplorerTab] = useState<ExplorerTab>("area");
@@ -189,8 +228,24 @@ const App: React.FC = () => {
   const [pinPosition, setPinPosition] = useState<[number, number] | null>(null);
   const [basemap, setBasemap] = useState<BasemapKind>("osm");
   const [drawMode, setDrawMode] = useState<string>("simple_select");
+  const govmapBasemapAvailable = isGovmapBasemapConfigured();
+
+  useEffect(() => {
+    if (basemap === "govmap" && !govmapBasemapAvailable) {
+      setBasemap("osm");
+    }
+  }, [basemap, govmapBasemapAvailable]);
 
   const mapRef = useRef<MapLibreMapHandle | null>(null);
+
+  const handleManualDetourLineFromMap = (geom: GeoJSON.LineString | null) => {
+    setManualDetourDraftLine(geom);
+    if (geom) {
+      setManualRoadGeoJsonText(JSON.stringify(geom, null, 2));
+    } else {
+      setManualRoadGeoJsonText("");
+    }
+  };
   const latestRouteLoadIdRef = useRef(0);
   const stopLinesAbortRef = useRef<AbortController | null>(null);
   const stopLinesRequestIdRef = useRef(0);
@@ -581,6 +636,34 @@ const App: React.FC = () => {
     loadRouteOnMap(r.route_id, r.direction_id ?? null);
   };
 
+  const mapAreaResultToDetour = (r: DetourByAreaRouteResult, feedVersion: string): DetourResponse => {
+    const raw = r.detour_geojson as GeoJSON.FeatureCollection | GeoJSON.Feature | null | undefined;
+    const asFeatureCollection: GeoJSON.FeatureCollection =
+      raw && (raw as GeoJSON.FeatureCollection).type === "FeatureCollection"
+        ? (raw as GeoJSON.FeatureCollection)
+        : raw && (raw as GeoJSON.Feature).type === "Feature"
+          ? { type: "FeatureCollection", features: [raw as GeoJSON.Feature] }
+          : { type: "FeatureCollection", features: [] };
+    return {
+    blocked_edges_count: r.blocked_edges_count,
+    stop_path: r.detour_stop_path,
+    path_geojson: asFeatureCollection,
+    blocked_edges_geojson: { type: "FeatureCollection", features: [] } as GeoJSON.FeatureCollection,
+    total_travel_time_s: null,
+    total_distance_m: null,
+    used_shape: false,
+    used_osm_snapping: false,
+    feed_version: feedVersion,
+    turn_by_turn: r.turn_by_turn ?? null,
+    from_override: r.from_override ?? false,
+    instructions_only: r.instructions_only ?? false,
+    reason_code: r.reason_code ?? null,
+    strategy_used: r.strategy_used ?? null,
+    confidence: r.confidence ?? null,
+    diagnostics: r.diagnostics ?? null,
+    };
+  };
+
   const handleComputeDetour = async () => {
     if (!isTimeWindowValid) {
       setMessage(timeWindowError);
@@ -599,7 +682,7 @@ const App: React.FC = () => {
     setDetour(null);
     setDetourAreaResults(null);
     try {
-      const body: any = {
+      const body: Record<string, unknown> = {
         mode: detourMode,
         start_date: areaStartDate.trim(),
         start_time: areaStartTime.trim() || "04:00",
@@ -609,6 +692,7 @@ const App: React.FC = () => {
         max_routes: 20,
         transfer_radius_m: 250,
         use_osm_detour: useOSMDetour,
+        routing_engine: detourRoutingEngine,
       };
       if (detourMode === "route" && selectedRoute) {
         body.route_id = selectedRoute.route_id;
@@ -618,53 +702,190 @@ const App: React.FC = () => {
         timeout: 120000,
         headers: { "Content-Type": "application/json" },
       });
-      const feedVersion = (res.data as any).feed_version ?? "";
+      const feedVersion = res.data.feed_version ?? "";
       if (res.data.mode === "route") {
-        const r = (res.data as any).result as DetourByAreaRouteResult | null;
+        const r = res.data.result;
         setDetourAreaResults(r ? [r] : []);
         if (!r) setMessage("No result for this route.");
-        else if (r.error) setMessage(r.error);
-        else if (r.blocked_edges_count === 0) setMessage("Route not affected by blockage.");
-        else if (r.detour_geojson) {
-          setDetour({
-            blocked_edges_count: r.blocked_edges_count,
-            stop_path: r.detour_stop_path,
-            path_geojson: r.detour_geojson as any,
-            blocked_edges_geojson: { type: "FeatureCollection", features: [] } as any,
-            total_travel_time_s: null,
-            total_distance_m: null,
-            used_shape: false,
-            used_osm_snapping: false,
-            feed_version: feedVersion,
-          });
+        else if (r.error) {
+          setMessage(r.error);
+          if (r.stop_before) setManualStopBefore(r.stop_before);
+          if (r.stop_after) setManualStopAfter(r.stop_after);
+        }         else if (r.blocked_edges_count === 0) setMessage("Route not affected by blockage.");
+        else if (
+          r.detour_geojson ||
+          (r.instructions_only && r.turn_by_turn && r.turn_by_turn.length > 0)
+        ) {
+          setDetour(mapAreaResultToDetour(r, feedVersion));
+          if (r.stop_before) setManualStopBefore(r.stop_before);
+          if (r.stop_after) setManualStopAfter(r.stop_after);
+          if (r.instructions_only && r.turn_by_turn && r.turn_by_turn.length > 0) {
+            setMessage("Computed instructions-only fallback. No mapped detour geometry was returned.");
+          } else if (r.strategy_used === "gtfs_multiroute" && r.reason_code === "gtfs_only_fallback") {
+            setMessage("Detour uses GTFS fallback geometry. It may not reflect drivable roads exactly.");
+          } else if (r.strategy_used === "gtfs_road_hybrid") {
+            setMessage("Detour selected with GTFS + road validation.");
+          }
+        } else {
+          const reason = r.reason_code ? ` (${r.reason_code})` : "";
+          const strategy = r.strategy_used ? ` via ${r.strategy_used}` : "";
+          setMessage(`Detour could not produce mappable geometry${strategy}${reason}.`);
         }
       } else {
-        const all = (res.data as any).results as DetourByAreaRouteResult[] | null;
+        const all = res.data.results;
         setDetourAreaResults(all || []);
         if (!all || all.length === 0) setMessage("No affected routes for this blockage.");
         else {
-          const withDetour = all.find((r) => !r.error && r.detour_geojson && r.detour_stop_path.length > 0);
+          const withDetour = all.find(
+            (r) =>
+              !r.error &&
+              (Boolean(r.detour_geojson) || Boolean(r.instructions_only && (r.turn_by_turn?.length ?? 0) > 0)) &&
+              r.detour_stop_path.length > 0
+          );
           if (withDetour?.detour_geojson) {
-            setDetour({
-              blocked_edges_count: withDetour.blocked_edges_count,
-              stop_path: withDetour.detour_stop_path,
-              path_geojson: withDetour.detour_geojson as any,
-              blocked_edges_geojson: { type: "FeatureCollection", features: [] } as any,
-              total_travel_time_s: null,
-              total_distance_m: null,
-              used_shape: false,
-              used_osm_snapping: false,
-              feed_version: feedVersion,
-            });
+            setDetour(mapAreaResultToDetour(withDetour, feedVersion));
+            if (withDetour.strategy_used === "gtfs_multiroute" && withDetour.reason_code === "gtfs_only_fallback") {
+              setMessage("Showing GTFS fallback detour geometry for one affected route.");
+            } else if (withDetour.strategy_used === "gtfs_road_hybrid") {
+              setMessage("Showing a GTFS + road validated detour.");
+            }
+          } else if (withDetour?.instructions_only) {
+            setDetour(mapAreaResultToDetour(withDetour, feedVersion));
+            setMessage("Using instructions-only fallback for one affected route.");
+          } else {
+            setMessage("Affected routes were found, but none returned drawable detour geometry.");
           }
         }
       }
-    } catch (err: any) {
+    } catch (err: unknown) {
       console.error(err);
       setMessage(axios.isAxiosError(err) ? (err.response?.data?.detail ?? err.message) : "Detour failed.");
     } finally {
       setDetourLoading(false);
     }
+  };
+
+  const handleApplyManualStreetDetour = async () => {
+    if (!isTimeWindowValid) {
+      setMessage(timeWindowError);
+      return;
+    }
+    if (!blockageGeojson) {
+      setMessage("Draw a blockage first.");
+      return;
+    }
+    if (!selectedRoute) {
+      setMessage("Select one route (switch to “One route”) and try again.");
+      return;
+    }
+    let road: GeoJSON.Geometry | undefined;
+    if (manualDetourDraftLine?.coordinates && manualDetourDraftLine.coordinates.length >= 2) {
+      road = manualDetourDraftLine;
+    } else {
+      const geoTrim = manualRoadGeoJsonText.trim();
+      if (geoTrim) {
+        try {
+          const parsed = JSON.parse(geoTrim) as unknown;
+          if (parsed && typeof parsed === "object" && (parsed as GeoJSON.Geometry).type) {
+            road = parsed as GeoJSON.Geometry;
+          } else {
+            setMessage("Advanced: road field must be a GeoJSON geometry object (e.g. LineString).");
+            return;
+          }
+        } catch {
+          setMessage("Advanced: invalid JSON for road geometry.");
+          return;
+        }
+      }
+    }
+    const turn_by_turn = manualTurnRows
+      .map((row) => {
+        const o: DetourTurnStep = {};
+        if (row.instruction_he.trim()) o.instruction_he = row.instruction_he.trim();
+        if (row.instruction_en.trim()) o.instruction_en = row.instruction_en.trim();
+        return Object.keys(o).length ? o : null;
+      })
+      .filter((x): x is DetourTurnStep => x != null);
+    const narrative = instructionsTextHe.trim();
+    if (!narrative && !road && turn_by_turn.length === 0) {
+      setMessage("Enter Hebrew turn-by-turn (main box), or optional rows / Advanced road geometry.");
+      return;
+    }
+    setDetourLoading(true);
+    setMessage(null);
+    try {
+      const body: Record<string, unknown> = {
+        mode: "route",
+        start_date: areaStartDate.trim(),
+        start_time: areaStartTime.trim() || "04:00",
+        end_date: areaEndDate.trim(),
+        end_time: areaEndTime.trim() || "23:59",
+        blockage_geojson: blockageGeojson,
+        max_routes: 20,
+        transfer_radius_m: 250,
+        use_osm_detour: useOSMDetour,
+        routing_engine: detourRoutingEngine,
+        route_id: selectedRoute.route_id,
+        direction_id: selectedDirectionId ?? undefined,
+        remember_override: rememberStreetOverride,
+      };
+      if (road) body.detour_road_geojson = road;
+      if (narrative) body.instructions_text_he = narrative;
+      if (turn_by_turn.length) body.turn_by_turn = turn_by_turn;
+      if (manualStopBefore.trim()) body.stop_before = manualStopBefore.trim();
+      if (manualStopAfter.trim()) body.stop_after = manualStopAfter.trim();
+      const res = await axios.post<DetourByAreaResponse>(`${API_BASE}/detours/by-area`, body, {
+        timeout: 120000,
+        headers: { "Content-Type": "application/json" },
+      });
+      const feedVersion = res.data.feed_version ?? "";
+      if (res.data.mode !== "route") {
+        setMessage("Unexpected response mode from server.");
+        return;
+      }
+      const r = res.data.result;
+      setDetourAreaResults(r ? [r] : []);
+      const hasPathFeatures = (r?.detour_geojson?.features?.length ?? 0) > 0;
+      const hasInstructionsOnly =
+        Boolean(r?.instructions_only) && Boolean(r.turn_by_turn && r.turn_by_turn.length > 0);
+      if (!r) {
+        setMessage("No result.");
+      } else if (r.error) {
+        setMessage(r.error);
+      } else if (hasInstructionsOnly) {
+        setDetour(mapAreaResultToDetour(r, feedVersion));
+        setMessage(null);
+      } else if (hasPathFeatures) {
+        setDetour(mapAreaResultToDetour(r, feedVersion));
+        setMessage(null);
+        requestAnimationFrame(() => mapRef.current?.fitToDetour());
+      } else if (r.detour_geojson && !hasPathFeatures) {
+        setMessage("Server returned an empty detour path. Check stop overrides, direction, or try again.");
+      } else {
+        setMessage("Unexpected response: no detour path and no instructions. Check the server or try again.");
+      }
+    } catch (err: unknown) {
+      console.error(err);
+      setMessage(axios.isAxiosError(err) ? (err.response?.data?.detail ?? err.message) : "Manual detour request failed.");
+    } finally {
+      setDetourLoading(false);
+    }
+  };
+
+  const handlePrepareManualDetour = (areaRoute: AreaRouteResult, dr: DetourByAreaRouteResult | null) => {
+    const info: RouteInfo = {
+      route_id: areaRoute.route_id,
+      route_short_name: areaRoute.route_short_name ?? undefined,
+      route_long_name: areaRoute.route_long_name ?? undefined,
+      agency_name: areaRoute.agency_name ?? undefined,
+    };
+    setSelectedRoute(info);
+    setSelectedDirectionId(areaRoute.direction_id != null ? String(areaRoute.direction_id) : null);
+    setDetourMode("route");
+    setManualDetourOpen(true);
+    if (dr?.stop_before) setManualStopBefore(dr.stop_before);
+    if (dr?.stop_after) setManualStopAfter(dr.stop_after);
+    loadRouteOnMap(areaRoute.route_id, areaRoute.direction_id ?? null);
   };
 
   const resultByRouteId = useMemo(() => {
@@ -674,6 +895,54 @@ const App: React.FC = () => {
     });
     return m;
   }, [detourAreaResults]);
+
+  const diagnosticsPanel = useMemo(() => {
+    if (!detour) return null;
+    const diagnostics = detour.diagnostics ?? {};
+    const knownKeys = new Set([
+      "distance_ratio",
+      "time_ratio",
+      "road_distance_m",
+      "road_time_s",
+      "gtfs_cost",
+      "candidate_count",
+    ]);
+    const extras = Object.entries(diagnostics).filter(([k]) => !knownKeys.has(k));
+    const metric = (key: string): number | null => {
+      const raw = (diagnostics as Record<string, unknown>)[key];
+      return typeof raw === "number" && Number.isFinite(raw) ? raw : null;
+    };
+    const formatMetric = (value: number | null, suffix = "", digits = 2): string =>
+      value == null ? "—" : `${value.toFixed(digits)}${suffix}`;
+    const formatUnknown = (value: unknown): string => {
+      if (value == null) return "—";
+      if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+        return String(value);
+      }
+      try {
+        return JSON.stringify(value);
+      } catch {
+        return "[unserializable]";
+      }
+    };
+    const confidencePct =
+      typeof detour.confidence === "number" && Number.isFinite(detour.confidence)
+        ? `${Math.max(0, Math.min(100, detour.confidence * 100)).toFixed(0)}%`
+        : "—";
+    return {
+      strategyUsed: detour.strategy_used ?? "—",
+      reasonCode: detour.reason_code ?? "—",
+      confidencePct,
+      distanceRatio: metric("distance_ratio"),
+      timeRatio: metric("time_ratio"),
+      roadDistanceM: metric("road_distance_m"),
+      roadTimeS: metric("road_time_s"),
+      gtfsCost: metric("gtfs_cost"),
+      candidateCount: metric("candidate_count"),
+      extras: extras.map(([k, v]) => ({ key: k, value: formatUnknown(v) })),
+      formatMetric,
+    };
+  }, [detour]);
 
   return (
     <div className="app">
@@ -814,6 +1083,29 @@ const App: React.FC = () => {
             />{" "}
             Use road-network detour (Valhalla)
           </label>
+          <div className="radio-group" style={{ marginTop: 8 }}>
+            <span className="rail-label-small" style={{ display: "block", marginBottom: 4 }}>
+              GTFS graph routing
+            </span>
+            <label>
+              <input
+                type="radio"
+                name="detour-routing-engine"
+                checked={detourRoutingEngine === "astar"}
+                onChange={() => setDetourRoutingEngine("astar")}
+              />{" "}
+              A* (default)
+            </label>
+            <label>
+              <input
+                type="radio"
+                name="detour-routing-engine"
+                checked={detourRoutingEngine === "dijkstra"}
+                onChange={() => setDetourRoutingEngine("dijkstra")}
+              />{" "}
+              Dijkstra
+            </label>
+          </div>
           <button
             type="button"
             className="btn-compute"
@@ -822,6 +1114,163 @@ const App: React.FC = () => {
           >
             {detourLoading ? "Computing…" : "Compute detour"}
           </button>
+          <button
+            type="button"
+            className="btn-time-preset"
+            style={{ marginTop: 8, width: "100%" }}
+            onClick={() => setManualDetourOpen((o) => !o)}
+          >
+            {manualDetourOpen ? "Hide manual street detour" : "Manual street detour (after compute)"}
+          </button>
+          {manualDetourOpen && (
+            <div className="manual-detour-panel" style={{ marginTop: 10 }}>
+              <label className="rail-label-small">Turn-by-turn (Hebrew — separate steps with commas)</label>
+              <textarea
+                value={instructionsTextHe}
+                onChange={(e) => setInstructionsTextHe(e.target.value)}
+                dir="rtl"
+                placeholder="תמשיך ישר בבלפור, שמאלה בישראל בן ציון, …"
+                rows={5}
+                style={{ width: "100%", fontSize: 14 }}
+              />
+              <p className="hint" style={{ marginTop: 4 }}>
+                Hebrew text is for passenger instructions only — it does not draw a line. Under Advanced, use
+                &quot;Draw detour path on map&quot; (or paste GeoJSON) to show the detour on the map and enable
+                Remember with blockage checks.
+              </p>
+              <label className="rail-label-small">Entry / exit stop IDs (optional, must match failed compute)</label>
+              <input
+                type="text"
+                placeholder="stop_before"
+                value={manualStopBefore}
+                onChange={(e) => setManualStopBefore(e.target.value)}
+                style={{ width: "100%", marginBottom: 4 }}
+              />
+              <input
+                type="text"
+                placeholder="stop_after"
+                value={manualStopAfter}
+                onChange={(e) => setManualStopAfter(e.target.value)}
+                style={{ width: "100%", marginBottom: 8 }}
+              />
+              <button
+                type="button"
+                className="btn-time-preset"
+                style={{ marginBottom: 8 }}
+                onClick={() => setManualGeoAdvancedOpen((o) => !o)}
+              >
+                {manualGeoAdvancedOpen ? "Hide advanced (GeoJSON / per-step)" : "Advanced: road GeoJSON or per-step rows"}
+              </button>
+              {manualGeoAdvancedOpen && (
+                <>
+                  <div className="rail-buttons" style={{ marginBottom: 8, flexWrap: "wrap" }}>
+                    <button
+                      type="button"
+                      onClick={() => mapRef.current?.startDrawDetourLine()}
+                      title="Click the map to add vertices; double-click or Enter to finish"
+                    >
+                      Draw detour path on map
+                    </button>
+                    <button type="button" onClick={() => mapRef.current?.clearManualDetourLine()}>
+                      Clear drawn path
+                    </button>
+                  </div>
+                  <label className="rail-label-small">Road geometry (GeoJSON LineString, lon/lat) — optional paste</label>
+                  <textarea
+                    value={manualRoadGeoJsonText}
+                    onChange={(e) => {
+                      const v = e.target.value;
+                      setManualRoadGeoJsonText(v);
+                      const t = v.trim();
+                      if (!t) {
+                        setManualDetourDraftLine(null);
+                        mapRef.current?.applyManualDetourLineToDraw(null);
+                        return;
+                      }
+                      try {
+                        const parsed = JSON.parse(t) as unknown;
+                        if (
+                          parsed &&
+                          typeof parsed === "object" &&
+                          (parsed as GeoJSON.LineString).type === "LineString"
+                        ) {
+                          const ls = parsed as GeoJSON.LineString;
+                          if (ls.coordinates && ls.coordinates.length >= 2) {
+                            setManualDetourDraftLine(ls);
+                            mapRef.current?.applyManualDetourLineToDraw(ls);
+                          }
+                        }
+                      } catch {
+                        /* invalid while typing */
+                      }
+                    }}
+                    placeholder='{"type":"LineString","coordinates":[[34.8,32.0],[34.81,32.01]]}'
+                    rows={4}
+                    style={{ width: "100%", fontFamily: "monospace", fontSize: 12 }}
+                  />
+                  <div style={{ marginTop: 8 }}>
+                    <span className="rail-label-small">Optional per-step rows (Hebrew / English)</span>
+                    {manualTurnRows.map((row, i) => (
+                      <div key={i} style={{ display: "flex", gap: 6, marginTop: 4, flexDirection: "column" }}>
+                        <input
+                          type="text"
+                          dir="rtl"
+                          placeholder="הוראה בעברית"
+                          value={row.instruction_he}
+                          onChange={(e) => {
+                            const next = [...manualTurnRows];
+                            next[i] = { ...next[i], instruction_he: e.target.value };
+                            setManualTurnRows(next);
+                          }}
+                        />
+                        <input
+                          type="text"
+                          placeholder="English instruction"
+                          value={row.instruction_en}
+                          onChange={(e) => {
+                            const next = [...manualTurnRows];
+                            next[i] = { ...next[i], instruction_en: e.target.value };
+                            setManualTurnRows(next);
+                          }}
+                        />
+                      </div>
+                    ))}
+                    <button
+                      type="button"
+                      className="btn-time-preset"
+                      style={{ marginTop: 6 }}
+                      onClick={() =>
+                        setManualTurnRows([...manualTurnRows, { instruction_he: "", instruction_en: "" }])
+                      }
+                    >
+                      + Step
+                    </button>
+                  </div>
+                </>
+              )}
+              <label style={{ display: "block", marginTop: 8 }}>
+                <input
+                  type="checkbox"
+                  checked={rememberStreetOverride}
+                  onChange={(e) => setRememberStreetOverride(e.target.checked)}
+                />{" "}
+                Remember for this blockage (server)
+              </label>
+              <button
+                type="button"
+                className="btn-compute"
+                style={{ marginTop: 10, width: "100%" }}
+                onClick={handleApplyManualStreetDetour}
+                disabled={detourLoading || !blockageGeojson || !isTimeWindowValid || !selectedRoute}
+              >
+                Apply manual detour
+              </button>
+              <p className="hint" style={{ marginTop: 6 }}>
+                Use “One route” mode. Text-only saves narrative for replay; drawn road (Advanced) is used for map fit and
+                blockage-safe Remember.
+              </p>
+            </div>
+          )}
         </section>
 
         <section className="rail-section">
@@ -847,10 +1296,21 @@ const App: React.FC = () => {
             className="rail-select"
             value={basemap}
             onChange={(e) => setBasemap(e.target.value as BasemapKind)}
-            title="Raster options use GPU tuning for clarity; vector uses OpenFreeMap (crisp labels)"
+            title="Raster options use GPU tuning for clarity; vector uses OpenFreeMap (crisp labels). GovMap needs VITE_GOVMAP_TILES or proxy env — see govmapBasemapEnv.ts."
           >
             <option value="osm">OSM standard (raster)</option>
             <option value="carto_light">Carto light (minimal raster)</option>
+            <option
+              value="govmap"
+              disabled={!govmapBasemapAvailable}
+              title={
+                govmapBasemapAvailable
+                  ? "Web Mercator raster tiles (GovMap)"
+                  : "Set VITE_GOVMAP_TILES (XYZ URLs) or VITE_GOVMAP_USE_PROXY=1 and GOVMAP_TILE_UPSTREAM_TEMPLATE on the API"
+              }
+            >
+              GovMap (raster){govmapBasemapAvailable ? "" : " — configure env"}
+            </option>
             <option value="vector_liberty">Vector Liberty (OpenFreeMap)</option>
           </select>
           <div className="rail-buttons">
@@ -878,6 +1338,70 @@ const App: React.FC = () => {
 
         {feedCalendarNotice && <div className="rail-status rail-status-feed">{feedCalendarNotice}</div>}
         {message && <div className="rail-status">{message}</div>}
+        {detour && diagnosticsPanel && (
+          <section className="rail-section diagnostics-panel">
+            <button
+              type="button"
+              className="btn-time-preset diagnostics-toggle"
+              onClick={() => setShowDiagnostics((v) => !v)}
+            >
+              {showDiagnostics ? "Hide diagnostics" : "Show diagnostics"}
+            </button>
+            {showDiagnostics && (
+              <div className="diagnostics-body">
+                <div className="diagnostics-summary">
+                  <span className="diag-chip">strategy: {diagnosticsPanel.strategyUsed}</span>
+                  <span className="diag-chip">reason: {diagnosticsPanel.reasonCode}</span>
+                  <span className="diag-chip">confidence: {diagnosticsPanel.confidencePct}</span>
+                </div>
+                <div className="diagnostics-grid">
+                  <div>distance_ratio</div>
+                  <div>{diagnosticsPanel.formatMetric(diagnosticsPanel.distanceRatio, "", 2)}</div>
+                  <div>time_ratio</div>
+                  <div>{diagnosticsPanel.formatMetric(diagnosticsPanel.timeRatio, "", 2)}</div>
+                  <div>road_distance_m</div>
+                  <div>{diagnosticsPanel.formatMetric(diagnosticsPanel.roadDistanceM, " m", 0)}</div>
+                  <div>road_time_s</div>
+                  <div>{diagnosticsPanel.formatMetric(diagnosticsPanel.roadTimeS, " s", 0)}</div>
+                  <div>gtfs_cost</div>
+                  <div>{diagnosticsPanel.formatMetric(diagnosticsPanel.gtfsCost, "", 1)}</div>
+                  <div>candidate_count</div>
+                  <div>{diagnosticsPanel.formatMetric(diagnosticsPanel.candidateCount, "", 0)}</div>
+                </div>
+                {diagnosticsPanel.extras.length > 0 && (
+                  <div className="diagnostics-extra">
+                    {diagnosticsPanel.extras.map((row) => (
+                      <div className="diagnostics-extra-row" key={row.key}>
+                        <span>{row.key}</span>
+                        <span>{row.value}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+          </section>
+        )}
+        {detour?.turn_by_turn && detour.turn_by_turn.length > 0 && (
+          <section className="rail-section">
+            <h2 className="rail-heading">Turn-by-turn</h2>
+            {detour.from_override && (
+              <p className="hint" style={{ marginBottom: 6 }}>
+                Saved street override
+              </p>
+            )}
+            <ol className="turn-by-turn-list" style={{ paddingInlineStart: 20, fontSize: 13 }}>
+              {detour.turn_by_turn.map((s, i) => (
+                <li key={i} style={{ marginBottom: 6 }}>
+                  {(s.instruction_he || "").trim() || (s.instruction_en || "").trim() || s.street || "—"}
+                  {(s.instruction_he || "").trim() && (s.instruction_en || "").trim() ? (
+                    <div style={{ opacity: 0.85, fontSize: 12 }}>{s.instruction_en}</div>
+                  ) : null}
+                </li>
+              ))}
+            </ol>
+          </section>
+        )}
       </aside>
 
       <div className="map-container">
@@ -889,6 +1413,8 @@ const App: React.FC = () => {
           detour={detour as { path_geojson?: GeoJSON.FeatureCollection | null } | null}
           blockageGeojson={blockageGeojson as GeoJSON.Geometry | null}
           onBlockageChange={setBlockageGeojson}
+          manualDraftDetourLine={manualDetourDraftLine}
+          onManualDetourLineChange={handleManualDetourLineFromMap}
           pinPosition={pinPosition}
           selectedStopId={selectedStop?.stop_id ?? null}
           basemap={basemap}
@@ -944,6 +1470,7 @@ const App: React.FC = () => {
             onSearchLinesInStop={handleSearchLinesInStop}
             onSelectStopLineRoute={handleSelectStopLineRoute}
             sortBy={sortBy}
+            onPrepareManualDetour={handlePrepareManualDetour}
           />
         )}
       </div>

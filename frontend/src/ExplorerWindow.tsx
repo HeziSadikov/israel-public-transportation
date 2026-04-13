@@ -38,6 +38,13 @@ export type DetourByAreaRouteResult = {
   detour_geojson?: unknown;
   detour_stop_path: string[];
   used_transfers: boolean;
+  stop_before?: string | null;
+  stop_after?: string | null;
+  turn_by_turn?: { instruction_he?: string | null; instruction_en?: string | null; street?: string | null }[];
+  from_override?: boolean;
+  instructions_only?: boolean;
+  reason_code?: string | null;
+  strategy_used?: string | null;
 };
 
 export type GeocodeResult = {
@@ -117,10 +124,12 @@ type ExplorerWindowProps = {
   onSearchLinesInStop: () => void;
   onSelectStopLineRoute: (r: StopLineResult) => void;
   sortBy: ExplorerSortBy;
+  onPrepareManualDetour?: (areaRoute: AreaRouteResult, detourResult: DetourByAreaRouteResult | null) => void;
 };
 
 function getRouteResultStatus(r: DetourByAreaRouteResult): "detour" | "no-detour" | "error" {
   if (r.error) return "error";
+  if (r.instructions_only && (r.turn_by_turn?.length ?? 0) > 0) return "detour";
   if (r.detour_geojson && Array.isArray(r.detour_stop_path) && r.detour_stop_path.length > 0) return "detour";
   return "no-detour";
 }
@@ -353,11 +362,33 @@ export const ExplorerWindow: React.FC<ExplorerWindowProps> = (props) => {
                           <td className="col-status">
                             {status ? (
                               <span className={`badge badge-${status}`}>
-                                {status === "detour" && (result?.used_transfers ? "Detour (transfers)" : "Detour")}
+                                {status === "detour" &&
+                                  (result?.strategy_used === "gtfs_road_hybrid"
+                                    ? "Detour (hybrid)"
+                                    : result?.strategy_used === "gtfs_multiroute" && result?.reason_code === "gtfs_only_fallback"
+                                      ? "Detour (GTFS fallback)"
+                                      : result?.instructions_only
+                                    ? "Detour (instructions)"
+                                    : result?.used_transfers
+                                      ? "Detour (transfers)"
+                                      : "Detour")}
                                 {status === "no-detour" && "No detour"}
                                 {status === "error" && (result?.error ?? "Error")}
                               </span>
                             ) : "—"}
+                            {status === "error" && props.onPrepareManualDetour ? (
+                              <button
+                                type="button"
+                                className="btn-time-preset"
+                                style={{ marginTop: 4, display: "block" }}
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  props.onPrepareManualDetour!(r, result ?? null);
+                                }}
+                              >
+                                Manual detour…
+                              </button>
+                            ) : null}
                           </td>
                         </tr>
                       );

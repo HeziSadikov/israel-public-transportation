@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import os
+import time
 import logging
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Dict, List, Tuple, Optional, Set
+from typing import TYPE_CHECKING, Any, Dict, List, Tuple, Optional, Set
 
 import networkx as nx
 from shapely.geometry import LineString, shape, mapping
+from shapely.ops import unary_union
 
 from .pattern_builder import PatternBuilder, RoutePattern
 from .graph_builder import (
@@ -17,7 +19,8 @@ from .graph_builder import (
 )
 from .area_search import find_routes_in_polygon
 from . import db_access
-from .config import DETOUR_ALLOW_FEED_FALLBACK, DETOUR_TOP_K_PATTERNS
+from .config import DETOUR_ALLOW_FEED_FALLBACK, DETOUR_TOP_K_PATTERNS, DETOUR_MAX_CANDIDATE_ROUTES
+from .detour_junctions import JunctionBuildConfig, apply_corridor_junctions, apply_geocode_snap_junctions
 
 if TYPE_CHECKING:
     from .gtfs_loader import GTFSFeed
@@ -39,9 +42,13 @@ def _env_float(key: str, default: str) -> float:
     return float(os.getenv(key, default))
 
 
+def _env_bool(key: str, default: str = "1") -> bool:
+    return os.getenv(key, default).strip().lower() not in ("0", "false", "no", "")
+
+
 # Legacy aliases (same env keys as DetourGraphParams).
-AOI_BUFFER_DEG = _env_float("DETOUR_AOI_BUFFER_DEG", "0.01")
-TRANSFER_HEADING_TOLERANCE_DEG = _env_float("DETOUR_TRANSFER_HEADING_TOLERANCE_DEG", "90")
+AOI_BUFFER_DEG = _env_float("DETOUR_AOI_BUFFER_DEG", "0.032")
+TRANSFER_HEADING_TOLERANCE_DEG = _env_float("DETOUR_TRANSFER_HEADING_TOLERANCE_DEG", "100")
 
 
 @dataclass(frozen=True)
@@ -49,19 +56,31 @@ class DetourGraphParams:
     """Explicit search-space tuning for detour graph construction (AOI, transfers)."""
 
     aoi_buffer_deg: float
+    """Buffer around blockage polygon (degrees) for route candidate search."""
+    segment_corridor_buffer_deg: float
+    """Extra buffer around replaced primary segment geometry unioned into AOI (parallel corridors)."""
     transfer_heading_tolerance_deg: float
     transfer_radius_m: float
     transfer_walk_speed_m_s: float
     transfer_fixed_penalty_s: float
+    junction_crossing_enabled: bool
+    junction_near_miss_m: float
+    junction_dedupe_m: float
+    junction_geocode_snap_max_m: float
 
 
 def default_detour_graph_params() -> DetourGraphParams:
     return DetourGraphParams(
-        aoi_buffer_deg=_env_float("DETOUR_AOI_BUFFER_DEG", "0.01"),
-        transfer_heading_tolerance_deg=_env_float("DETOUR_TRANSFER_HEADING_TOLERANCE_DEG", "90"),
-        transfer_radius_m=_env_float("DETOUR_TRANSFER_RADIUS_M", "200"),
+        aoi_buffer_deg=_env_float("DETOUR_AOI_BUFFER_DEG", "0.032"),
+        segment_corridor_buffer_deg=_env_float("DETOUR_SEGMENT_CORRIDOR_BUFFER_DEG", "0.02"),
+        transfer_heading_tolerance_deg=_env_float("DETOUR_TRANSFER_HEADING_TOLERANCE_DEG", "100"),
+        transfer_radius_m=_env_float("DETOUR_TRANSFER_RADIUS_M", "320"),
         transfer_walk_speed_m_s=_env_float("DETOUR_TRANSFER_WALK_SPEED_M_S", "1.3"),
-        transfer_fixed_penalty_s=_env_float("DETOUR_TRANSFER_FIXED_PENALTY_S", "60"),
+        transfer_fixed_penalty_s=_env_float("DETOUR_TRANSFER_FIXED_PENALTY_S", "20"),
+        junction_crossing_enabled=_env_bool("DETOUR_JUNCTION_CROSSINGS_ENABLED", "1"),
+        junction_near_miss_m=_env_float("DETOUR_JUNCTION_NEAR_MISS_M", "35"),
+        junction_dedupe_m=_env_float("DETOUR_JUNCTION_DEDUPE_M", "18"),
+        junction_geocode_snap_max_m=_env_float("DETOUR_JUNCTION_GEOCODE_SNAP_M", "85"),
     )
 
 
@@ -224,6 +243,41 @@ def _add_transfer_edges(
                         )
 
 
+def _candidate_aoi_geojson(
+    blockage_geojson: Dict[str, Any],
+    replaced_segment_geojson: Optional[Dict[str, Any]],
+    p: DetourGraphParams,
+) -> Dict[str, Any]:
+    """
+    Union buffered blockage with buffered primary replaced segment so parallel corridors
+    (routes that do not intersect the raw polygon) still enter the candidate route set.
+    """
+    blockage_geom = shape(blockage_geojson)
+    try:
+        aoi_geom = blockage_geom.buffer(p.aoi_buffer_deg)
+    except Exception:
+        aoi_geom = blockage_geom
+    if replaced_segment_geojson and isinstance(replaced_segment_geojson, dict):
+        geoms: List = []
+        for feat in replaced_segment_geojson.get("features") or []:
+            if not isinstance(feat, dict):
+                continue
+            g = feat.get("geometry")
+            if not isinstance(g, dict) or not g.get("type"):
+                continue
+            try:
+                geoms.append(shape(g))
+            except Exception:
+                continue
+        if geoms:
+            try:
+                seg_union = unary_union(geoms)
+                aoi_geom = aoi_geom.union(seg_union.buffer(p.segment_corridor_buffer_deg))
+            except Exception:
+                pass
+    return mapping(aoi_geom)
+
+
 def _merge_from_postgis_bulk(
     g: nx.DiGraph,
     edge_geoms: Dict[Tuple[str, str], EdgeGeometry],
@@ -308,6 +362,8 @@ def build_detour_graph(
     start_sec: Optional[int] = None,
     end_sec: Optional[int] = None,
     params: Optional[DetourGraphParams] = None,
+    replaced_segment_geojson: Optional[Dict[str, Any]] = None,
+    junction_geocode_waypoints_lonlat: Optional[List[Tuple[float, float]]] = None,
 ) -> DetourGraph:
     """
     Build a direction-aware detour graph.
@@ -324,13 +380,9 @@ def build_detour_graph(
       when PostGIS pattern lookup fails but an in-memory feed is available.
     """
     p = params or default_detour_graph_params()
+    _t0 = time.monotonic()
 
-    blockage_geom = shape(blockage_geojson)
-    try:
-        aoi_geom = blockage_geom.buffer(p.aoi_buffer_deg)
-    except Exception:
-        aoi_geom = blockage_geom
-    aoi_geojson = mapping(aoi_geom)
+    aoi_geojson = _candidate_aoi_geojson(blockage_geojson, replaced_segment_geojson, p)
 
     day_start = start_sec if start_sec is not None else 0
     day_end = end_sec if end_sec is not None else 27 * 3600
@@ -344,6 +396,34 @@ def build_detour_graph(
     )
     route_ids: Set[str] = {r["route_id"] for r in routes_raw}
     route_ids.add(primary_route_id)
+
+    _t_routes = time.monotonic()
+    logger.info(
+        "detour_graph step=find_routes elapsed_ms=%d candidate_routes=%d primary_route_id=%s",
+        int((_t_routes - _t0) * 1000),
+        len(route_ids),
+        primary_route_id,
+    )
+
+    if len(route_ids) > DETOUR_MAX_CANDIDATE_ROUTES:
+        # Rank non-primary routes by total trip count (sum across directions) and keep the
+        # busiest ones so the graph stays tractable. The primary route is always retained.
+        trip_counts: Dict[str, int] = {}
+        for r in routes_raw:
+            rid = r["route_id"]
+            trip_counts[rid] = trip_counts.get(rid, 0) + (r.get("trip_count") or 0)
+        ranked = sorted(
+            (rid for rid in route_ids if rid != primary_route_id),
+            key=lambda rid: trip_counts.get(rid, 0),
+            reverse=True,
+        )
+        route_ids = {primary_route_id} | set(ranked[: DETOUR_MAX_CANDIDATE_ROUTES - 1])
+        logger.info(
+            "detour_graph step=cap_routes kept=%d cap=%d primary_route_id=%s",
+            len(route_ids),
+            DETOUR_MAX_CANDIDATE_ROUTES,
+            primary_route_id,
+        )
 
     g = nx.DiGraph()
     edge_geoms: Dict[Tuple[str, str], EdgeGeometry] = {}
@@ -377,6 +457,13 @@ def build_detour_graph(
         use_postgis = primary_meta is not None
     except (RuntimeError, Exception) as exc:
         postgis_error = exc
+
+    _t_patterns = time.monotonic()
+    logger.info(
+        "detour_graph step=get_patterns elapsed_ms=%d",
+        int((_t_patterns - _t_routes) * 1000),
+    )
+
     if feed is None and primary_meta is not None:
         use_postgis = True
 
@@ -391,6 +478,14 @@ def build_detour_graph(
                 seen_patterns.add(meta.pattern_id)
                 metas.append(meta)
         _merge_from_postgis_precomputed(g, edge_geoms, metas)
+        _t_merge = time.monotonic()
+        logger.info(
+            "detour_graph step=merge_postgis elapsed_ms=%d patterns=%d nodes=%d edges=%d",
+            int((_t_merge - _t_patterns) * 1000),
+            len(metas),
+            g.number_of_nodes(),
+            g.number_of_edges(),
+        )
     else:
         if postgis_error is not None and not (DETOUR_ALLOW_FEED_FALLBACK and feed is not None):
             raise DetourGraphBuildError(
@@ -440,12 +535,49 @@ def build_detour_graph(
             res = graph_builder.build_graph_for_pattern(pat)
             _merge_graphs(g, edge_geoms, res.graph, res.edge_geometries)
 
+        _t_merge = time.monotonic()
+        logger.info(
+            "detour_graph step=merge_feed_fallback elapsed_ms=%d nodes=%d edges=%d",
+            int((_t_merge - _t_patterns) * 1000),
+            g.number_of_nodes(),
+            g.number_of_edges(),
+        )
+
+    jcfg = JunctionBuildConfig(
+        crossing_enabled=p.junction_crossing_enabled,
+        near_miss_m=p.junction_near_miss_m,
+        dedupe_cluster_m=p.junction_dedupe_m,
+        geocode_snap_max_m=p.junction_geocode_snap_max_m,
+    )
+    apply_corridor_junctions(g, edge_geoms, aoi_geojson, jcfg)
+    if junction_geocode_waypoints_lonlat:
+        apply_geocode_snap_junctions(
+            g,
+            edge_geoms,
+            junction_geocode_waypoints_lonlat,
+            p.junction_geocode_snap_max_m,
+        )
+
+    _t_junctions = time.monotonic()
+    logger.info(
+        "detour_graph step=junctions elapsed_ms=%d",
+        int((_t_junctions - _t_merge) * 1000),
+    )
+
     _add_transfer_edges(
         g,
         max_transfer_m=p.transfer_radius_m,
         walk_speed_m_s=p.transfer_walk_speed_m_s,
         fixed_penalty_s=p.transfer_fixed_penalty_s,
         heading_tolerance_deg=p.transfer_heading_tolerance_deg,
+    )
+
+    _t_transfers = time.monotonic()
+    logger.info(
+        "detour_graph step=transfer_edges elapsed_ms=%d nodes=%d edges=%d",
+        int((_t_transfers - _t_junctions) * 1000),
+        g.number_of_nodes(),
+        g.number_of_edges(),
     )
 
     for u, v in g.edges():
@@ -463,6 +595,10 @@ def build_detour_graph(
         edge_geoms[(u, v)] = EdgeGeometry(from_stop_id=sid_u, to_stop_id=sid_v, linestring=line)
 
     idx = _build_nodes_by_stop_id(g, primary_pattern_id)
+    logger.info(
+        "detour_graph step=total elapsed_ms=%d",
+        int((time.monotonic() - _t0) * 1000),
+    )
     return DetourGraph(
         graph=g,
         edge_geometries=edge_geoms,

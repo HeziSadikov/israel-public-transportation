@@ -83,6 +83,75 @@ html, body, #root {
   margin-bottom: 6px;
 }
 
+.diagnostics-panel {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid rgba(148, 163, 184, 0.25);
+}
+
+.diagnostics-toggle {
+  width: 100%;
+}
+
+.diagnostics-body {
+  margin-top: 8px;
+  padding: 8px;
+  border: 1px solid rgba(148, 163, 184, 0.25);
+  border-radius: 8px;
+  background: rgba(15, 23, 42, 0.65);
+}
+
+.diagnostics-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.diag-chip {
+  display: inline-block;
+  padding: 2px 6px;
+  font-size: 0.7rem;
+  color: #cbd5e1;
+  border: 1px solid rgba(100, 116, 139, 0.5);
+  border-radius: 999px;
+  background: rgba(30, 41, 59, 0.8);
+}
+
+.diagnostics-grid {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  column-gap: 10px;
+  row-gap: 4px;
+  font-size: 0.72rem;
+  color: #94a3b8;
+}
+
+.diagnostics-grid > div:nth-child(even) {
+  color: #e2e8f0;
+  font-family: Consolas, "Courier New", monospace;
+}
+
+.diagnostics-extra {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px dashed rgba(100, 116, 139, 0.5);
+}
+
+.diagnostics-extra-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  column-gap: 10px;
+  font-size: 0.68rem;
+  color: #94a3b8;
+  margin-bottom: 3px;
+}
+
+.diagnostics-extra-row span:last-child {
+  color: #cbd5e1;
+  font-family: Consolas, "Courier New", monospace;
+}
+
 .row {
   display: flex;
   gap: 8px;

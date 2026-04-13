@@ -52,8 +52,13 @@ OSM_ENGINE_URL = os.getenv("OSM_ENGINE_URL", "http://localhost:5000")
 # If set, /detour will use Valhalla to route around the blocked area on the road network.
 # Example: http://localhost:8002 (Valhalla default port)
 VALHALLA_URL = os.getenv("VALHALLA_URL", "")
+HYBRID_DETOUR_ENABLED = parse_bool_env("HYBRID_DETOUR_ENABLED", True)
 DETOUR_ALLOW_FEED_FALLBACK = parse_bool_env("DETOUR_ALLOW_FEED_FALLBACK", False)
-DETOUR_TOP_K_PATTERNS = max(1, parse_int_env("DETOUR_TOP_K_PATTERNS", 2))
+# Higher k pulls more pattern variants per route into the detour graph (better urban coverage, more CPU).
+DETOUR_TOP_K_PATTERNS = max(1, parse_int_env("DETOUR_TOP_K_PATTERNS", 3))
+# Cap on the number of candidate routes included in the detour graph. Routes are ranked by trip count
+# and the busiest ones are kept. The primary route is always included regardless of rank.
+DETOUR_MAX_CANDIDATE_ROUTES = max(1, parse_int_env("DETOUR_MAX_CANDIDATE_ROUTES", 80))
 GRAPH_WARMUP_ENABLED = parse_bool_env("GRAPH_WARMUP_ENABLED", True)
 GRAPH_WARMUP_TIMEOUT_S = max(10, parse_int_env("GRAPH_WARMUP_TIMEOUT_S", 300))
 GRAPH_WARMUP_PROFILES = parse_csv_env(
@@ -85,4 +90,7 @@ SHAPES_BY_ID_CACHE: dict = {}
 # On-disk cache for per-route graphs (persistent between restarts)
 GRAPH_CACHE_DIR = BASE_DIR / "data" / "graph_cache"
 GRAPH_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+# GovMap tile proxy: upstream URL template with {z}, {x}, {y} (see /api/govmap-tiles in app.py).
+GOVMAP_TILE_UPSTREAM_TEMPLATE = os.getenv("GOVMAP_TILE_UPSTREAM_TEMPLATE", "").strip()
 

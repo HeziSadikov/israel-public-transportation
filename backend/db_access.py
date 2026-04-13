@@ -2038,6 +2038,289 @@ def save_route_preview_pg(
 
 
 
+def hash_geojson_canonical(geojson: Dict[str, Any]) -> str:
+    """Stable hash used for detour-by-area cache keys."""
+    raw = json.dumps(
+        geojson, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def build_street_override_key(
+    scope: str,
+    route_id: str,
+    direction_id: Optional[str],
+    blockage_hash: str,
+    entry_stop_id: str,
+    exit_stop_id: str,
+    route_sig_hash: str,
+) -> str:
+    """Deterministic key for detour_street_override (scope: point | by_area)."""
+    payload = {
+        "scope": scope,
+        "route_id": route_id,
+        "direction_id": str(direction_id) if direction_id is not None else "",
+        "blockage_hash": blockage_hash,
+        "entry_stop_id": entry_stop_id,
+        "exit_stop_id": exit_stop_id,
+        "route_sig_hash": route_sig_hash or "",
+    }
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode(
+        "utf-8"
+    )
+    return hashlib.sha256(raw).hexdigest()
+
+
+def get_detour_street_override_pg(
+    feed_id: int,
+    override_key: str,
+    conn=None,
+) -> Optional[Dict[str, Any]]:
+    """Load stored street override blob."""
+    close = False
+    if conn is None:
+        conn = _get_conn()
+        close = True
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT road_geojson, turn_by_turn_json
+                FROM detour_street_override
+                WHERE feed_id = %s AND override_key = %s
+                """,
+                (feed_id, override_key),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            return {
+                "road_geojson": json.loads(str(row["road_geojson"])),
+                "turn_by_turn": json.loads(str(row["turn_by_turn_json"])),
+            }
+    finally:
+        if close:
+            conn.close()
+
+
+def save_detour_street_override_pg(
+    feed_id: int,
+    override_key: str,
+    scope: str,
+    route_id: str,
+    direction_id: Optional[str],
+    blockage_hash: str,
+    entry_stop_id: str,
+    exit_stop_id: str,
+    route_sig_hash: str,
+    road_geojson: Dict[str, Any],
+    turn_by_turn: List[Any],
+    conn=None,
+    *,
+    commit: bool = True,
+) -> None:
+    close = False
+    if conn is None:
+        conn = _get_conn()
+        close = True
+    dir_sql: Optional[int] = None
+    if direction_id is not None and str(direction_id).strip() != "":
+        try:
+            dir_sql = int(str(direction_id).strip())
+        except ValueError:
+            dir_sql = None
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO detour_street_override (
+                  feed_id,
+                  override_key,
+                  scope,
+                  route_id,
+                  direction_id,
+                  blockage_hash,
+                  entry_stop_id,
+                  exit_stop_id,
+                  route_sig_hash,
+                  road_geojson,
+                  turn_by_turn_json
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (feed_id, override_key)
+                DO UPDATE SET
+                  road_geojson = EXCLUDED.road_geojson,
+                  turn_by_turn_json = EXCLUDED.turn_by_turn_json,
+                  created_at = NOW()
+                """,
+                (
+                    feed_id,
+                    override_key,
+                    scope,
+                    route_id,
+                    dir_sql,
+                    blockage_hash,
+                    entry_stop_id,
+                    exit_stop_id,
+                    route_sig_hash or "",
+                    json.dumps(road_geojson, separators=(",", ":"), ensure_ascii=False),
+                    json.dumps(turn_by_turn, separators=(",", ":"), ensure_ascii=False),
+                ),
+            )
+        if close or commit:
+            conn.commit()
+    finally:
+        if close:
+            conn.close()
+
+
+def get_cached_detour_by_area_pg(
+    feed_id: int,
+    mode: str,
+    route_id: str,
+    direction_id: Optional[str],
+    date_ymd: str,
+    start_sec: int,
+    end_sec: int,
+    transfer_radius_m: float,
+    use_osm_detour: bool,
+    policy_profile: str,
+    blockage_hash: str,
+    route_sig_hash: str,
+    conn=None,
+) -> Optional[Dict[str, Any]]:
+    """Load cached /detours/by-area route result when key and route signature match."""
+    close = False
+    if conn is None:
+        conn = _get_conn()
+        close = True
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT result_json
+                FROM detour_by_area_cache
+                WHERE feed_id = %s
+                  AND mode = %s
+                  AND route_id = %s
+                  AND COALESCE(direction_id, -1) = COALESCE(%s::int, -1)
+                  AND date_ymd = %s
+                  AND start_sec = %s
+                  AND end_sec = %s
+                  AND transfer_radius_m = %s
+                  AND use_osm_detour = %s
+                  AND policy_profile = %s
+                  AND blockage_hash = %s
+                  AND route_sig_hash = %s
+                """,
+                (
+                    feed_id,
+                    mode,
+                    route_id,
+                    int(direction_id) if direction_id is not None else None,
+                    int(date_ymd),
+                    int(start_sec),
+                    int(end_sec),
+                    float(transfer_radius_m),
+                    bool(use_osm_detour),
+                    policy_profile,
+                    blockage_hash,
+                    route_sig_hash,
+                ),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            return json.loads(str(row["result_json"]))
+    finally:
+        if close:
+            conn.close()
+
+
+def save_detour_by_area_pg(
+    feed_id: int,
+    mode: str,
+    route_id: str,
+    direction_id: Optional[str],
+    date_ymd: str,
+    start_sec: int,
+    end_sec: int,
+    transfer_radius_m: float,
+    use_osm_detour: bool,
+    policy_profile: str,
+    blockage_hash: str,
+    route_sig_hash: str,
+    result_json: Dict[str, Any],
+    conn=None,
+    *,
+    commit: bool = True,
+) -> None:
+    """Save/update cached /detours/by-area route result."""
+    close = False
+    if conn is None:
+        conn = _get_conn()
+        close = True
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO detour_by_area_cache (
+                  feed_id,
+                  mode,
+                  route_id,
+                  direction_id,
+                  date_ymd,
+                  start_sec,
+                  end_sec,
+                  transfer_radius_m,
+                  use_osm_detour,
+                  policy_profile,
+                  blockage_hash,
+                  route_sig_hash,
+                  result_json
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (
+                  feed_id,
+                  mode,
+                  route_id,
+                  direction_id,
+                  date_ymd,
+                  start_sec,
+                  end_sec,
+                  transfer_radius_m,
+                  use_osm_detour,
+                  policy_profile,
+                  blockage_hash
+                )
+                DO UPDATE SET
+                  route_sig_hash = EXCLUDED.route_sig_hash,
+                  result_json    = EXCLUDED.result_json,
+                  created_at     = NOW()
+                """,
+                (
+                    feed_id,
+                    mode,
+                    route_id,
+                    int(direction_id) if direction_id is not None else None,
+                    int(date_ymd),
+                    int(start_sec),
+                    int(end_sec),
+                    float(transfer_radius_m),
+                    bool(use_osm_detour),
+                    policy_profile,
+                    blockage_hash,
+                    route_sig_hash,
+                    json.dumps(result_json, separators=(",", ":"), ensure_ascii=False),
+                ),
+            )
+        if close or commit:
+            conn.commit()
+    finally:
+        if close:
+            conn.close()
+
+
 def get_blocked_edge_keys_pg(
     edge_geometries: Dict[Tuple[str, str], Any],
     blockage_geojson: Dict[str, Any],

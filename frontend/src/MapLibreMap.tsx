@@ -5,11 +5,20 @@ import React, { useEffect, useImperativeHandle, useRef, useState } from "react";
 import maplibregl from "maplibre-gl";
 import MapboxDraw from "@mapbox/mapbox-gl-draw";
 
+import {
+  govmapAttribution,
+  govmapRasterMaxZoom,
+  govmapRasterTiles,
+  isGovmapBasemapConfigured,
+} from "./govmapBasemapEnv";
+
 // GeoJSON types for internal use (coordinates as [lng, lat])
 type GeoJSONPosition = [number, number];
 type GeoJSONGeometry =
   | { type: "Polygon"; coordinates: GeoJSONPosition[][] }
   | { type: "LineString"; coordinates: GeoJSONPosition[] }
+  | { type: "MultiLineString"; coordinates: GeoJSONPosition[][] }
+  | { type: "MultiPolygon"; coordinates: GeoJSONPosition[][][] }
   | { type: "Point"; coordinates: GeoJSONPosition };
 type GeoJSONFeature = { type: "Feature"; geometry: GeoJSONGeometry; properties?: Record<string, unknown> };
 type GeoJSONFeatureCollection = { type: "FeatureCollection"; features: GeoJSONFeature[] };
@@ -26,14 +35,21 @@ const RASTER_BASEMAP_PAINT: maplibregl.RasterLayerSpecification["paint"] = {
   "raster-contrast": 0.06,
 };
 
-export type BasemapKind = "osm" | "carto_light" | "vector_liberty";
+export type BasemapKind = "osm" | "carto_light" | "vector_liberty" | "govmap";
 const BASEMAP_RASTER_SOURCE = "basemap-raster-source";
 const BASEMAP_RASTER_LAYER = "basemap-raster";
 
 /** OpenFreeMap Liberty — vector tiles, crisp at all zooms (separate CDN; check terms for production). */
 const OPENFREEMAP_LIBERTY_STYLE = "https://tiles.openfreemap.org/styles/liberty";
 
-function rasterStyle(tiles: string[], attribution: string): maplibregl.StyleSpecification {
+function effectiveBasemap(kind: BasemapKind): BasemapKind {
+  if (kind !== "govmap") return kind;
+  if (!isGovmapBasemapConfigured()) return "osm";
+  if (govmapRasterTiles().length === 0) return "osm";
+  return "govmap";
+}
+
+function rasterStyle(tiles: string[], attribution: string, maxzoom = 19): maplibregl.StyleSpecification {
   return {
     version: 8,
     sources: {
@@ -42,7 +58,7 @@ function rasterStyle(tiles: string[], attribution: string): maplibregl.StyleSpec
         tiles,
         tileSize: 256,
         attribution,
-        maxzoom: 19,
+        maxzoom,
       },
     },
     layers: [
@@ -71,11 +87,24 @@ const CARTO_LIGHT_STYLE = rasterStyle(
 function styleForBasemap(kind: BasemapKind): string | maplibregl.StyleSpecification {
   if (kind === "vector_liberty") return OPENFREEMAP_LIBERTY_STYLE;
   if (kind === "carto_light") return CARTO_LIGHT_STYLE;
+  if (kind === "govmap") {
+    return rasterStyle(govmapRasterTiles(), govmapAttribution(), govmapRasterMaxZoom());
+  }
   return OSM_STYLE;
 }
 
 function isRasterBasemap(kind: BasemapKind): boolean {
-  return kind === "osm" || kind === "carto_light";
+  return kind === "osm" || kind === "carto_light" || kind === "govmap";
+}
+
+function rasterMaxZoom(kind: BasemapKind): number {
+  if (kind === "govmap") return govmapRasterMaxZoom();
+  return 19;
+}
+
+function mapMaxZoomForBasemap(kind: BasemapKind): number {
+  if (kind === "vector_liberty") return 19;
+  return rasterMaxZoom(kind);
 }
 
 function rasterTilesForBasemap(kind: BasemapKind): string[] {
@@ -86,6 +115,7 @@ function rasterTilesForBasemap(kind: BasemapKind): string[] {
       "https://c.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png",
     ];
   }
+  if (kind === "govmap") return govmapRasterTiles();
   return ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"];
 }
 
@@ -99,6 +129,10 @@ function mapPixelRatioForBasemap(kind: BasemapKind): number {
   if (kind === "vector_liberty") return Math.min(dpr, 2);
   return dpr;
 }
+
+/** MapboxDraw styles filter on this; polygon-phase synthetic LineStrings omit it (see mapbox-gl-draw draw_polygon). */
+const PROP_MANUAL_DETOUR_DRAFT = "manual_detour_draft";
+const VAL_MANUAL_DETOUR_DRAFT = "yes";
 
 // Custom, minimal styles for MapboxDraw that are compatible with MapLibre.
 // We avoid any complex line-dasharray expressions that trigger style errors.
@@ -177,6 +211,22 @@ const DRAW_STYLES: any[] = [
       "circle-stroke-color": "#dc2626",
     },
   },
+  // Untagged LineStrings (polygon first-edge preview + in-progress draw_line_string): do NOT filter on `active`.
+  // MapboxDraw often omits `active` on HOT LineStrings while drawing, which made line layers match nothing (only vertices visible).
+  {
+    id: "gl-draw-line-untagged",
+    type: "line",
+    filter: [
+      "all",
+      ["==", "$type", "LineString"],
+      ["!=", ["get", PROP_MANUAL_DETOUR_DRAFT], VAL_MANUAL_DETOUR_DRAFT],
+    ],
+    layout: { "line-cap": "round", "line-join": "round" },
+    paint: {
+      "line-color": "#dc2626",
+      "line-width": 2,
+    },
+  },
 ];
 
 const SOURCE_ROUTE = "route";
@@ -186,8 +236,51 @@ const SOURCE_PIN = "pin";
 /** First-edge rubber line while drawing (one anchor + cursor); not part of MapboxDraw HOT/COLD. */
 const SOURCE_POLYGON_PREVIEW = "blockage-polygon-preview-line";
 const LAYER_POLYGON_PREVIEW = "blockage-polygon-preview-line-layer";
+/** Manual detour draft path — plain GeoJSON overlay (MapboxDraw stroke filters are unreliable for this line). */
+const SOURCE_MANUAL_DETOUR_DRAFT = "manual-detour-draft";
+const LAYER_MANUAL_DETOUR_DRAFT = "manual-detour-draft-line";
 
 const EMPTY_FC: GeoJSONFeatureCollection = { type: "FeatureCollection", features: [] };
+
+function normalizeToFeatureCollection(input: unknown): GeoJSONFeatureCollection {
+  if (!input || typeof input !== "object") return EMPTY_FC;
+  const maybe = input as { type?: string; features?: unknown; geometry?: unknown; properties?: unknown };
+  if (maybe.type === "FeatureCollection" && Array.isArray(maybe.features)) {
+    return maybe as GeoJSONFeatureCollection;
+  }
+  if (maybe.type === "Feature" && maybe.geometry && typeof maybe.geometry === "object") {
+    return {
+      type: "FeatureCollection",
+      features: [{ type: "Feature", geometry: maybe.geometry as GeoJSONGeometry, properties: maybe.properties as any }],
+    };
+  }
+  if (
+    maybe.type === "LineString" ||
+    maybe.type === "MultiLineString" ||
+    maybe.type === "Polygon" ||
+    maybe.type === "MultiPolygon" ||
+    maybe.type === "Point"
+  ) {
+    return {
+      type: "FeatureCollection",
+      features: [{ type: "Feature", geometry: maybe as GeoJSONGeometry, properties: {} }],
+    };
+  }
+  return EMPTY_FC;
+}
+
+function manualDetourDraftOverlayFc(line: GeoJSON.LineString | null): GeoJSONFeatureCollection {
+  if (!line?.coordinates || line.coordinates.length < 2) return EMPTY_FC;
+  return {
+    type: "FeatureCollection",
+    features: [{ type: "Feature", properties: {}, geometry: line }],
+  };
+}
+
+function syncManualDetourDraftOverlay(map: maplibregl.Map, line: GeoJSON.LineString | null) {
+  const src = map.getSource(SOURCE_MANUAL_DETOUR_DRAFT) as maplibregl.GeoJSONSource | undefined;
+  src?.setData(manualDetourDraftOverlayFc(line) as any);
+}
 
 /** MapboxDraw duplicates each style for cold/hot sources; layer ids are `${DRAW_STYLES.id}.hot`. */
 const DRAW_VERTEX_LAYER_HOT = "gl-draw-polygon-vertex.hot";
@@ -236,12 +329,41 @@ function firstPolygonFeatureIdFromDrawAll(all: GeoJSON.FeatureCollection): strin
   return String(id);
 }
 
+function deletePolygonFeaturesFromDraw(draw: MapboxDraw) {
+  const all = draw.getAll() as GeoJSON.FeatureCollection;
+  for (const f of all.features || []) {
+    const t = f.geometry?.type;
+    if (t === "Polygon" || t === "MultiPolygon") {
+      if (f.id != null) draw.delete(String(f.id));
+    }
+  }
+}
+
+function deleteLineStringFeaturesFromDraw(draw: MapboxDraw) {
+  const all = draw.getAll() as GeoJSON.FeatureCollection;
+  for (const f of all.features || []) {
+    if (f.geometry?.type === "LineString" && f.id != null) {
+      draw.delete(String(f.id));
+    }
+  }
+}
+
+function firstLineStringGeometryFromDrawAll(all: GeoJSON.FeatureCollection): GeoJSON.LineString | null {
+  const f = all.features?.find((x) => x.geometry?.type === "LineString");
+  const g = f?.geometry;
+  return g && g.type === "LineString" ? g : null;
+}
+
 export type MapLibreMapHandle = {
   clearBlockage: () => void;
   cancelDrawing: () => void;
   undoLastPoint: () => void;
   startPolygon: () => void;
   editBlockagePolygon: () => void;
+  /** Replace the drawn manual detour LineString (e.g. after pasting GeoJSON in the panel). */
+  applyManualDetourLineToDraw: (geom: GeoJSON.LineString | null) => void;
+  startDrawDetourLine: () => void;
+  clearManualDetourLine: () => void;
   fitToBlockage: () => void;
   fitToRoute: () => void;
   fitToDetour: () => void;
@@ -253,7 +375,7 @@ export type MapLibreMapProps = {
   center: [number, number];
   stops: { stop_id: string; name: string; stop_code?: string | null; lat: number; lon: number; sequence: number }[];
   routeGeojson: GeoJSON.FeatureCollection | null;
-  detour: { path_geojson?: GeoJSON.FeatureCollection | null } | null;
+  detour: { path_geojson?: unknown } | null;
   blockageGeojson: GeoJSON.Geometry | null;
   onBlockageChange: (geom: GeoJSON.Geometry | null) => void;
   pinPosition: [number, number] | null;
@@ -266,10 +388,14 @@ export type MapLibreMapProps = {
     lat: number;
     lon: number;
   }) => void;
-  /** Basemap: OSM raster, minimal Carto raster, or vector (OpenFreeMap Liberty). */
+  /** Basemap: OSM / Carto / GovMap raster (EPSG:3857 tiles), or vector (OpenFreeMap Liberty). */
   basemap?: BasemapKind;
   /** Fired when MapboxDraw mode changes (e.g. draw_polygon, direct_select, simple_select). */
   onDrawModeChange?: (mode: string) => void;
+  /** Draft detour path drawn on the map (LineString lon/lat), separate from computed detour overlay. */
+  manualDraftDetourLine?: GeoJSON.LineString | null;
+  /** Called when the user finishes or edits the manual detour line in MapboxDraw. */
+  onManualDetourLineChange?: (geom: GeoJSON.LineString | null) => void;
 };
 
 type StopRole = "first" | "last" | "middle" | "both";
@@ -316,6 +442,8 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
     onStopOpenInExplorer,
     basemap = "osm",
     onDrawModeChange,
+    manualDraftDetourLine = null,
+    onManualDetourLineChange,
   },
   ref
 ) {
@@ -338,8 +466,8 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
   const stopLayerMouseLeaveRef = useRef<(() => void) | null>(null);
   const drawDetachRef = useRef<(() => void) | null>(null);
   const styleRehydrateRef = useRef<(() => void) | null>(null);
-  const basemapRef = useRef<BasemapKind>(basemap);
-  const initialBasemapRef = useRef<BasemapKind>(basemap);
+  const basemapRef = useRef<BasemapKind>(effectiveBasemap(basemap));
+  const initialBasemapRef = useRef<BasemapKind>(effectiveBasemap(basemap));
   const [mapReady, setMapReady] = useState(false);
 
   blockageRef.current = blockageGeojson;
@@ -352,20 +480,29 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
   onStopClickRef.current = onStopClick;
   onStopOpenInExplorerRef.current = onStopOpenInExplorer;
   onDrawModeChangeRef.current = onDrawModeChange;
+  const onBlockageChangeRef = useRef(onBlockageChange);
+  onBlockageChangeRef.current = onBlockageChange;
+  const onManualDetourLineChangeRef = useRef<MapLibreMapProps["onManualDetourLineChange"]>(undefined);
+  onManualDetourLineChangeRef.current = onManualDetourLineChange;
+  const manualDraftDetourLinePropRef = useRef<GeoJSON.LineString | null>(null);
+  manualDraftDetourLinePropRef.current = manualDraftDetourLine;
 
   useEffect(() => {
     if (!containerRef.current) return;
     const [lat, lng] = center;
+    const eff0 = effectiveBasemap(basemap);
+    initialBasemapRef.current = eff0;
+    basemapRef.current = eff0;
     const map = new maplibregl.Map({
       container: containerRef.current,
-      style: styleForBasemap(initialBasemapRef.current),
+      style: styleForBasemap(eff0),
       center: [lng, lat],
       zoom: 9,
       minZoom: 5,
-      maxZoom: 19,
+      maxZoom: mapMaxZoomForBasemap(eff0),
       dragRotate: false,
       pitchWithRotate: false,
-      pixelRatio: mapPixelRatioForBasemap(initialBasemapRef.current),
+      pixelRatio: mapPixelRatioForBasemap(eff0),
     });
     // Make mouse-wheel zoom a bit faster/more responsive.
     map.scrollZoom.setWheelZoomRate(1 / 180);
@@ -555,11 +692,12 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
       }
 
       if (!drawRef.current) {
-        // Draw control: polygon only (explicitly activated by the toolbar button)
+        // Draw control: polygon (blockage) + line_string (manual detour path); activated from toolbar / Advanced.
         const draw = new MapboxDraw({
           displayControlsDefault: false,
           controls: {
             polygon: true,
+            line_string: true,
             trash: true,
           },
           styles: DRAW_STYLES,
@@ -567,6 +705,23 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
         // Place controls in the top-right to avoid overlap with the explorer window.
         map.addControl(draw as any, "top-right");
         drawRef.current = draw;
+
+        const publishDrawState = () => {
+          const d = drawRef.current;
+          if (!d) return;
+          const all = d.getAll() as GeoJSON.FeatureCollection;
+          const poly = all.features?.find(
+            (f) => f.geometry?.type === "Polygon" || f.geometry?.type === "MultiPolygon"
+          );
+          if (poly?.geometry) {
+            onBlockageChangeRef.current?.(normalizeBlockageGeometry(poly.geometry as GeoJSON.Geometry));
+          } else {
+            onBlockageChangeRef.current?.(null);
+          }
+          const line = firstLineStringGeometryFromDrawAll(all);
+          onManualDetourLineChangeRef.current?.(line);
+          syncManualDetourDraftOverlay(map, line);
+        };
 
         const drawApi = draw as MapboxDraw & { getMode?: () => string };
         const notifyDrawMode = () => {
@@ -581,7 +736,7 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
             return;
           }
           const all = draw.getAll();
-          const f = all?.features?.[0];
+          const f = all?.features?.find((x) => x.geometry?.type === "Polygon");
           if (!f || f.geometry?.type !== "Polygon") {
             src.setData(EMPTY_FC as any);
             return;
@@ -627,42 +782,33 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
           } as any);
         };
 
-        map.on("draw.render", syncPolygonPreviewLine);
+        const onDrawRender = () => {
+          syncPolygonPreviewLine();
+          const d = drawRef.current;
+          if (!d) return;
+          const line = firstLineStringGeometryFromDrawAll(d.getAll() as GeoJSON.FeatureCollection);
+          syncManualDetourDraftOverlay(map, line);
+        };
+        map.on("draw.render", onDrawRender);
         map.on("mousemove", syncPolygonPreviewLine);
         map.on("draw.modechange", syncPolygonPreviewLine);
         map.on("draw.modechange", notifyDrawMode);
         notifyDrawMode();
 
-        map.on("draw.create", (e: { features?: GeoJSON.Feature[] }) => {
-          let feature = e?.features?.[0];
-          if (!feature && typeof draw.getAll === "function") {
-            const all = draw.getAll();
-            feature = all?.features?.[0];
-          }
-          if (feature?.geometry) {
-            const geom = normalizeBlockageGeometry(feature.geometry);
-            onBlockageChange(geom);
-          }
+        map.on("draw.create", () => {
+          publishDrawState();
           syncPolygonPreviewLine();
         });
-        map.on("draw.update", (e: { features?: GeoJSON.Feature[] }) => {
-          let feature = e?.features?.[0];
-          if (!feature && typeof draw.getAll === "function") {
-            const all = draw.getAll();
-            feature = all?.features?.[0];
-          }
-          if (feature?.geometry) {
-            const geom = normalizeBlockageGeometry(feature.geometry);
-            onBlockageChange(geom);
-          }
+        map.on("draw.update", () => {
+          publishDrawState();
           syncPolygonPreviewLine();
         });
         map.on("draw.delete", () => {
-          onBlockageChange(null);
+          publishDrawState();
           syncPolygonPreviewLine();
         });
         drawDetachRef.current = () => {
-          map.off("draw.render", syncPolygonPreviewLine);
+          map.off("draw.render", onDrawRender);
           map.off("mousemove", syncPolygonPreviewLine);
           map.off("draw.modechange", syncPolygonPreviewLine);
           map.off("draw.modechange", notifyDrawMode);
@@ -695,6 +841,19 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
           });
         }
       }
+
+      if (!map.getSource(SOURCE_MANUAL_DETOUR_DRAFT)) {
+        map.addSource(SOURCE_MANUAL_DETOUR_DRAFT, { type: "geojson", data: EMPTY_FC });
+      }
+      if (!map.getLayer(LAYER_MANUAL_DETOUR_DRAFT)) {
+        map.addLayer({
+          id: LAYER_MANUAL_DETOUR_DRAFT,
+          type: "line",
+          source: SOURCE_MANUAL_DETOUR_DRAFT,
+          layout: { "line-cap": "round", "line-join": "round" },
+          paint: { "line-color": "#b45309", "line-width": 5 },
+        });
+      }
     };
 
     const rehydrateMapStyle = () => {
@@ -702,7 +861,7 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
       const routeSource = map.getSource(SOURCE_ROUTE) as maplibregl.GeoJSONSource | undefined;
       routeSource?.setData((routeRef.current || EMPTY_FC) as any);
       const detourSource = map.getSource(SOURCE_DETOUR) as maplibregl.GeoJSONSource | undefined;
-      detourSource?.setData((detourRef.current?.path_geojson || EMPTY_FC) as any);
+      detourSource?.setData(normalizeToFeatureCollection(detourRef.current?.path_geojson) as any);
       const pinSource = map.getSource(SOURCE_PIN) as maplibregl.GeoJSONSource | undefined;
       if (pinSource) {
         const activePin = pinPositionRef.current;
@@ -741,6 +900,7 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
           })),
         } as any);
       }
+      syncManualDetourDraftOverlay(map, manualDraftDetourLinePropRef.current);
       const drawAfterRehydrate = drawRef.current as MapboxDraw & { getMode?: () => string };
       if (drawAfterRehydrate && typeof drawAfterRehydrate.getMode === "function") {
         onDrawModeChangeRef.current?.(drawAfterRehydrate.getMode());
@@ -774,13 +934,14 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
       drawRef.current = null;
       setMapReady(false);
     };
-  }, [onBlockageChange]);
+  }, []);
 
   useEffect(() => {
     const map = mapRef.current;
     if (!map) return;
     const prev = basemapRef.current;
-    if (prev === basemap) return;
+    const next = effectiveBasemap(basemap);
+    if (prev === next) return;
 
     const camera = {
       center: map.getCenter(),
@@ -793,11 +954,12 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
       map.jumpTo(camera);
     };
 
-    // Raster->raster: keep style/sources/layers and only swap tile URLs.
-    if (isRasterBasemap(prev) && isRasterBasemap(basemap)) {
+    // Raster->raster: keep style/sources/layers and only swap tile URLs when maxzoom matches.
+    if (isRasterBasemap(prev) && isRasterBasemap(next) && rasterMaxZoom(prev) === rasterMaxZoom(next)) {
       const src = map.getSource(BASEMAP_RASTER_SOURCE) as (maplibregl.Source & { setTiles?: (t: string[]) => void }) | null;
-      src?.setTiles?.(rasterTilesForBasemap(basemap));
-      basemapRef.current = basemap;
+      src?.setTiles?.(rasterTilesForBasemap(next));
+      basemapRef.current = next;
+      map.setMaxZoom(mapMaxZoomForBasemap(next));
       applyCamera();
       return;
     }
@@ -806,22 +968,33 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
     map.once("style.load", () => {
       styleRehydrateRef.current?.();
       applyCamera();
-      basemapRef.current = basemap;
+      basemapRef.current = next;
+      map.setMaxZoom(mapMaxZoomForBasemap(next));
     });
-    map.setStyle(styleForBasemap(basemap), { diff: false });
+    map.setStyle(styleForBasemap(next), { diff: false });
   }, [basemap]);
 
-  // After style reload, re-apply blockage from React state into MapboxDraw.
+  // After map becomes ready (or remounts), re-apply blockage + manual detour line into MapboxDraw without wiping
+  // each other. Ongoing edits use draw events; textarea paste uses applyManualDetourLineToDraw on the ref.
   useEffect(() => {
     if (!mapReady || !drawRef.current) return;
     const draw = drawRef.current;
     const geom = blockagePropRef.current;
+    const line = manualDraftDetourLinePropRef.current;
     try {
-      draw.deleteAll();
+      deletePolygonFeaturesFromDraw(draw);
+      deleteLineStringFeaturesFromDraw(draw);
       if (geom) {
         draw.add({
           type: "Feature",
           geometry: geom as GeoJSON.Geometry,
+          properties: {},
+        } as GeoJSON.Feature);
+      }
+      if (line?.coordinates && line.coordinates.length >= 2) {
+        draw.add({
+          type: "Feature",
+          geometry: line,
           properties: {},
         } as GeoJSON.Feature);
       }
@@ -833,6 +1006,13 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
       onDrawModeChangeRef.current?.(drawNotify.getMode());
     }
   }, [mapReady]);
+
+  // Manual detour draft overlay (plain GeoJSON; stays in sync when parent sets `manualDraftDetourLine` without Draw events).
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !mapReady) return;
+    syncManualDetourDraftOverlay(map, manualDraftDetourLine);
+  }, [mapReady, manualDraftDetourLine]);
 
   // Route source data
   useEffect(() => {
@@ -850,9 +1030,7 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
     if (!map || !mapReady) return;
     const source = map.getSource(SOURCE_DETOUR) as maplibregl.GeoJSONSource | undefined;
     if (!source) return;
-    const detourFc = detour?.path_geojson ?? null;
-    const data = detourFc || ({ type: "FeatureCollection", features: [] } as GeoJSON.FeatureCollection);
-    source.setData(data as any);
+    source.setData(normalizeToFeatureCollection(detour?.path_geojson ?? null) as any);
   }, [mapReady, detour]);
 
   // Stops source data
@@ -911,7 +1089,9 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
       const g = f.geometry;
       if (g.type === "Point") extend(g.coordinates);
       else if (g.type === "LineString") g.coordinates.forEach(extend);
+      else if (g.type === "MultiLineString") g.coordinates.forEach((line) => line.forEach(extend));
       else if (g.type === "Polygon") g.coordinates[0].forEach(extend);
+      else if (g.type === "MultiPolygon") g.coordinates.forEach((poly) => poly[0].forEach(extend));
     });
     if (bounds.isEmpty()) return;
     map.fitBounds(bounds, { padding: 50, maxZoom: 16 });
@@ -921,8 +1101,15 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
     ref,
     () => ({
       clearBlockage() {
-        drawRef.current?.deleteAll();
-        onBlockageChange(null);
+        const draw = drawRef.current;
+        if (draw) {
+          try {
+            deletePolygonFeaturesFromDraw(draw);
+          } catch {
+            /* ignore */
+          }
+        }
+        onBlockageChangeRef.current?.(null);
       },
       startPolygon() {
         const draw = drawRef.current;
@@ -939,9 +1126,12 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
         const draw = drawRef.current;
         if (!draw) return;
         let all = draw.getAll() as GeoJSON.FeatureCollection;
-        if (!all.features?.length && blockagePropRef.current) {
+        const hasPoly = all.features?.some(
+          (f) => f.geometry?.type === "Polygon" || f.geometry?.type === "MultiPolygon"
+        );
+        if (!hasPoly && blockagePropRef.current) {
           try {
-            draw.deleteAll();
+            deletePolygonFeaturesFromDraw(draw);
             draw.add({
               type: "Feature",
               geometry: blockagePropRef.current as GeoJSON.Geometry,
@@ -962,6 +1152,42 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
           console.error("Failed to enter direct_select mode", e);
         }
       },
+      applyManualDetourLineToDraw(geom: GeoJSON.LineString | null) {
+        const draw = drawRef.current;
+        if (!draw) return;
+        try {
+          deleteLineStringFeaturesFromDraw(draw);
+          if (geom?.coordinates && geom.coordinates.length >= 2) {
+            draw.add({
+              type: "Feature",
+              geometry: geom,
+              properties: {},
+            } as GeoJSON.Feature);
+          }
+        } catch (e) {
+          console.error("Failed to apply manual detour line to draw", e);
+        }
+      },
+      startDrawDetourLine() {
+        const draw = drawRef.current;
+        if (!draw) return;
+        try {
+          // @ts-expect-error draw_line_string at runtime
+          draw.changeMode("draw_line_string");
+        } catch (e) {
+          console.error("Failed to start draw_line_string mode", e);
+        }
+      },
+      clearManualDetourLine() {
+        const draw = drawRef.current;
+        if (!draw) return;
+        try {
+          deleteLineStringFeaturesFromDraw(draw);
+          onManualDetourLineChangeRef.current?.(null);
+        } catch (e) {
+          console.error("Failed to clear manual detour line", e);
+        }
+      },
       cancelDrawing() {
         drawRef.current?.changeMode("simple_select");
       },
@@ -980,13 +1206,13 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
       },
       fitToDetour() {
         const d = detourRef.current;
-        if (d?.path_geojson) fitBoundsFromGeoJSON(d.path_geojson);
+        if (d?.path_geojson) fitBoundsFromGeoJSON(normalizeToFeatureCollection(d.path_geojson) as any);
       },
       flyTo(lat: number, lng: number, zoom = 15) {
         mapRef.current?.flyTo({ center: [lng, lat], zoom });
       },
     }),
-    [onBlockageChange]
+    []
   );
 
   return <div ref={containerRef} className="maplibre-map-container" />;
