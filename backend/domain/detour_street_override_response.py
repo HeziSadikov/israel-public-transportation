@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from .api_models import DetourResponse, DetourTurnStep
+from backend.mcp_server.schemas.api_models import DetourResponse, DetourTurnStep
 from .detour_geo_validation import (
     approximate_line_length_m,
     extract_line_coords_from_road_geojson,

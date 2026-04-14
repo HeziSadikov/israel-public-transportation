@@ -20,7 +20,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from backend.logging_utils import ensure_cli_action_logging, log
+from backend.infra.logging_utils import ensure_cli_action_logging, log
 
 ROOT = Path(__file__).resolve().parent.parent
 PY = sys.executable

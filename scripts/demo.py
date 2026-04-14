@@ -5,7 +5,7 @@ from typing import Any, Dict
 
 import httpx
 
-from backend.logging_utils import ensure_cli_action_logging, log
+from backend.infra.logging_utils import ensure_cli_action_logging, log
 
 
 API_BASE = os.getenv("API_BASE", "http://localhost:8000")

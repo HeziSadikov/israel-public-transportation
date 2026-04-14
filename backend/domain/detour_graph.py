@@ -11,16 +11,21 @@ from shapely.geometry import LineString, shape, mapping
 from shapely.ops import unary_union
 
 from .pattern_builder import PatternBuilder, RoutePattern
-from .graph_builder import (
+from backend.domain.graph_builder import (
     GraphBuilder,
     EdgeGeometry,
     haversine_meters,
     angle_difference_deg,
 )
 from .area_search import find_routes_in_polygon
-from . import db_access
-from .config import DETOUR_ALLOW_FEED_FALLBACK, DETOUR_TOP_K_PATTERNS, DETOUR_MAX_CANDIDATE_ROUTES
-from .detour_junctions import JunctionBuildConfig, apply_corridor_junctions, apply_geocode_snap_junctions
+from backend.infra import db_access
+from backend.infra.config import (
+    DETOUR_ALLOW_FEED_FALLBACK,
+    DETOUR_TOP_K_PATTERNS_SPATIAL,
+    DETOUR_SPATIAL_MIN_OVERLAP_M,
+    DETOUR_MAX_CANDIDATE_ROUTES,
+)
+from backend.detour_junctions import JunctionBuildConfig, apply_corridor_junctions, apply_geocode_snap_junctions
 
 if TYPE_CHECKING:
     from .gtfs_loader import GTFSFeed
@@ -439,15 +444,21 @@ def build_detour_graph(
         direction_filter = {}
         if dir_param is not None:
             direction_filter[primary_route_id] = dir_param
-        selected_by_key = db_access.get_top_patterns_for_routes(
+        selected_by_key = db_access.get_detour_patterns_for_routes(
             route_ids=sorted(route_ids),
             date_ymd=date_ymd,
             start_sec=day_start,
             end_sec=day_end,
-            k_per_route_dir=DETOUR_TOP_K_PATTERNS,
+            aoi_geojson=aoi_geojson,
+            k_per_route_dir=DETOUR_TOP_K_PATTERNS_SPATIAL,
             direction_filter_by_route=direction_filter or None,
-            include_fallback=True,
+            min_overlap_m=float(DETOUR_SPATIAL_MIN_OVERLAP_M),
         )
+        if not selected_by_key:
+            raise DetourGraphBuildError(
+                PATTERN_DATA_MISSING,
+                "Detour spatial pattern index returned no AOI-overlapping patterns.",
+            )
         primary_key = (primary_route_id, dir_param)
         primary_list = selected_by_key.get(primary_key, [])
         if not primary_list:
@@ -455,8 +466,18 @@ def build_detour_graph(
             primary_list = any_primary
         primary_meta = primary_list[0] if primary_list else None
         use_postgis = primary_meta is not None
+        if primary_meta is None:
+            raise DetourGraphBuildError(
+                PATTERN_DATA_MISSING,
+                "Detour spatial pattern index did not return the primary route pattern.",
+            )
+    except DetourGraphBuildError:
+        raise
     except (RuntimeError, Exception) as exc:
-        postgis_error = exc
+        raise DetourGraphBuildError(
+            PATTERN_DATA_MISSING,
+            "Detour spatial pattern index is unavailable or query failed.",
+        ) from exc
 
     _t_patterns = time.monotonic()
     logger.info(

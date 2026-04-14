@@ -7,12 +7,12 @@ from typing import Dict, List, Tuple, Optional, Sequence, TYPE_CHECKING, Any
 import networkx as nx
 from shapely.geometry import LineString
 
-from .db_access import get_stop_times_for_trip
+from backend.infra.db_access import get_stop_times_for_trip
 from .pattern_builder import RoutePattern
 from .service_calendar import parse_gtfs_time_to_seconds
 
 if TYPE_CHECKING:
-    from .db_access import PatternMeta
+    from backend.infra.db_access import PatternMeta
 
 
 def haversine_meters(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -449,7 +449,7 @@ def build_graph_for_pattern_from_postgis(
     Build a direction-aware graph from PostGIS data (patterns, pattern_stops, shapes_lines, stop_times).
     When pattern_stops, shape_line, or stop_times are provided, use them instead of DB calls (for bulk precompute).
     """
-    from . import db_access
+    from backend.infra import db_access
 
     pid = pattern_meta.pattern_id
     if pattern_stops is not None:

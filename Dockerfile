@@ -22,5 +22,5 @@ EXPOSE 8000
 ENV UVICORN_HOST=0.0.0.0 \
     UVICORN_PORT=8000
 
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "backend.mcp_server.transport.http:app", "--host", "0.0.0.0", "--port", "8000"]
 

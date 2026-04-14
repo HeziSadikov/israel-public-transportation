@@ -5,7 +5,7 @@ from collections import defaultdict, Counter
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional, Set, Any
 
-from .db_access import get_stop_times_for_trip
+from backend.infra.db_access import get_stop_times_for_trip
 from .service_calendar import ServiceCalendar
 
 

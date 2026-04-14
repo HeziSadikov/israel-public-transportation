@@ -6,12 +6,12 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from .config import VALHALLA_URL
+from backend.infra.config import VALHALLA_URL
 from .detour_geo_validation import road_geojson_clear_of_blockage
 from .detour_instructions_text import merged_steps_to_geocode_queries
-from .geocoding_nominatim import geocode_ordered_waypoints
-from .osm_detour import route_waypoints_avoiding_polygon
-from .osm_pretty import map_match_coordinates
+from backend.adapters.geocoding_nominatim import geocode_ordered_waypoints
+from backend.adapters.osm_detour import route_waypoints_avoiding_polygon
+from backend.adapters.osm_pretty import map_match_coordinates
 
 
 def try_build_narrative_detour_linestring(

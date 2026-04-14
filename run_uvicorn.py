@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import uvicorn
 
-from backend.uvicorn_logging import LOGGING_CONFIG
+from backend.infra.uvicorn_logging import LOGGING_CONFIG
 
 
 def main() -> None:
     uvicorn.run(
-        "app:app",
+        "backend.mcp_server.transport.http:app",
         host="0.0.0.0",
         port=8000,
         reload=True,

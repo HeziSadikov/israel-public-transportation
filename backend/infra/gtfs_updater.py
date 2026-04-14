@@ -9,10 +9,10 @@ from typing import Optional, Dict, Any
 
 from .gtfs_download import download_gtfs_zip
 from .logging_utils import log
-from .config import GTFS_DATA_DIR, FEED_METADATA_PATH
-from .db_access import DB_URL
-from .scripts.ingest_gtfs_postgis import ingest_gtfs
-from .scripts.build_patterns_postgis import build_patterns
+from backend.infra.config import GTFS_DATA_DIR, FEED_METADATA_PATH
+from backend.infra.db_access import DB_URL
+from backend.scripts.ingest_gtfs_postgis import ingest_gtfs
+from backend.scripts.build_patterns_postgis import build_patterns
 
 
 @dataclass

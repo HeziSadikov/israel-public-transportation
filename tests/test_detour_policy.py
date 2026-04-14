@@ -7,26 +7,26 @@ import networkx as nx
 import pytest
 from shapely.geometry import LineString, shape
 
-from backend.config import parse_bool_env
-from backend.detour_graph import (
+from backend.infra.config import parse_bool_env
+from backend.domain.detour_graph import (
     DetourGraph,
     DetourGraphBuildError,
     PATTERN_DATA_MISSING,
     POSTGIS_UNAVAILABLE,
     build_detour_graph,
 )
-from backend.detour_service import (
+from backend.domain.detour_service import (
     DetourComputeError,
     DetourComputeInput,
     DetourComputeResult,
     compute_detour,
     compute_detour_with_strategies,
 )
-from backend.router_core import astar_route, dijkstra_best_route, dfs_best_route
-from backend.graph_builder import EdgeGeometry
-from backend.routing_policy import RoutingPolicy, default_by_area_routing_policy
-from backend.osm_detour import OSMFeasibilityResult
-import backend.graph_builder as graph_builder_mod
+from backend.domain.router_core import astar_route, dijkstra_best_route, dfs_best_route
+from backend.domain.graph_builder import EdgeGeometry
+from backend.domain.routing_policy import RoutingPolicy, default_by_area_routing_policy
+from backend.adapters.osm_detour import OSMFeasibilityResult
+import backend.domain.graph_builder as graph_builder_mod
 
 
 def _tiny_graph(u: str = "a", v: str = "b", sid_u: str = "S1", sid_v: str = "S2") -> tuple[nx.DiGraph, dict]:
@@ -48,7 +48,7 @@ def test_parse_bool_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_build_detour_graph_postgis_unavailable_when_fallback_off(monkeypatch: pytest.MonkeyPatch) -> None:
-    import backend.detour_graph as dg
+    import backend.domain.detour_graph as dg
 
     monkeypatch.setattr(dg, "DETOUR_ALLOW_FEED_FALLBACK", False)
     monkeypatch.setattr(dg.db_access, "get_active_feed_id", lambda: (_ for _ in ()).throw(RuntimeError("db down")))
@@ -62,63 +62,32 @@ def test_build_detour_graph_postgis_unavailable_when_fallback_off(monkeypatch: p
             primary_route_id="R1",
             primary_direction_id="0",
         )
-    assert exc.value.code == POSTGIS_UNAVAILABLE
+    assert exc.value.code == PATTERN_DATA_MISSING
 
 
-def test_build_detour_graph_fallback_on_logs_warning(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
-    import backend.detour_graph as dg
+def test_build_detour_graph_no_feed_fallback_when_spatial_selector_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import backend.domain.detour_graph as dg
 
     monkeypatch.setattr(dg, "DETOUR_ALLOW_FEED_FALLBACK", True)
-    monkeypatch.setattr(dg.db_access, "get_active_feed_id", lambda: (_ for _ in ()).throw(RuntimeError("db down")))
+    monkeypatch.setattr(dg.db_access, "get_active_feed_id", lambda *_a, **_k: 1)
     monkeypatch.setattr(dg, "find_routes_in_polygon", lambda **_: [])
-
-    class FakePatternBuilder:
-        def __init__(self, _feed):
-            pass
-
-        def build_patterns_for_route(self, **_kwargs):
-            return [
-                SimpleNamespace(
-                    pattern_id="p1",
-                    route_id="R1",
-                    direction_id="0",
-                    stop_ids=["S1", "S2"],
-                    frequency=10,
-                    representative_trip_id="T1",
-                    representative_shape_id=None,
-                )
-            ]
-
-        def pick_most_frequent_pattern(self, pats):
-            return pats[0]
-
-    class FakeGraphBuilder:
-        def __init__(self, _feed):
-            pass
-
-        def build_graph_for_pattern(self, _pattern):
-            g, ge = _tiny_graph()
-            return SimpleNamespace(graph=g, edge_geometries=ge)
-
-    monkeypatch.setattr(dg, "PatternBuilder", FakePatternBuilder)
-    monkeypatch.setattr(dg, "GraphBuilder", FakeGraphBuilder)
-
-    caplog.set_level("WARNING")
-    res = build_detour_graph(
-        feed=object(),
-        date_ymd="20260101",
-        blockage_geojson={"type": "Point", "coordinates": [34.8, 32.0]},
-        primary_route_id="R1",
-        primary_direction_id="0",
+    monkeypatch.setattr(
+        dg.db_access,
+        "get_detour_patterns_for_routes",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("selector failed")),
     )
-    assert isinstance(res, DetourGraph)
-    recs = [r for r in caplog.records if r.message == "detour_graph_feed_fallback"]
-    assert recs, "expected fallback warning log record"
-    rec = recs[0]
-    assert getattr(rec, "route_id", None) == "R1"
-    assert getattr(rec, "date", None) == "20260101"
-    assert getattr(rec, "reason_code", None) == POSTGIS_UNAVAILABLE
-    assert getattr(rec, "fallback_used", None) is True
+    with pytest.raises(DetourGraphBuildError) as exc:
+        build_detour_graph(
+            feed=object(),
+            date_ymd="20260101",
+            blockage_geojson={"type": "Point", "coordinates": [34.8, 32.0]},
+            primary_route_id="R1",
+            primary_direction_id="0",
+        )
+    assert exc.value.code == PATTERN_DATA_MISSING
+    assert "spatial pattern index" in str(exc.value)
 
 
 def _input_for_service() -> DetourComputeInput:
@@ -142,7 +111,7 @@ def _input_for_service() -> DetourComputeInput:
 
 
 def test_compute_detour_maps_postgis_unavailable_to_503(monkeypatch: pytest.MonkeyPatch) -> None:
-    import backend.detour_service as ds
+    import backend.domain.detour_service as ds
 
     monkeypatch.setattr(ds, "astar_route", lambda **_: ["c1", "c2"])
     monkeypatch.setattr(
@@ -156,7 +125,7 @@ def test_compute_detour_maps_postgis_unavailable_to_503(monkeypatch: pytest.Monk
 
 
 def test_compute_detour_maps_pattern_missing_to_409(monkeypatch: pytest.MonkeyPatch) -> None:
-    import backend.detour_service as ds
+    import backend.domain.detour_service as ds
 
     monkeypatch.setattr(ds, "astar_route", lambda **_: ["c1", "c2"])
     monkeypatch.setattr(
@@ -170,7 +139,7 @@ def test_compute_detour_maps_pattern_missing_to_409(monkeypatch: pytest.MonkeyPa
 
 
 def test_compute_detour_threads_window_uses_resolver_and_detour_blocked(monkeypatch: pytest.MonkeyPatch) -> None:
-    import backend.detour_service as ds
+    import backend.domain.detour_service as ds
 
     inp = _input_for_service()
     detour_g, detour_ge = _tiny_graph("d1", "d2", "S1", "S2")
@@ -209,7 +178,7 @@ def test_compute_detour_threads_window_uses_resolver_and_detour_blocked(monkeypa
 
 
 def test_compute_detour_instructions_only_when_astar_fails_with_hebrew_text(monkeypatch: pytest.MonkeyPatch) -> None:
-    import backend.detour_service as ds
+    import backend.domain.detour_service as ds
 
     inp = _input_for_service()
     inp.instructions_text_he = "פנה שמאלה, ישר"
@@ -256,7 +225,7 @@ def test_build_detour_graph_postgis_uses_precomputed_tables(
     When PostGIS is available, `build_detour_graph` must assemble the local graph from
     precomputed `pattern_nodes` / `pattern_edges` instead of rebuilding per-pattern graphs.
     """
-    import backend.detour_graph as dg
+    import backend.domain.detour_graph as dg
 
     # If legacy on-demand per-pattern graph building is called, we want the test to fail.
     def _fail_build_graph_for_pattern(*_args, **_kwargs):
@@ -271,11 +240,11 @@ def test_build_detour_graph_postgis_uses_precomputed_tables(
         dg, "find_routes_in_polygon", lambda **_kwargs: [{"route_id": "R2", "direction_id": "0"}]
     )
 
-    # PostGIS available + Top-K selection returns primary and secondary patterns.
+    # PostGIS available + spatial selection returns primary and secondary patterns.
     monkeypatch.setattr(dg.db_access, "get_active_feed_id", lambda *_args, **_kwargs: 1)
     monkeypatch.setattr(
         dg.db_access,
-        "get_top_patterns_for_routes",
+        "get_detour_patterns_for_routes",
         lambda **_kwargs: {
             ("R1", "0"): [SimpleNamespace(pattern_id="pat_R1_0")],
             ("R2", "0"): [SimpleNamespace(pattern_id="pat_R2_0")],
@@ -359,12 +328,13 @@ def test_build_detour_graph_postgis_uses_precomputed_tables(
     assert ("pat_R1_0:S1:0", "pat_R1_0:S2:1") in res.edge_geometries
 
 
-def test_build_detour_graph_threads_topk_and_window(monkeypatch: pytest.MonkeyPatch) -> None:
-    import backend.detour_graph as dg
+def test_build_detour_graph_threads_spatial_selector_and_window(monkeypatch: pytest.MonkeyPatch) -> None:
+    import backend.domain.detour_graph as dg
 
     captured: dict = {}
     monkeypatch.setattr(dg, "DETOUR_ALLOW_FEED_FALLBACK", False)
-    monkeypatch.setattr(dg, "DETOUR_TOP_K_PATTERNS", 2)
+    monkeypatch.setattr(dg, "DETOUR_TOP_K_PATTERNS_SPATIAL", 2)
+    monkeypatch.setattr(dg, "DETOUR_SPATIAL_MIN_OVERLAP_M", 9)
     monkeypatch.setattr(dg, "find_routes_in_polygon", lambda **_kwargs: [{"route_id": "R2", "direction_id": "1"}])
     monkeypatch.setattr(dg.db_access, "get_active_feed_id", lambda *_args, **_kwargs: 1)
 
@@ -372,7 +342,7 @@ def test_build_detour_graph_threads_topk_and_window(monkeypatch: pytest.MonkeyPa
         captured["kwargs"] = kwargs
         return {("R1", "0"): [SimpleNamespace(pattern_id="pat_R1_0")]}
 
-    monkeypatch.setattr(dg.db_access, "get_top_patterns_for_routes", _fake_selector)
+    monkeypatch.setattr(dg.db_access, "get_detour_patterns_for_routes", _fake_selector)
     monkeypatch.setattr(dg.db_access, "get_pattern_nodes_bulk", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(dg.db_access, "get_pattern_edges_bulk", lambda *_args, **_kwargs: [])
 
@@ -391,10 +361,36 @@ def test_build_detour_graph_threads_topk_and_window(monkeypatch: pytest.MonkeyPa
     assert selector_args["start_sec"] == 3600
     assert selector_args["end_sec"] == 7200
     assert selector_args["direction_filter_by_route"] == {"R1": "0"}
+    assert selector_args["min_overlap_m"] == 9.0
+    assert selector_args["aoi_geojson"]["type"] in {"Polygon", "MultiPolygon"}
+
+
+def test_build_detour_graph_fails_when_spatial_selector_returns_no_patterns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import backend.domain.detour_graph as dg
+
+    monkeypatch.setattr(dg, "DETOUR_ALLOW_FEED_FALLBACK", False)
+    monkeypatch.setattr(dg, "find_routes_in_polygon", lambda **_kwargs: [{"route_id": "R2", "direction_id": "1"}])
+    monkeypatch.setattr(dg.db_access, "get_active_feed_id", lambda *_args, **_kwargs: 1)
+    monkeypatch.setattr(dg.db_access, "get_detour_patterns_for_routes", lambda **_kwargs: {})
+
+    with pytest.raises(DetourGraphBuildError) as exc:
+        dg.build_detour_graph(
+            feed=object(),
+            date_ymd="20260101",
+            blockage_geojson={"type": "Point", "coordinates": [34.8, 32.0]},
+            primary_route_id="R1",
+            primary_direction_id="0",
+            start_sec=3600,
+            end_sec=7200,
+        )
+    assert exc.value.code == PATTERN_DATA_MISSING
+    assert "AOI-overlapping patterns" in str(exc.value)
 
 
 def test_build_detour_graph_aoi_unions_replaced_segment_corridor(monkeypatch: pytest.MonkeyPatch) -> None:
-    import backend.detour_graph as dg
+    import backend.domain.detour_graph as dg
 
     seen: list = []
 
@@ -409,7 +405,7 @@ def test_build_detour_graph_aoi_unions_replaced_segment_corridor(monkeypatch: py
     def _fake_patterns(**kwargs):
         return {("R1", "0"): [SimpleNamespace(pattern_id="pat_R1")]}
 
-    monkeypatch.setattr(dg.db_access, "get_top_patterns_for_routes", _fake_patterns)
+    monkeypatch.setattr(dg.db_access, "get_detour_patterns_for_routes", _fake_patterns)
     monkeypatch.setattr(dg.db_access, "get_pattern_nodes_bulk", lambda *_a, **_k: [])
     monkeypatch.setattr(dg.db_access, "get_pattern_edges_bulk", lambda *_a, **_k: [])
 
@@ -571,8 +567,8 @@ def test_dijkstra_and_astar_agree_when_direct_edge_blocked() -> None:
 def test_compute_detour_dijkstra_raises_error_when_no_path_found(monkeypatch: pytest.MonkeyPatch) -> None:
     """When dijkstra_best_route returns None (no path found), compute_detour
     should raise DetourComputeError."""
-    import backend.detour_service as ds
-    from backend.detour_service import DetourComputeError
+    import backend.domain.detour_service as ds
+    from backend.domain.detour_service import DetourComputeError
 
     inp = replace(_input_for_service(), routing_engine="dijkstra")
     detour_g, detour_ge = _tiny_graph("d1", "d2", "S1", "S2")
@@ -602,7 +598,7 @@ def test_compute_detour_dijkstra_raises_error_when_no_path_found(monkeypatch: py
 
 
 def test_compute_route_detour_by_area_cache_hit(monkeypatch: pytest.MonkeyPatch) -> None:
-    import app as app_mod
+    from backend.mcp_server.transport import http as app_mod
 
     expected = {
         "route_id": "R1",
@@ -651,7 +647,7 @@ def test_compute_route_detour_by_area_cache_hit(monkeypatch: pytest.MonkeyPatch)
 
 
 def test_compute_route_detour_by_area_blocks_path_intersecting_polygon(monkeypatch: pytest.MonkeyPatch) -> None:
-    import app as app_mod
+    from backend.mcp_server.transport import http as app_mod
 
     # Cache row exists but is invalid (intersects blockage), so compute path must proceed.
     cached_invalid = {
@@ -759,7 +755,7 @@ def test_compute_route_detour_by_area_blocks_path_intersecting_polygon(monkeypat
 
 def test_compute_route_detour_by_area_manual_road_before_automatic(monkeypatch: pytest.MonkeyPatch) -> None:
     """Submitted detour_road_geojson is applied before GTFS/OSM and is not rejected for clipping the blockage."""
-    import app as app_mod
+    from backend.mcp_server.transport import http as app_mod
 
     monkeypatch.setattr(app_mod.db_access_module, "get_trip_time_bounds_pg", lambda: {})
     monkeypatch.setattr(app_mod.db_access_module, "get_active_feed_id", lambda: 1)
@@ -862,7 +858,7 @@ def test_compute_route_detour_by_area_manual_road_before_automatic(monkeypatch: 
 
 
 def test_compute_route_detour_by_area_prefers_best_hybrid_candidate(monkeypatch: pytest.MonkeyPatch) -> None:
-    import app as app_mod
+    from backend.mcp_server.transport import http as app_mod
 
     monkeypatch.setattr(app_mod.db_access_module, "get_trip_time_bounds_pg", lambda: {})
     monkeypatch.setattr(app_mod.db_access_module, "get_active_feed_id", lambda: 1)
@@ -984,7 +980,7 @@ def test_compute_route_detour_by_area_prefers_best_hybrid_candidate(monkeypatch:
 
 
 def test_compute_route_detour_by_area_road_rejects_falls_back_gtfs(monkeypatch: pytest.MonkeyPatch) -> None:
-    import app as app_mod
+    from backend.mcp_server.transport import http as app_mod
 
     monkeypatch.setattr(app_mod.db_access_module, "get_trip_time_bounds_pg", lambda: {})
     monkeypatch.setattr(app_mod.db_access_module, "get_active_feed_id", lambda: 1)
@@ -1072,7 +1068,7 @@ def test_compute_route_detour_by_area_road_rejects_falls_back_gtfs(monkeypatch: 
 
 
 def test_hybrid_osm_detour_segment_success(monkeypatch: pytest.MonkeyPatch) -> None:
-    import app as app_mod
+    from backend.mcp_server.transport import http as app_mod
 
     class _OK:
         success = True
@@ -1098,7 +1094,7 @@ def test_hybrid_osm_detour_segment_success(monkeypatch: pytest.MonkeyPatch) -> N
 
 
 def test_detour_endpoint_hybrid_fallback_to_gtfs(monkeypatch: pytest.MonkeyPatch) -> None:
-    import app as app_mod
+    from backend.mcp_server.transport import http as app_mod
     from fastapi import HTTPException
 
     req = app_mod.DetourRequest(
@@ -1194,7 +1190,7 @@ def test_compute_detour_with_strategies_falls_back_to_gtfs(monkeypatch: pytest.M
         strategy_used="gtfs_graph",
         confidence=0.8,
     )
-    monkeypatch.setattr("backend.detour_service.compute_detour", lambda _inp: expected)
+    monkeypatch.setattr("backend.domain.detour_service.compute_detour", lambda _inp: expected)
 
     res = compute_detour_with_strategies(inp, osm_strategy=lambda _inp: None, prefer_osm=True)
     assert res.strategy_used == "gtfs_graph"

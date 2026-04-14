@@ -6,8 +6,8 @@ from typing import Dict, List, Tuple, Optional
 import httpx
 from shapely.geometry import LineString
 
-from .config import OSM_ENGINE_URL
-from .graph_builder import EdgeGeometry
+from backend.infra.config import OSM_ENGINE_URL
+from backend.domain.graph_builder import EdgeGeometry
 
 
 @dataclass

@@ -11,7 +11,7 @@ from typing import Dict, Optional
 
 import httpx
 
-from .config import GTFS_REMOTE_BASE, GTFS_REMOTE_FILENAME
+from backend.infra.config import GTFS_REMOTE_BASE, GTFS_REMOTE_FILENAME
 from .logging_utils import log
 
 

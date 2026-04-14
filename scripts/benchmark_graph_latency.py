@@ -17,7 +17,7 @@ import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
 
-from backend.logging_utils import ensure_cli_action_logging, log
+from backend.infra.logging_utils import ensure_cli_action_logging, log
 
 
 def _post_json(

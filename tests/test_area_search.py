@@ -1,5 +1,5 @@
 """
-Tests for backend.area_search (find_routes_in_polygon and helpers).
+Tests for backend.domain.area_search (find_routes_in_polygon and helpers).
 Uses minimal in-memory GTFS data; no real GTFS file required.
 
 Run from project root: python -m unittest tests.test_area_search
@@ -9,9 +9,9 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 
-from backend.gtfs_loader import GTFSFeed
-from backend.area_search import find_routes_in_polygon, get_trip_time_bounds, _get_shapes_by_id
-from backend.config import TRIP_TIME_BOUNDS_CACHE, SHAPES_BY_ID_CACHE
+from backend.domain.gtfs_loader import GTFSFeed
+from backend.domain.area_search import find_routes_in_polygon, get_trip_time_bounds, _get_shapes_by_id
+from backend.infra.config import TRIP_TIME_BOUNDS_CACHE, SHAPES_BY_ID_CACHE
 
 
 def _make_test_feed(source_path: Path) -> GTFSFeed:

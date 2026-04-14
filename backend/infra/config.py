@@ -2,7 +2,7 @@ from pathlib import Path
 import os
 
 
-BASE_DIR = Path(__file__).resolve().parent.parent
+BASE_DIR = Path(__file__).resolve().parents[2]
 
 
 def parse_bool_env(name: str, default: bool = False) -> bool:
@@ -56,6 +56,10 @@ HYBRID_DETOUR_ENABLED = parse_bool_env("HYBRID_DETOUR_ENABLED", True)
 DETOUR_ALLOW_FEED_FALLBACK = parse_bool_env("DETOUR_ALLOW_FEED_FALLBACK", False)
 # Higher k pulls more pattern variants per route into the detour graph (better urban coverage, more CPU).
 DETOUR_TOP_K_PATTERNS = max(1, parse_int_env("DETOUR_TOP_K_PATTERNS", 3))
+# Detour spatial selector uses a dedicated K so it can be wider than generic pattern selection.
+DETOUR_TOP_K_PATTERNS_SPATIAL = max(1, parse_int_env("DETOUR_TOP_K_PATTERNS_SPATIAL", 8))
+# Ignore tiny AOI touches; 0 keeps all intersections.
+DETOUR_SPATIAL_MIN_OVERLAP_M = max(0, parse_int_env("DETOUR_SPATIAL_MIN_OVERLAP_M", 0))
 # Cap on the number of candidate routes included in the detour graph. Routes are ranked by trip count
 # and the busiest ones are kept. The primary route is always included regardless of rank.
 DETOUR_MAX_CANDIDATE_ROUTES = max(1, parse_int_env("DETOUR_MAX_CANDIDATE_ROUTES", 80))

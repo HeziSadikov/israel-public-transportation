@@ -4,7 +4,7 @@
 - Use `now_ts()` or `log(tag, msg)` when adding new logs:
 
 ```python
-from backend.logging_utils import log
+from backend.infra.logging_utils import log
 
 log("feed/update", "Downloading GTFS ...")
 log("patterns", "Building patterns ...")

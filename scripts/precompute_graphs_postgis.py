@@ -32,13 +32,13 @@ import psycopg2
 from psycopg2 import sql as pg_sql
 from psycopg2.extras import DictCursor
 
-from backend.config import GRAPH_CACHE
-from backend.db_access import DB_URL
-from backend.graph_builder import build_graph_for_pattern_from_postgis
-from backend.logging_utils import ensure_cli_action_logging, log
-from backend.osm_pretty import map_match_pattern
-from backend import db_access as db_access_module
-from backend.route_preview_payload import build_route_preview_cache_dict
+from backend.infra.config import GRAPH_CACHE
+from backend.infra.db_access import DB_URL
+from backend.domain.graph_builder import build_graph_for_pattern_from_postgis
+from backend.infra.logging_utils import ensure_cli_action_logging, log
+from backend.adapters.osm_pretty import map_match_pattern
+from backend.infra import db_access as db_access_module
+from backend.domain.route_preview_payload import build_route_preview_cache_dict
 from backend.scripts.build_patterns_postgis import pick_default_pattern_build_date
 
 

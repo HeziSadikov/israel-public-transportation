@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from backend import service_calendar as sc
+from backend.domain import service_calendar as sc
 
 
 def test_default_profile_for_date_weekparts():

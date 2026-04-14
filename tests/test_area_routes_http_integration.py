@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import os
 
-# Before importing app (backend.config reads env at import time).
+# Before importing app (backend.infra.config reads env at import time).
 os.environ.setdefault("DATABASE_URL", "postgresql://postgres@localhost:5432/israel_gtfs")
 os.environ["GRAPH_WARMUP_ENABLED"] = "false"
 
@@ -16,7 +16,7 @@ import pytest
 pytest.importorskip("fastapi")
 
 from fastapi.testclient import TestClient  # noqa: E402
-from app import app  # noqa: E402
+from backend.mcp_server.transport.http import app  # noqa: E402
 
 
 @pytest.fixture(scope="module")
@@ -44,9 +44,11 @@ def test_post_area_routes_canonical_polygon_returns_200_and_routes(http_client):
         "end_time": CANONICAL_AREA_END_TIME_HHMM,
         "max_results": 200,
     }
-    r = http_client.post("/area/routes", json=payload)
+    r = http_client.post("/api/v1/area/routes", json=payload)
     if r.status_code == 500 and "could not connect" in (r.text or "").lower():
         pytest.skip("Postgres unreachable")
     assert r.status_code == 200, r.text
     data = r.json()
+    if not (data.get("routes") or []) and data.get("calendar_hint"):
+        pytest.skip(str(data.get("calendar_hint")))
     assert len(data.get("routes") or []) >= 1

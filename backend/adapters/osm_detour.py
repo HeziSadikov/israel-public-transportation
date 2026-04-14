@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import httpx
 from shapely.geometry import shape
 
-from .config import VALHALLA_URL
+from backend.infra.config import VALHALLA_URL
 
 
 @dataclass

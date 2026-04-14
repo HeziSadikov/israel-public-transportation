@@ -1,0 +1,2 @@
+"""Canonical CLI script namespace."""
+

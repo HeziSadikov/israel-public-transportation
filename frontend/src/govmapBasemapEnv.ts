@@ -12,7 +12,7 @@ const env = import.meta.env;
 function apiBase(): string {
   const v = env.VITE_API_BASE;
   if (typeof v === "string" && v.trim()) return v.trim().replace(/\/$/, "");
-  return "http://127.0.0.1:8000";
+  return "http://127.0.0.1:8000/api/v1";
 }
 
 function useProxy(): boolean {
@@ -29,7 +29,7 @@ export function isGovmapBasemapConfigured(): boolean {
 
 export function govmapRasterTiles(): string[] {
   if (useProxy()) {
-    const u = `${apiBase()}/api/govmap-tiles/{z}/{x}/{y}`;
+    const u = `${apiBase()}/govmap-tiles/{z}/{x}/{y}`;
     return [u, u, u];
   }
   const raw = String(env.VITE_GOVMAP_TILES ?? "");

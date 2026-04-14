@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 
 @pytest.fixture
 def client(monkeypatch):
-    import app as app_mod
+    from backend.mcp_server.transport import http as app_mod
 
     monkeypatch.setattr(
         app_mod,
@@ -24,14 +24,14 @@ def client(monkeypatch):
 
 
 def test_feed_status_includes_calendar_span(client, monkeypatch):
-    import app as app_mod
+    from backend.mcp_server.transport import http as app_mod
 
     monkeypatch.setattr(
         app_mod.db_access_module,
         "get_active_feed_calendar_span",
         lambda _conn=None: (20260301, 20260331),
     )
-    r = client.get("/feed/status")
+    r = client.get("/api/v1/feed/status")
     assert r.status_code == 200
     data = r.json()
     assert data["calendar_min_ymd"] == 20260301
@@ -39,7 +39,7 @@ def test_feed_status_includes_calendar_span(client, monkeypatch):
 
 
 def test_feed_status_calendar_none_when_db_raises(client, monkeypatch):
-    import app as app_mod
+    from backend.mcp_server.transport import http as app_mod
 
     def _boom(_conn=None):
         raise RuntimeError("no db")
@@ -49,7 +49,7 @@ def test_feed_status_calendar_none_when_db_raises(client, monkeypatch):
         "get_active_feed_calendar_span",
         _boom,
     )
-    r = client.get("/feed/status")
+    r = client.get("/api/v1/feed/status")
     assert r.status_code == 200
     data = r.json()
     assert data["calendar_min_ymd"] is None

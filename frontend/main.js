@@ -1,5 +1,5 @@
 // Basic configuration
-const BACKEND_BASE_URL = "http://127.0.0.1:8000";
+const BACKEND_BASE_URL = "http://127.0.0.1:8000/api/v1";
 
 /** Set from GET /feed/status when available; used for empty area-search hints. */
 let feedCalendarMin = null;

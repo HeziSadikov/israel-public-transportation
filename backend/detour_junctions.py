@@ -15,7 +15,7 @@ from shapely.geometry import LineString, Point, shape
 from shapely.ops import nearest_points
 from shapely.strtree import STRtree
 
-from .graph_builder import EdgeGeometry, bearing_deg, haversine_meters
+from backend.domain.graph_builder import EdgeGeometry, bearing_deg, haversine_meters
 
 
 def _polyline_cumdist_m(coords: Sequence[Tuple[float, float]]) -> List[float]:

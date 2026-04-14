@@ -25,7 +25,11 @@ from backend.area_routes_canonical_fixtures import (  # noqa: E402
     CANONICAL_AREA_POLYGON_WKT,
     CANONICAL_AREA_START_SEC,
 )
-from backend.db_access import get_active_feed_id, get_routes_in_polygon_range  # noqa: E402
+from backend.infra.db_access import (  # noqa: E402
+    get_active_feed_id,
+    get_active_feed_calendar_span,
+    get_routes_in_polygon_range,
+)
 
 
 def _conn_or_skip():
@@ -47,6 +51,14 @@ def test_get_routes_in_polygon_range_canonical_polygon_returns_rows():
     except Exception as e:
         conn.close()
         pytest.skip(f"No active feed: {e}")
+    span = get_active_feed_calendar_span(conn=conn)
+    if span and span[0] is not None and span[1] is not None:
+        date_n = int(CANONICAL_AREA_DATE_YMD)
+        if date_n < int(span[0]) or date_n > int(span[1]):
+            conn.close()
+            pytest.skip(
+                f"Canonical date {CANONICAL_AREA_DATE_YMD} is outside loaded calendar span {span[0]}-{span[1]}"
+            )
     try:
         rows = get_routes_in_polygon_range(
             polygon_wkt=CANONICAL_AREA_POLYGON_WKT,

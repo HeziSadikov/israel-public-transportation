@@ -11,7 +11,7 @@ import networkx as nx
 from shapely.geometry import mapping, LineString, shape
 from shapely.strtree import STRtree
 
-from .graph_builder import GraphBuildResult, EdgeGeometry
+from backend.domain.graph_builder import GraphBuildResult, EdgeGeometry
 from .routing_policy import RoutingPolicy, default_routing_policy
 
 logger = logging.getLogger(__name__)
@@ -244,7 +244,7 @@ def compute_blocked_edges(
     edge_geometries: Dict[Tuple[str, str], EdgeGeometry],
     blockage_geojson: Dict,
 ) -> Tuple[set[Tuple[str, str]], Dict]:
-    from . import db_access
+    from backend.infra import db_access
 
     # Prefer PostGIS for intersection (SQL-heavy path).
     blocked_sql = db_access.get_blocked_edge_keys_pg(

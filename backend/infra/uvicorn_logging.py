@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _LOG_CONFIG_PATH = _PROJECT_ROOT / "uvicorn_logging.json"
 
 LOGGING_CONFIG = json.loads(_LOG_CONFIG_PATH.read_text(encoding="utf-8"))

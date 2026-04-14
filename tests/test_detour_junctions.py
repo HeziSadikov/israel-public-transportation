@@ -11,8 +11,8 @@ from backend.detour_junctions import (
     replace_ride_edge_with_junction_chain,
     snap_geocode_points_to_edges,
 )
-from backend.graph_builder import EdgeGeometry
-from backend.router_core import compute_blocked_edges
+from backend.domain.graph_builder import EdgeGeometry
+from backend.domain.router_core import compute_blocked_edges
 
 
 def _sample_edge_graph() -> tuple[nx.DiGraph, dict]:

@@ -7,7 +7,7 @@ This module hides raw SQL behind a small set of functions used by:
   - area_search (routes in polygon for a date/time window)
   - graph_builder / detour_graph (patterns, stops, shapes, trip time bounds)
 
-It assumes the schema defined in backend/db_postgis_schema.sql and that
+It assumes the schema defined in backend/sql/schema/db_postgis_schema.sql and that
 feed_versions.active indicates the current GTFS feed.
 """
 
@@ -480,6 +480,218 @@ def get_top_patterns_for_routes(
                     m.selection_source = "fallback"
                 if fallback:
                     selected[key] = fallback
+        return selected
+    finally:
+        if close:
+            conn.close()
+
+
+def get_detour_patterns_for_routes(
+    route_ids: List[str],
+    date_ymd: str,
+    start_sec: int,
+    end_sec: int,
+    aoi_geojson: Dict[str, Any],
+    k_per_route_dir: int = 6,
+    direction_filter_by_route: Optional[Dict[str, Optional[str]]] = None,
+    min_overlap_m: float = 0.0,
+    conn=None,
+) -> Dict[RouteDirKey, List[PatternMeta]]:
+    """
+    Return AOI-ranked Top-K patterns per (route_id, direction_id) using pattern_detour_index.
+
+    This is detour-specific and intentionally does not fall back to legacy frequency-only
+    selectors; callers should decide whether missing results are terminal.
+    """
+    if not route_ids:
+        return {}
+    k = max(1, int(k_per_route_dir or 1))
+    close = False
+    if conn is None:
+        conn = _get_conn()
+        close = True
+    try:
+        feed_id = get_active_feed_id(conn)
+        wanted_routes = set(route_ids)
+        dir_filter_int: Dict[str, Optional[int]] = {}
+        if direction_filter_by_route:
+            for rid, did in direction_filter_by_route.items():
+                dir_filter_int[rid] = _to_int_direction(did)
+
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                WITH aoi AS (
+                    SELECT ST_SetSRID(ST_GeomFromGeoJSON(%s), 4326) AS geom
+                ),
+                dow AS (
+                    SELECT EXTRACT(DOW FROM to_date(%s::text, 'YYYYMMDD'))::int AS d
+                ),
+                calendar_services AS (
+                    SELECT c.service_id
+                    FROM calendar c, dow
+                    WHERE c.feed_id = %s
+                      AND %s BETWEEN c.start_date AND c.end_date
+                      AND (
+                        (d = 0 AND c.sunday = 1)
+                        OR (d = 1 AND c.monday = 1)
+                        OR (d = 2 AND c.tuesday = 1)
+                        OR (d = 3 AND c.wednesday = 1)
+                        OR (d = 4 AND c.thursday = 1)
+                        OR (d = 5 AND c.friday = 1)
+                        OR (d = 6 AND c.saturday = 1)
+                      )
+                ),
+                add_services AS (
+                    SELECT service_id
+                    FROM calendar_dates
+                    WHERE feed_id = %s
+                      AND date = %s
+                      AND exception_type = 1
+                ),
+                remove_services AS (
+                    SELECT service_id
+                    FROM calendar_dates
+                    WHERE feed_id = %s
+                      AND date = %s
+                      AND exception_type = 2
+                ),
+                active_services AS (
+                    (SELECT service_id FROM calendar_services
+                     UNION
+                     SELECT service_id FROM add_services)
+                    EXCEPT
+                    SELECT service_id FROM remove_services
+                ),
+                trips_in_window AS (
+                    SELECT t.trip_id, t.route_id, t.direction_id
+                    FROM trips t
+                    JOIN active_services a
+                      ON a.service_id = t.service_id
+                    JOIN trip_time_bounds b
+                      ON b.feed_id = t.feed_id AND b.trip_id = t.trip_id
+                    WHERE t.feed_id = %s
+                      AND t.route_id = ANY(%s)
+                      AND b.last_sec >= %s
+                      AND b.first_sec <= %s
+                ),
+                trip_stop_chains AS (
+                    SELECT
+                        tw.trip_id,
+                        tw.route_id,
+                        tw.direction_id,
+                        ARRAY_AGG(st.stop_id ORDER BY st.stop_sequence)::text[] AS stop_ids
+                    FROM trips_in_window tw
+                    JOIN stop_times st
+                      ON st.feed_id = %s AND st.trip_id = tw.trip_id
+                    GROUP BY tw.trip_id, tw.route_id, tw.direction_id
+                ),
+                strict_counts AS (
+                    SELECT
+                        p.pattern_id,
+                        COUNT(*)::int AS active_trip_count
+                    FROM patterns p
+                    JOIN trip_stop_chains tsc
+                      ON tsc.route_id = p.route_id
+                     AND COALESCE(tsc.direction_id, -1) = COALESCE(p.direction_id, -1)
+                     AND tsc.stop_ids = p.stop_ids
+                    WHERE p.feed_id = %s
+                      AND p.route_id = ANY(%s)
+                    GROUP BY p.pattern_id
+                )
+                SELECT
+                    p.pattern_id,
+                    p.route_id,
+                    p.direction_id,
+                    p.repr_trip_id,
+                    p.repr_shape_id,
+                    p.stop_ids,
+                    p.frequency,
+                    p.used_shape,
+                    COALESCE(sc.active_trip_count, 0) AS active_trip_count,
+                    ST_Length(
+                        ST_Intersection(pdi.corridor_geom, aoi.geom)::geography
+                    ) AS overlap_m,
+                    CASE
+                        WHEN pdi.length_m > 0
+                        THEN ST_Length(ST_Intersection(pdi.corridor_geom, aoi.geom)::geography) / pdi.length_m
+                        ELSE 0.0
+                    END AS overlap_ratio
+                FROM pattern_detour_index pdi
+                JOIN patterns p
+                  ON p.feed_id = pdi.feed_id AND p.pattern_id = pdi.pattern_id
+                LEFT JOIN strict_counts sc
+                  ON sc.pattern_id = p.pattern_id
+                CROSS JOIN aoi
+                WHERE pdi.feed_id = %s
+                  AND p.route_id = ANY(%s)
+                  AND pdi.corridor_geom IS NOT NULL
+                  AND ST_Intersects(pdi.corridor_geom, aoi.geom)
+                ORDER BY
+                    p.route_id,
+                    p.direction_id NULLS FIRST,
+                    overlap_m DESC,
+                    overlap_ratio DESC,
+                    COALESCE(sc.active_trip_count, 0) DESC,
+                    p.frequency DESC NULLS LAST,
+                    p.pattern_id ASC
+                """,
+                (
+                    json.dumps(aoi_geojson),
+                    date_ymd,
+                    feed_id,
+                    int(date_ymd),
+                    feed_id,
+                    int(date_ymd),
+                    feed_id,
+                    int(date_ymd),
+                    feed_id,
+                    route_ids,
+                    start_sec,
+                    end_sec,
+                    feed_id,
+                    feed_id,
+                    route_ids,
+                    feed_id,
+                    route_ids,
+                ),
+            )
+            rows = cur.fetchall()
+
+        by_key: Dict[RouteDirKey, List[PatternMeta]] = {}
+        for row in rows:
+            rid = row["route_id"]
+            if rid not in wanted_routes:
+                continue
+            did_str = None if row["direction_id"] is None else str(row["direction_id"])
+            if rid in dir_filter_int:
+                wanted_did = dir_filter_int[rid]
+                if wanted_did is not None and row["direction_id"] != wanted_did:
+                    continue
+            overlap_m = float(row.get("overlap_m") or 0.0)
+            if overlap_m < float(min_overlap_m):
+                continue
+            key: RouteDirKey = (rid, did_str)
+            by_key.setdefault(key, []).append(
+                PatternMeta(
+                    pattern_id=row["pattern_id"],
+                    route_id=rid,
+                    direction_id=row["direction_id"],
+                    repr_trip_id=row["repr_trip_id"],
+                    repr_shape_id=row["repr_shape_id"],
+                    stop_ids=list(row["stop_ids"] or []),
+                    frequency=int(row["frequency"] or 0),
+                    used_shape=bool(row["used_shape"]),
+                    active_trip_count=int(row["active_trip_count"] or 0),
+                    selection_source="detour_spatial",
+                )
+            )
+
+        selected: Dict[RouteDirKey, List[PatternMeta]] = {}
+        for key in sorted(by_key.keys()):
+            metas = by_key.get(key) or []
+            if metas:
+                selected[key] = metas[:k]
         return selected
     finally:
         if close:
@@ -1504,7 +1716,7 @@ def compute_route_signatures_bulk(
     Compute signature for every (route_id, direction_id) in the feed in 3 queries.
     Returns (route_id, direction_id) -> sig_hash. Memory-heavy for large feeds.
     """
-    from backend.logging_utils import log
+    from backend.infra.logging_utils import log
 
     close = False
     if conn is None:

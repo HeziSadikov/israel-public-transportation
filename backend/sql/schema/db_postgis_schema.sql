@@ -334,6 +334,28 @@ CREATE INDEX IF NOT EXISTS idx_pattern_edges_feed_pattern
 CREATE INDEX IF NOT EXISTS idx_pattern_edges_geom
     ON pattern_edges USING GIST (geom);
 
+-- Detour-oriented pattern corridor index (additive; does not replace pattern_nodes/edges).
+CREATE TABLE IF NOT EXISTS pattern_detour_index (
+    feed_id           INT REFERENCES feed_versions(id) ON DELETE CASCADE,
+    pattern_id        TEXT NOT NULL,
+    route_id          TEXT NOT NULL,
+    direction_id      INT,
+    first_stop_id     TEXT,
+    last_stop_id      TEXT,
+    stop_count        INT NOT NULL,
+    edge_count        INT NOT NULL,
+    length_m          DOUBLE PRECISION NOT NULL,
+    corridor_geom     GEOMETRY(Geometry, 4326),
+    updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (feed_id, pattern_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pattern_detour_index_feed_route_dir
+    ON pattern_detour_index(feed_id, route_id, direction_id);
+
+CREATE INDEX IF NOT EXISTS idx_pattern_detour_index_corridor_geom
+    ON pattern_detour_index USING GIST (corridor_geom);
+
 -- ---------------------------------------------------------------------------
 -- Upgrade: UNIQUE keys for ON CONFLICT upserts (fixes PostgreSQL 42P10)
 --

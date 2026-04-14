@@ -5,7 +5,7 @@ from typing import Any
 import psycopg2
 from psycopg2.extras import DictCursor
 
-from .db_access import DB_URL, get_active_feed_id
+from backend.infra.db_access import DB_URL, get_active_feed_id
 
 
 def load_active_feed() -> Any:

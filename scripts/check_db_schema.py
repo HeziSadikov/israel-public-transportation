@@ -2,13 +2,14 @@ import json
 import sqlite3
 from pathlib import Path
 
-from backend.logging_utils import ensure_cli_action_logging, log
+from backend.infra.config import BASE_DIR
+from backend.infra.logging_utils import ensure_cli_action_logging, log
 
 
 def main() -> None:
     ensure_cli_action_logging()
     log("check_db_schema", "phase=main start")
-    db = Path(r"c:\Users\חל\Desktop\israel-public-transportation\data\gtfs.db")
+    db = BASE_DIR / "data" / "gtfs.db"
     print("DB exists:", db.exists())
     if not db.exists():
         log("check_db_schema", "phase=main done db_missing=true")

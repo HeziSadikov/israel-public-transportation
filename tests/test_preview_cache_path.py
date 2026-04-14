@@ -5,7 +5,7 @@ import time
 
 from fastapi import Response
 
-import app as app_mod
+from backend.mcp_server.transport import http as app_mod
 
 
 def test_graph_preview_memory_hit(monkeypatch):

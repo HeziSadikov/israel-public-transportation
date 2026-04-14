@@ -102,7 +102,7 @@ docker compose up -d
 Then create the schema (once, as superuser for `CREATE EXTENSION postgis`):
 
 ```bash
-docker compose exec postgis psql -U postgres -d israel_gtfs -f /backend/db_postgis_schema.sql
+docker compose exec postgis psql -U postgres -d israel_gtfs -f /backend/sql/schema/db_postgis_schema.sql
 ```
 
 **Ingest and patterns**
@@ -212,7 +212,7 @@ For realistic latency checks, avoid `--reload`:
 
 **Manage / CI**
 
-- Schema: `backend/db_postgis_schema.sql`
+- Schema: `backend/sql/schema/db_postgis_schema.sql`
 - Ingest: `backend/scripts/ingest_gtfs_postgis.py`
 - Patterns: `backend/scripts/build_patterns_postgis.py`
 - Data access: `backend/db_access.py` (used by area search, graph builder, detour graph)

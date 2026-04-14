@@ -15,7 +15,7 @@ import os
 import sys
 from pathlib import Path
 
-from backend.logging_utils import ensure_cli_action_logging, log
+from backend.infra.logging_utils import ensure_cli_action_logging, log
 
 # Before importing app: config reads these at import time.
 os.environ.setdefault("DATABASE_URL", "postgresql://postgres@localhost:5432/israel_gtfs")
@@ -49,7 +49,7 @@ def main() -> int:
     }
     with TestClient(app) as client:
         log("verify_area_http", "phase=http_post start endpoint=/area/routes")
-        r = client.post("/area/routes", json=payload)
+        r = client.post("/api/v1/area/routes", json=payload)
         log("verify_area_http", f"phase=http_post done status={r.status_code}")
     body = r.json() if r.content else {}
     routes = body.get("routes") if isinstance(body, dict) else None

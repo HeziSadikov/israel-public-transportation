@@ -10,13 +10,13 @@ import networkx as nx
 
 logger = logging.getLogger(__name__)
 
-from . import db_access
+from backend.infra import db_access
 from .detour_geo_validation import (
     road_geojson_clear_of_blockage,
     road_geojson_has_routable_geometry,
 )
 from .detour_instructions_text import instructions_text_he_to_steps, merged_steps_to_geocode_queries
-from .geocoding_nominatim import geocode_query_best_effort
+from backend.adapters.geocoding_nominatim import geocode_query_best_effort
 from .detour_graph import (
     DetourGraphParams,
     DetourGraphBuildError,
@@ -25,7 +25,7 @@ from .detour_graph import (
     build_detour_graph,
     default_detour_graph_params,
 )
-from .graph_builder import EdgeGeometry
+from backend.domain.graph_builder import EdgeGeometry
 from .router_core import astar_route, collect_path_geojson, compute_blocked_edges, dijkstra_best_route, dfs_best_route
 from .routing_policy import RoutingPolicy, default_routing_policy
 

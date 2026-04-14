@@ -20,7 +20,7 @@ Usage:
   python -m backend.scripts.build_patterns_postgis --ignore-calendar
 
 When run as a CLI (not via Uvicorn), progress and timestamps go to stderr through
-the ``app.action`` logger (see ``ensure_cli_action_logging`` in ``backend.logging_utils``).
+the ``app.action`` logger (see ``ensure_cli_action_logging`` in ``backend.infra.logging_utils``).
 """
 
 from __future__ import annotations
@@ -34,13 +34,13 @@ import psycopg2
 from psycopg2 import errors as pg_errors
 from psycopg2.extras import DictCursor
 
-from backend.logging_utils import ensure_cli_action_logging, log
+from backend.infra.logging_utils import ensure_cli_action_logging, log
 
 _ROUTE_PROGRESS_EVERY = 25
 _RIDE_NETWORK_PROGRESS_EVERY = 25
-from backend.graph_builder import build_graph_for_pattern_from_postgis
-from backend.pattern_builder import PatternBuilder, RoutePattern
-from backend.db_access import (
+from backend.domain.graph_builder import build_graph_for_pattern_from_postgis
+from backend.domain.pattern_builder import PatternBuilder, RoutePattern
+from backend.infra.db_access import (
   get_active_feed_id,
   DB_URL as DEFAULT_DB_URL,
   compute_route_signature,
@@ -55,6 +55,35 @@ from backend.db_access import (
 
 def _connect(database_url: Optional[str]):
   return psycopg2.connect(database_url or DEFAULT_DB_URL, cursor_factory=DictCursor)
+
+
+def _merge_pattern_corridor_wkt(edge_wkts: List[str]) -> Optional[str]:
+  """Merge per-edge LineStrings to one corridor geometry WKT for detour indexing."""
+  if not edge_wkts:
+    return None
+  from shapely import wkt as _wkt
+  from shapely.ops import linemerge, unary_union
+
+  lines = []
+  for txt in edge_wkts:
+    if not txt:
+      continue
+    try:
+      geom = _wkt.loads(str(txt))
+    except Exception:
+      continue
+    if geom is None or geom.is_empty:
+      continue
+    lines.append(geom)
+  if not lines:
+    return None
+  try:
+    merged = linemerge(unary_union(lines))
+  except Exception:
+    merged = lines[0]
+  if merged is None or merged.is_empty:
+    return None
+  return str(merged.wkt)
 
 
 def _ensure_patterns_built_checksum_column(conn) -> None:
@@ -325,6 +354,7 @@ def _upsert_patterns_for_feed(
   # Clear precomputed ride network derived tables.
   cur.execute("DELETE FROM pattern_nodes WHERE feed_id = %s", (feed_id,))
   cur.execute("DELETE FROM pattern_edges WHERE feed_id = %s", (feed_id,))
+  cur.execute("DELETE FROM pattern_detour_index WHERE feed_id = %s", (feed_id,))
 
   routes = feed.routes
   n_routes = len(routes)
@@ -632,6 +662,7 @@ def _build_pattern_ride_network(cur, feed_id: int, yyyymmdd: str) -> None:
     # Insert pattern_edges
     # -------------------------
     edge_rows = []
+    edge_wkts: List[str] = []
     for u, v, ed in res.graph.edges(data=True):
       eg = res.edge_geometries.get((u, v))
       if eg is None or eg.linestring is None:
@@ -639,6 +670,7 @@ def _build_pattern_ride_network(cur, feed_id: int, yyyymmdd: str) -> None:
 
       travel_time_s = ed.get("travel_time_s", ed.get("weight"))
       distance_m = ed.get("distance_m", 0.0)
+      ls_wkt = eg.linestring.wkt
       edge_rows.append(
         (
           feed_id,
@@ -649,9 +681,10 @@ def _build_pattern_ride_network(cur, feed_id: int, yyyymmdd: str) -> None:
           eg.to_stop_id,
           float(travel_time_s) if travel_time_s is not None else None,
           float(distance_m) if distance_m is not None else None,
-          eg.linestring.wkt,
+          ls_wkt,
         )
       )
+      edge_wkts.append(ls_wkt)
 
     if edge_rows:
       execute_values(
@@ -675,6 +708,62 @@ def _build_pattern_ride_network(cur, feed_id: int, yyyymmdd: str) -> None:
         template="(%s,%s,%s,%s,%s,%s,%s,%s,ST_GeomFromText(%s,4326))",
       )
       edges_inserted += len(edge_rows)
+
+    corridor_wkt = _merge_pattern_corridor_wkt(edge_wkts)
+    first_stop_id = stops[0].stop_id if stops else None
+    last_stop_id = stops[-1].stop_id if stops else None
+    cur.execute(
+      """
+      INSERT INTO pattern_detour_index (
+        feed_id,
+        pattern_id,
+        route_id,
+        direction_id,
+        first_stop_id,
+        last_stop_id,
+        stop_count,
+        edge_count,
+        length_m,
+        corridor_geom
+      )
+      VALUES (
+        %s, %s, %s, %s, %s, %s, %s, %s,
+        CASE
+          WHEN %s IS NULL THEN 0.0
+          ELSE ST_Length(ST_GeomFromText(%s, 4326)::geography)
+        END,
+        CASE
+          WHEN %s IS NULL THEN NULL
+          ELSE ST_GeomFromText(%s, 4326)
+        END
+      )
+      ON CONFLICT (feed_id, pattern_id) DO UPDATE
+      SET
+        route_id = EXCLUDED.route_id,
+        direction_id = EXCLUDED.direction_id,
+        first_stop_id = EXCLUDED.first_stop_id,
+        last_stop_id = EXCLUDED.last_stop_id,
+        stop_count = EXCLUDED.stop_count,
+        edge_count = EXCLUDED.edge_count,
+        length_m = EXCLUDED.length_m,
+        corridor_geom = EXCLUDED.corridor_geom,
+        updated_at = NOW()
+      """,
+      (
+        feed_id,
+        pid,
+        row["route_id"],
+        row.get("direction_id"),
+        first_stop_id,
+        last_stop_id,
+        len(stops),
+        len(edge_rows),
+        corridor_wkt,
+        corridor_wkt,
+        corridor_wkt,
+        corridor_wkt,
+      ),
+    )
 
     if (idx + 1) % _RIDE_NETWORK_PROGRESS_EVERY == 0:
       log("patterns", f"Ride network build progress: {idx + 1}/{len(pattern_rows)} patterns ...")

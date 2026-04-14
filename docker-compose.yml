@@ -70,5 +70,5 @@ volumes:
 # 2) Start stack:
 #    docker compose up --build
 # 3) Create PostGIS schema (once):
-#    docker compose exec postgis psql -U ${POSTGRES_USER:-user} -d ${POSTGRES_DB:-israel_gtfs} -f /backend/db_postgis_schema.sql
+#    docker compose exec postgis psql -U ${POSTGRES_USER:-user} -d ${POSTGRES_DB:-israel_gtfs} -f /backend/sql/schema/db_postgis_schema.sql
 # 4) Ingest GTFS & build patterns (from host or a one-off container) pointing at postgis:5432.

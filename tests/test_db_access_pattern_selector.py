@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import backend.db_access as db_access
+import backend.infra.db_access as db_access
 
 
 class _FakeCursor:

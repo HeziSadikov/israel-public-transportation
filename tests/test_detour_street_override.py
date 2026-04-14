@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from backend import db_access
-from backend.detour_geo_validation import (
+from backend.infra import db_access
+from backend.domain.detour_geo_validation import (
     road_geojson_clear_of_blockage,
     road_linestring_from_geojson,
 )
-from backend.detour_instructions_text import instructions_text_he_to_steps
-from backend.detour_street_override_response import build_detour_response_from_road_override
+from backend.domain.detour_instructions_text import instructions_text_he_to_steps
+from backend.domain.detour_street_override_response import build_detour_response_from_road_override
 
 
 def test_instructions_text_he_to_steps_splits_commas_and_semicolons() -> None:

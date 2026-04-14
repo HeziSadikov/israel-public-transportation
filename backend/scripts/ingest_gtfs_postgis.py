@@ -43,10 +43,10 @@ import psycopg2
 from psycopg2 import errors as pg_errors
 from psycopg2.extras import execute_values
 
-from backend.config import GTFS_REMOTE_BASE, GTFS_REMOTE_FILENAME, LOCAL_GTFS_ZIP
-from backend.db_access import DB_URL
-from backend.gtfs_download import download_gtfs_zip, get_remote_gtfs_metadata
-from backend.logging_utils import ensure_cli_action_logging, log
+from backend.infra.config import GTFS_REMOTE_BASE, GTFS_REMOTE_FILENAME, LOCAL_GTFS_ZIP
+from backend.infra.db_access import DB_URL
+from backend.infra.gtfs_download import download_gtfs_zip, get_remote_gtfs_metadata
+from backend.infra.logging_utils import ensure_cli_action_logging, log
 
 
 def _connect(database_url: str):

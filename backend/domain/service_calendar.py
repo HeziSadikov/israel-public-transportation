@@ -125,7 +125,7 @@ def date_has_calendar_exception(yyyymmdd: str, feed: Optional[Any] = None) -> bo
         return False
     # DB fallback (PostGIS path).
     try:
-        from . import db_access
+        from backend.infra import db_access
 
         return db_access.has_calendar_exception_for_date(yyyymmdd)
     except Exception:

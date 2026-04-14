@@ -7,7 +7,7 @@ from pathlib import Path
 
 from shapely.geometry import LineString
 
-from backend.db_access import StopMeta
+from backend.infra.db_access import StopMeta
 
 _ROOT = Path(__file__).resolve().parent.parent
 

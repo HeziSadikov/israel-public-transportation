@@ -10,14 +10,14 @@ os.environ.setdefault("DATABASE_URL", "postgresql://postgres@localhost:5432/isra
 import psycopg2  # noqa: E402
 from psycopg2.extras import DictCursor  # noqa: E402
 
-from backend.logging_utils import ensure_cli_action_logging, log as action_log  # noqa: E402
+from backend.infra.logging_utils import ensure_cli_action_logging, log as action_log  # noqa: E402
 from backend.area_routes_canonical_fixtures import (  # noqa: E402
     CANONICAL_AREA_DATE_YMD,
     CANONICAL_AREA_END_SEC,
     CANONICAL_AREA_POLYGON_WKT,
     CANONICAL_AREA_START_SEC,
 )
-from backend.db_access import get_active_feed_id, get_routes_in_polygon_range  # noqa: E402
+from backend.infra.db_access import get_active_feed_id, get_routes_in_polygon_range  # noqa: E402
 
 
 def main() -> None:

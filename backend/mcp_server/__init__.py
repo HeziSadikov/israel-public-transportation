@@ -1,0 +1,2 @@
+"""MCP-facing server package."""
+

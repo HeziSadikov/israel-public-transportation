@@ -103,7 +103,7 @@ type StopSearchResponseItem = {
 const API_BASE: string =
   (typeof (import.meta as any).env?.VITE_API_BASE === "string" &&
     (import.meta as any).env.VITE_API_BASE) ||
-  "http://127.0.0.1:8000";
+  "http://127.0.0.1:8000/api/v1";
 
 const DEFAULT_EXPLORER_POSITION = { x: 24, y: 24 };
 const DEFAULT_EXPLORER_SIZE = { width: 620, height: 420 };

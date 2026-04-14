@@ -5,9 +5,9 @@
 -- primary key at all, so id-only tables still failed ON CONFLICT on (feed_id, ...).
 --
 -- Run as a role that can ALTER these tables (database owner or superuser), e.g.:
---   docker compose exec postgis psql -U user -d israel_gtfs -f /backend/db_migration_route_cache_pk.sql
+--   docker compose exec postgis psql -U user -d israel_gtfs -f /backend/sql/migrations/db_migration_route_cache_pk.sql
 -- Or on host:
---   psql -h localhost -U postgres -d israel_gtfs -f backend/db_migration_route_cache_pk.sql
+--   psql -h localhost -U postgres -d israel_gtfs -f backend/sql/migrations/db_migration_route_cache_pk.sql
 
 DO $upgrade_route_cache_pk$
 BEGIN
