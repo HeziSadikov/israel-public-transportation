@@ -16,6 +16,8 @@ from backend.infra.config import (
     VALHALLA_CIRCUIT_COOLDOWN_S,
     VALHALLA_CIRCUIT_FAIL_THRESHOLD,
     VALHALLA_COUNTRY_CROSSING_PENALTY,
+    VALHALLA_HEADING_SNAP_RADIUS_M,
+    VALHALLA_HEADING_TOLERANCE_DEG,
     VALHALLA_LOCATION_RADIUS_M,
     VALHALLA_MANEUVER_PENALTY_S,
     VALHALLA_PRIVATE_ACCESS_PENALTY,
@@ -159,19 +161,53 @@ def _decode_polyline(encoded: str, precision: int = 6) -> List[Tuple[float, floa
     return coords
 
 
+def _break_point(
+    lon: float,
+    lat: float,
+    *,
+    radius_m: int,
+    heading_deg: Optional[float] = None,
+    heading_tolerance_deg: Optional[int] = None,
+) -> Dict[str, Any]:
+    loc: Dict[str, Any] = {"lat": lat, "lon": lon, "type": "break"}
+    if radius_m > 0:
+        loc["radius"] = int(radius_m)
+    if heading_deg is not None:
+        loc["heading"] = int(round(float(heading_deg))) % 360
+        tol = int(heading_tolerance_deg) if heading_tolerance_deg is not None else int(VALHALLA_HEADING_TOLERANCE_DEG)
+        loc["heading_tolerance"] = max(1, tol)
+    return loc
+
+
 def _valhalla_break_locations(
     from_lon: float,
     from_lat: float,
     to_lon: float,
     to_lat: float,
+    *,
+    exit_heading_deg: Optional[float] = None,
+    rejoin_heading_deg: Optional[float] = None,
+    heading_tolerance_deg: Optional[int] = None,
+    radius_exit_m: Optional[int] = None,
+    radius_rejoin_m: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
-    """Endpoints for /route with optional snap radius (reduces 442 when coords sit off the network)."""
-    a: Dict[str, Any] = {"lat": from_lat, "lon": from_lon, "type": "break"}
-    b: Dict[str, Any] = {"lat": to_lat, "lon": to_lon, "type": "break"}
-    r = int(VALHALLA_LOCATION_RADIUS_M)
-    if r > 0:
-        a["radius"] = r
-        b["radius"] = r
+    """Endpoints for /route with optional snap radius and optional preferred headings (divided roads)."""
+    r_def = int(VALHALLA_LOCATION_RADIUS_M)
+    re = int(radius_exit_m) if radius_exit_m is not None else r_def
+    rr = int(radius_rejoin_m) if radius_rejoin_m is not None else r_def
+    tol = heading_tolerance_deg
+    a = _break_point(
+        from_lon, from_lat,
+        radius_m=max(0, re),
+        heading_deg=exit_heading_deg,
+        heading_tolerance_deg=tol,
+    )
+    b = _break_point(
+        to_lon, to_lat,
+        radius_m=max(0, rr),
+        heading_deg=rejoin_heading_deg,
+        heading_tolerance_deg=tol,
+    )
     return [a, b]
 
 
@@ -228,6 +264,9 @@ def route_avoiding_polygon(
     blockage_geojson: Dict[str, Any],
     costing: str = "bus",
     timeout_s: float = 15.0,
+    *,
+    exit_heading_deg: Optional[float] = None,
+    rejoin_heading_deg: Optional[float] = None,
 ) -> OSMDetourResult:
     """
     Call Valhalla route API with exclude_polygons so the path goes around the blockage.
@@ -243,7 +282,11 @@ def route_avoiding_polygon(
 
     exclude = _polygon_to_exclude_rings(blockage_geojson)
     body: Dict[str, Any] = {
-        "locations": _valhalla_break_locations(from_lon, from_lat, to_lon, to_lat),
+        "locations": _valhalla_break_locations(
+            from_lon, from_lat, to_lon, to_lat,
+            exit_heading_deg=exit_heading_deg,
+            rejoin_heading_deg=rejoin_heading_deg,
+        ),
         "costing": costing,
         "costing_options": _valhalla_costing_options(costing),
         "units": "kilometers",
@@ -328,6 +371,9 @@ def route_avoiding_polygon_alternates_debug(
     costing: str = "bus",
     alternate_count: int = 2,
     timeout_s: float = 25.0,
+    *,
+    exit_heading_deg: Optional[float] = None,
+    rejoin_heading_deg: Optional[float] = None,
 ) -> Tuple[List[OSMDetourResult], Dict[str, Any]]:
     """
     Request multiple route alternatives from Valhalla (when supported).
@@ -349,7 +395,15 @@ def route_avoiding_polygon_alternates_debug(
     }
     if not VALHALLA_URL or not VALHALLA_URL.strip():
         r = route_avoiding_polygon(
-            from_lon, from_lat, to_lon, to_lat, blockage_geojson, costing=costing, timeout_s=timeout_s
+            from_lon,
+            from_lat,
+            to_lon,
+            to_lat,
+            blockage_geojson,
+            costing=costing,
+            timeout_s=timeout_s,
+            exit_heading_deg=exit_heading_deg,
+            rejoin_heading_deg=rejoin_heading_deg,
         )
         debug["fallback_attempted"] = True
         debug["fallback_success"] = bool(r.success)
@@ -365,62 +419,104 @@ def route_avoiding_polygon_alternates_debug(
     exclude = _polygon_to_exclude_rings(blockage_geojson)
     debug["exclude_polygon_count"] = len(exclude) if exclude else 0
     alts_req = max(0, int(alternate_count))
-    base: Dict[str, Any] = {
-        "locations": _valhalla_break_locations(from_lon, from_lat, to_lon, to_lat),
-        "costing": costing,
-        "costing_options": _valhalla_costing_options(costing),
-        "units": "kilometers",
-        "alternates": alts_req,
-    }
-    if exclude:
-        base["exclude_polygons"] = exclude
+    heading_tol = int(VALHALLA_HEADING_TOLERANCE_DEG)
+    tight_r = int(VALHALLA_HEADING_SNAP_RADIUS_M)
+    loose_r = int(VALHALLA_LOCATION_RADIUS_M)
+    h_exit, h_rejoin = exit_heading_deg, rejoin_heading_deg
 
-    # Retry chain for Valhalla 442 ("No path could be found"): alternates>0 can fail when only one
-    # detour exists; bus costing may disconnect before auto on some tile builds.
-    attempts: List[Tuple[str, Dict[str, Any]]] = [("primary", dict(base))]
-    if alts_req != 0:
-        b0 = dict(base)
-        b0["alternates"] = 0
-        attempts.append(("alternates_0", b0))
-    if (costing or "").lower() == "bus":
-        ba = dict(base)
-        ba["alternates"] = 0
-        ba["costing"] = "auto"
-        ba["costing_options"] = _valhalla_costing_options("auto")
-        attempts.append(("costing_auto_alternates_0", ba))
+    location_batches: List[Tuple[str, List[Dict[str, Any]]]] = []
+    if h_exit is not None and h_rejoin is not None:
+        tr = tight_r if tight_r > 0 else loose_r
+        location_batches.append(
+            (
+                "heading_tight",
+                _valhalla_break_locations(
+                    from_lon,
+                    from_lat,
+                    to_lon,
+                    to_lat,
+                    exit_heading_deg=h_exit,
+                    rejoin_heading_deg=h_rejoin,
+                    heading_tolerance_deg=heading_tol,
+                    radius_exit_m=tr,
+                    radius_rejoin_m=tr,
+                ),
+            )
+        )
+        location_batches.append(
+            (
+                "heading_loose",
+                _valhalla_break_locations(
+                    from_lon,
+                    from_lat,
+                    to_lon,
+                    to_lat,
+                    exit_heading_deg=h_exit,
+                    rejoin_heading_deg=h_rejoin,
+                    heading_tolerance_deg=heading_tol,
+                    radius_exit_m=loose_r,
+                    radius_rejoin_m=loose_r,
+                ),
+            )
+        )
+    location_batches.append(
+        ("plain", _valhalla_break_locations(from_lon, from_lat, to_lon, to_lat)),
+    )
 
     url = f"{VALHALLA_URL.rstrip('/')}/route"
     data: Optional[Dict[str, Any]] = None
     try:
-        for attempt_name, body in attempts:
-            resp = httpx.post(url, json=body, timeout=timeout_s)
-            debug["http_status"] = resp.status_code
-            if resp.status_code < 400:
-                data = resp.json()
-                debug["valhalla_attempt_used"] = attempt_name
-                # Earlier attempts may have set 442 diagnostics; clear so logs reflect success.
-                debug["error_type"] = None
-                debug["error_message"] = None
-                debug.pop("valhalla_error_json", None)
-                _breaker.record_success()
+        for loc_batch_name, locations in location_batches:
+            base: Dict[str, Any] = {
+                "locations": locations,
+                "costing": costing,
+                "costing_options": _valhalla_costing_options(costing),
+                "units": "kilometers",
+                "alternates": alts_req,
+            }
+            if exclude:
+                base["exclude_polygons"] = exclude
+
+            attempts: List[Tuple[str, Dict[str, Any]]] = [("primary", dict(base))]
+            if alts_req != 0:
+                b0 = dict(base)
+                b0["alternates"] = 0
+                attempts.append(("alternates_0", b0))
+            if (costing or "").lower() == "bus":
+                ba = dict(base)
+                ba["alternates"] = 0
+                ba["costing"] = "auto"
+                ba["costing_options"] = _valhalla_costing_options("auto")
+                attempts.append(("costing_auto_alternates_0", ba))
+
+            for attempt_name, body in attempts:
+                resp = httpx.post(url, json=body, timeout=timeout_s)
+                debug["http_status"] = resp.status_code
+                if resp.status_code < 400:
+                    data = resp.json()
+                    debug["valhalla_location_batch"] = loc_batch_name
+                    debug["valhalla_attempt_used"] = attempt_name
+                    debug["error_type"] = None
+                    debug["error_message"] = None
+                    debug.pop("valhalla_error_json", None)
+                    _breaker.record_success()
+                    break
+                err_txt = (resp.text or "")[:2000]
+                debug["error_type"] = "valhalla_http_error"
+                debug["error_message"] = err_txt
+                err_json: Dict[str, Any] = {}
+                try:
+                    j = resp.json()
+                    if isinstance(j, dict):
+                        err_json = j
+                        debug["valhalla_error_json"] = j
+                except Exception:
+                    pass
+                ec = err_json.get("error_code") if isinstance(err_json, dict) else None
+                if ec != 442:
+                    return out, debug
+            if data is not None:
                 break
-            err_txt = (resp.text or "")[:2000]
-            debug["error_type"] = "valhalla_http_error"
-            debug["error_message"] = err_txt
-            err_json: Dict[str, Any] = {}
-            try:
-                j = resp.json()
-                if isinstance(j, dict):
-                    err_json = j
-                    debug["valhalla_error_json"] = j
-            except Exception:
-                pass
-            ec = err_json.get("error_code") if isinstance(err_json, dict) else None
-            # Only retry on 442; other 4xx are likely permanent for this request shape.
-            if ec != 442:
-                return out, debug
-            if attempt_name == attempts[-1][0]:
-                return out, debug
         if data is None:
             return out, debug
     except Exception as e:
@@ -451,12 +547,68 @@ def route_avoiding_polygon_alternates_debug(
     if not out:
         debug["fallback_attempted"] = True
         r = route_avoiding_polygon(
-            from_lon, from_lat, to_lon, to_lat, blockage_geojson, costing=costing, timeout_s=timeout_s
+            from_lon,
+            from_lat,
+            to_lon,
+            to_lat,
+            blockage_geojson,
+            costing=costing,
+            timeout_s=timeout_s,
+            exit_heading_deg=exit_heading_deg,
+            rejoin_heading_deg=rejoin_heading_deg,
         )
         if r.success:
             out.append(r)
         debug["fallback_success"] = bool(r.success)
     return out, debug
+
+
+def _normalize_trace_attributes_edge(edge: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Valhalla may return flat keys like way_id/length or dotted keys (edge.way_id) or nested edge{}.
+    Downstream code expects way_id, length (km), road_class at top level.
+    """
+    e = dict(edge)
+    if e.get("way_id") is None:
+        for k in ("edge.way_id",):
+            if k in e and e[k] is not None:
+                try:
+                    e["way_id"] = int(e[k])
+                except (TypeError, ValueError):
+                    pass
+                break
+        if e.get("way_id") is None:
+            inner = e.get("edge")
+            if isinstance(inner, dict) and inner.get("way_id") is not None:
+                try:
+                    e["way_id"] = int(inner["way_id"])
+                except (TypeError, ValueError):
+                    pass
+    if e.get("length") is None:
+        for k in ("edge.length",):
+            if k in e and e[k] is not None:
+                try:
+                    e["length"] = float(e[k])
+                except (TypeError, ValueError):
+                    pass
+                break
+        if e.get("length") is None:
+            inner = e.get("edge")
+            if isinstance(inner, dict) and inner.get("length") is not None:
+                try:
+                    e["length"] = float(inner["length"])
+                except (TypeError, ValueError):
+                    pass
+    if e.get("road_class") is None:
+        for k in ("edge.road_class",):
+            if k in e and e[k] is not None:
+                e["road_class"] = e[k]
+                break
+        if e.get("road_class") is None:
+            inner = e.get("edge")
+            if isinstance(inner, dict) and inner.get("road_class") is not None:
+                e["road_class"] = inner["road_class"]
+    return e
 
 
 def match_route_attributes(
@@ -510,7 +662,7 @@ def match_route_attributes(
         edges = data.get("edges")
         if not isinstance(edges, list):
             return None
-        return edges
+        return [_normalize_trace_attributes_edge(x) for x in edges if isinstance(x, dict)]
     except Exception:
         return None
 

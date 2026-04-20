@@ -58,7 +58,13 @@ from backend.domain.detour_street_override_response import (
     build_detour_response_from_road_override,
     build_detour_response_instructions_only,
 )
-from backend.infra.config import VALHALLA_URL, HYBRID_DETOUR_ENABLED, DETOUR_V2_ENABLED
+from backend.infra.config import (
+    VALHALLA_URL,
+    HYBRID_DETOUR_ENABLED,
+    DETOUR_V2_ENABLED,
+    DETOUR_V2_AI_LOG,
+    DETOUR_V2_DEBUG,
+)
 from backend.mcp_server.schemas.api_models import (
     RouteSearchRequest,
     RouteInfo,
@@ -114,7 +120,7 @@ from backend.infra.logging_utils import log
 from backend.domain.service_calendar import ServiceCalendar, resolve_service_profile
 from backend.infra.uvicorn_logging import LOGGING_CONFIG
 from backend.domain.detour_v2.compute import compute_detour_for_trip
-from backend.domain.detour_v2.serialize import detour_compute_output_to_dict
+from backend.domain.detour_v2.serialize import detour_compute_output_to_dict, format_detour_ai_log_line
 from backend.domain.detour_v2.policy import get_default_policy
 from backend.domain.detour_v2.incident_projector import project_incident_polygon
 from backend.domain.detour_v2 import detour_memory as detour_memory_v2
@@ -672,6 +678,11 @@ def startup_detour_v2_schema():
         log("db/schema", "detour v2 support tables ensured (if missing)")
     except Exception as e:
         log("db/schema", f"ensure detour v2 support schema failed (persist may error until fixed): {e}")
+    try:
+        db_access_module.ensure_pattern_physical_layer_schema()
+        log("db/schema", "pattern physical layer tables ensured (if missing)")
+    except Exception as e:
+        log("db/schema", f"ensure pattern physical layer schema failed: {e}")
 
 
 @app.on_event("startup")
@@ -3901,6 +3912,13 @@ def post_detours_compute_v2(req: DetourComputeV2Request):
     feed_id = db_access_module.get_active_feed_id()
     # B3: shared Valhalla response cache for trips on the same shape within this request.
     valhalla_cache: Dict[str, Any] = {}
+    use_geojson = bool(getattr(req, "detour_debug", False)) or bool(getattr(req, "debug_detour", False))
+    use_ai_log = (
+        bool(getattr(req, "detour_debug", False))
+        or bool(getattr(req, "log_ai_summary", False))
+        or DETOUR_V2_DEBUG
+        or DETOUR_V2_AI_LOG
+    )
     for trip_id in trip_ids_to_compute:
         t0 = time.time()
         rid: Optional[int] = None
@@ -3913,7 +3931,17 @@ def post_detours_compute_v2(req: DetourComputeV2Request):
                 service_date=req.service_date,
                 incident_id=req.incident_id,
                 _valhalla_cache=valhalla_cache,
+                debug_detour=use_geojson,
+                use_matched_physical=bool(getattr(req, "use_matched_physical", False)),
             )
+            if use_ai_log:
+                try:
+                    log("detours/v2/compute_ai", format_detour_ai_log_line(out))
+                except Exception as ai_log_exc:
+                    log(
+                        "detours/v2/compute_ai",
+                        f"trip_id={trip_id} error=ai_log_failed err={ai_log_exc!s}",
+                    )
             payload = detour_compute_output_to_dict(out)
         except Exception as e:
             payload = {

@@ -22,6 +22,16 @@ def parse_int_env(name: str, default: int) -> int:
         return default
 
 
+def parse_float_env(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return float(str(raw).strip())
+    except Exception:
+        return default
+
+
 def parse_csv_env(name: str, default_csv: str) -> list[str]:
     raw = os.getenv(name, default_csv)
     return [p.strip() for p in str(raw).split(",") if p.strip()]
@@ -54,6 +64,32 @@ OSM_ENGINE_URL = os.getenv("OSM_ENGINE_URL", "http://localhost:5000")
 VALHALLA_URL = os.getenv("VALHALLA_URL", "")
 # Meters: search radius to snap /route endpoints to the road graph (helps 442 near stops). 0 = omit (Valhalla default).
 VALHALLA_LOCATION_RADIUS_M = max(0, parse_int_env("VALHALLA_LOCATION_RADIUS_M", 90))
+# When set, prefer tighter snap on break locations if heading is provided (divided roads).
+VALHALLA_HEADING_SNAP_RADIUS_M = max(0, parse_int_env("VALHALLA_HEADING_SNAP_RADIUS_M", 45))
+# Degrees: Valhalla location heading tolerance (snaps to edges aligned with this direction).
+VALHALLA_HEADING_TOLERANCE_DEG = max(1, parse_int_env("VALHALLA_HEADING_TOLERANCE_DEG", 60))
+# Physical layer: GTFS pattern edges matched to OSM (PostGIS); when true, prefer matched geometry for impact/anchors if backfilled.
+USE_MATCHED_PHYSICAL_GEOMETRY = parse_bool_env("USE_MATCHED_PHYSICAL_GEOMETRY", False)
+# Thresholds (mirrored in DetourPolicyConfig.physical_path; env wins at runtime via policy loader).
+PHYSICAL_PATH_MIN_TRIP_COVERAGE_RATIO = parse_float_env("PHYSICAL_PATH_MIN_TRIP_COVERAGE_RATIO", 0.72)
+PHYSICAL_PATH_MAX_AMBIGUOUS_STOP_PAIRS = max(0, parse_int_env("PHYSICAL_PATH_MAX_AMBIGUOUS_STOP_PAIRS", 2))
+PHYSICAL_PATH_MIN_SUMMARY_CONFIDENCE = parse_float_env("PHYSICAL_PATH_MIN_SUMMARY_CONFIDENCE", 0.35)
+PHYSICAL_PATH_MAX_MEAN_OFFSET_M = parse_float_env("PHYSICAL_PATH_MAX_MEAN_OFFSET_M", 35.0)
+PHYSICAL_PATH_ANCHOR_MIN_COVERAGE_RATIO = parse_float_env("PHYSICAL_PATH_ANCHOR_MIN_COVERAGE_RATIO", 0.72)
+PHYSICAL_PATH_MAX_WEAK_STOP_PAIRS = max(0, parse_int_env("PHYSICAL_PATH_MAX_WEAK_STOP_PAIRS", 8))
+PHYSICAL_PATH_HARD_REJECT_WRONG_ENTRY_EXIT_SEGMENT = parse_bool_env(
+    "PHYSICAL_PATH_HARD_REJECT_WRONG_ENTRY_EXIT_SEGMENT", True
+)
+DETOUR_V2_TIMING_LOG = parse_bool_env("DETOUR_V2_TIMING_LOG", False)
+# Emit structured detours/v2/compute_ai log lines for every /detours/compute call (no automatic GeoJSON; use request detour_debug for that).
+DETOUR_V2_DEBUG = parse_bool_env("DETOUR_V2_DEBUG", False)
+# Deprecated alias for DETOUR_V2_DEBUG (AI log half only).
+DETOUR_V2_AI_LOG = parse_bool_env("DETOUR_V2_AI_LOG", False)
+VALIDATE_DETOUR_CARRIAGEWAY = parse_bool_env("VALIDATE_DETOUR_CARRIAGEWAY", True)
+STRICT_ANCHOR_SNAPPING = parse_bool_env("STRICT_ANCHOR_SNAPPING", False)
+PREFER_BUS_SERVED_OSM = parse_bool_env("PREFER_BUS_SERVED_OSM", False)
+# Stop coordinate may replace shape-interpolated anchor if projected distance to shape is below this (meters).
+ANCHOR_STOP_MAX_PROJECTION_M = max(5, parse_int_env("ANCHOR_STOP_MAX_PROJECTION_M", 85))
 # Seconds-equivalent penalties used in Valhalla costing_options to reduce awkward maneuvers.
 VALHALLA_MANEUVER_PENALTY_S = max(0, parse_int_env("VALHALLA_MANEUVER_PENALTY_S", 45))
 VALHALLA_SERVICE_PENALTY_S = max(0, parse_int_env("VALHALLA_SERVICE_PENALTY_S", 30))

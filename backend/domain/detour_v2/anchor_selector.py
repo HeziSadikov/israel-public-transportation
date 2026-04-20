@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple
 
-from shapely.geometry import LineString
+from shapely.geometry import LineString, Point
+
+from backend.infra.config import ANCHOR_STOP_MAX_PROJECTION_M
 
 from .models import AnchorPair, BlockedShapeInterval
 from .policy import DetourPolicyConfig
@@ -18,6 +20,34 @@ def _point_on_line_at_m(line: LineString, dist_m: float, total_m: float) -> Tupl
     t = max(0.0, min(1.0, dist_m / total_m))
     p = line.interpolate(t, normalized=True)
     return (float(p.x), float(p.y))
+
+
+def _lonlat_stop_or_shape(
+    stop_id: Optional[str],
+    dist_m: float,
+    total_m: float,
+    line: LineString,
+    stop_lonlat: Dict[str, Tuple[float, float]],
+) -> Tuple[float, float]:
+    """Prefer curb stop position when it projects near the shape (meters), else shape point."""
+    sx, sy = _point_on_line_at_m(line, dist_m, total_m)
+    if not stop_id:
+        return sx, sy
+    ll = stop_lonlat.get(str(stop_id))
+    if not ll:
+        return sx, sy
+    slon, slat = ll
+    try:
+        p = Point(slon, slat)
+        d_proj = float(line.project(p))
+        closest = line.interpolate(d_proj)
+        dist_deg = float(p.distance(closest))
+        dist_m_approx = dist_deg * 111_320.0
+        if dist_m_approx <= float(ANCHOR_STOP_MAX_PROJECTION_M):
+            return slon, slat
+    except Exception:
+        pass
+    return sx, sy
 
 
 def _stops_with_dist_along(
@@ -135,8 +165,8 @@ def enumerate_anchor_candidates(
             interp_pen = float((e_sid is None) + (r_sid is None))
             shoulder_m = max(0.0, bs - e_d) + max(0.0, r_d - be)
             span_m = max(1.0, r_d - e_d)
-            ex_lon, ex_lat = _point_on_line_at_m(line, e_d, total_m)
-            rj_lon, rj_lat = _point_on_line_at_m(line, r_d, total_m)
+            ex_lon, ex_lat = _lonlat_stop_or_shape(e_sid, e_d, total_m, line, stop_lonlat)
+            rj_lon, rj_lat = _lonlat_stop_or_shape(r_sid, r_d, total_m, line, stop_lonlat)
             note = None
             if e_sid is None or r_sid is None:
                 note = "interpolated_shape_anchor"

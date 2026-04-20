@@ -122,8 +122,14 @@ def analyze_trip_impact(
     shape_id: Optional[str],
     shape_line: Optional[Any],
     blockage_geojson: Dict[str, Any],
+    physical_shape_line: Optional[Any] = None,
 ) -> TripImpactResult:
-    if shape_line is None or getattr(shape_line, "is_empty", True):
+    """
+    If physical_shape_line is set (matched OSM path), use it for blockage intersection;
+    otherwise use shape_line (GTFS).
+    """
+    primary = physical_shape_line if physical_shape_line is not None else shape_line
+    if primary is None or getattr(primary, "is_empty", True):
         return TripImpactResult(
             trip_id=trip_id,
             route_id=route_id,
@@ -131,7 +137,7 @@ def analyze_trip_impact(
             blocked=None,
             intersects_blockage=False,
         )
-    line = shape_line
+    line = primary
     if line.geom_type != "LineString":
         return TripImpactResult(
             trip_id=trip_id,

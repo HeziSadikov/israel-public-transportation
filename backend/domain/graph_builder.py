@@ -77,6 +77,10 @@ class GraphBuildResult:
     edge_geometries: Dict[Tuple[str, str], EdgeGeometry]
     pattern: RoutePattern
     used_shape: bool
+    # Optional summary when pattern_edge / OSM matching is populated (PostGIS).
+    physical_matching_status: Optional[str] = None
+    matched_edge_count: Optional[int] = None
+    ambiguous_edge_count: Optional[int] = None
 
 
 class GraphBuilder:

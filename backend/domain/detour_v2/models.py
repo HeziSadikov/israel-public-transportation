@@ -35,6 +35,12 @@ class AnchorPair:
     exit_shape_dist_m: float = 0.0
     rejoin_shape_dist_m: float = 0.0
     anchor_quality_note: Optional[str] = None
+    # Forward bearings along GTFS shape (or matched physical path) at exit/rejoin — used for Valhalla heading snap.
+    exit_forward_bearing_deg: Optional[float] = None
+    rejoin_forward_bearing_deg: Optional[float] = None
+    anchor_geometry_source: Optional[str] = None  # "gtfs_shape" | "matched_physical"
+    exit_osm_segment_id: Optional[int] = None
+    rejoin_osm_segment_id: Optional[int] = None
 
 
 @dataclass

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from backend.adapters.osm_detour import route_avoiding_polygon_alternates_debug
 
@@ -37,6 +37,8 @@ def generate_candidates_with_debug(
     blockage_geojson: Dict[str, Any],
     *,
     alternate_count: int = 2,
+    exit_heading_deg: Optional[float] = None,
+    rejoin_heading_deg: Optional[float] = None,
 ) -> Tuple[List[RoadCandidate], Dict[str, Any]]:
     """
     Produce named strategy candidates with compact no-candidate diagnostics.
@@ -49,6 +51,8 @@ def generate_candidates_with_debug(
         blockage_geojson,
         costing="bus",
         alternate_count=alternate_count,
+        exit_heading_deg=exit_heading_deg,
+        rejoin_heading_deg=rejoin_heading_deg,
     )
     out: List[RoadCandidate] = []
     filtered_success_false = 0

@@ -60,6 +60,8 @@ export function IncidentDetourV2Panel(props: Props) {
   const [message, setMessage] = useState<string | null>(null);
   const [lastResult, setLastResult] = useState<DetourV2ComputeResult | null>(null);
   const [showDiag, setShowDiag] = useState(false);
+  const [debugDetour, setDebugDetour] = useState(false);
+  const [useMatchedPhysical, setUseMatchedPhysical] = useState(false);
 
   const hasRouteOrTrip =
     !!props.selectedRoute?.route_id || tripId.trim().length > 0;
@@ -112,6 +114,8 @@ export function IncidentDetourV2Panel(props: Props) {
               blockage_geojson: props.blockageGeojson,
               incident_id: incidentId,
               persist: true as const,
+              debug_detour: debugDetour,
+              use_matched_physical: useMatchedPhysical,
             }
           : {
               service_date: props.startDateYmd,
@@ -119,6 +123,8 @@ export function IncidentDetourV2Panel(props: Props) {
               blockage_geojson: props.blockageGeojson,
               incident_id: incidentId,
               persist: true as const,
+              debug_detour: debugDetour,
+              use_matched_physical: useMatchedPhysical,
             };
       const r = await postDetourComputeV2(body);
       const first = (r.results?.[0] ?? null) as DetourV2ComputeResult | null;
@@ -161,6 +167,22 @@ export function IncidentDetourV2Panel(props: Props) {
           placeholder="Leave empty to use selected route"
           spellCheck={false}
         />
+      </label>
+      <label className="rail-label" style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 6 }}>
+        <input
+          type="checkbox"
+          checked={debugDetour}
+          onChange={(e) => setDebugDetour(e.target.checked)}
+        />
+        <span>Debug GeoJSON (anchors, shape, blockage layers in API response)</span>
+      </label>
+      <label className="rail-label" style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        <input
+          type="checkbox"
+          checked={useMatchedPhysical}
+          onChange={(e) => setUseMatchedPhysical(e.target.checked)}
+        />
+        <span>Use matched physical geometry (when PostGIS backfill exists)</span>
       </label>
       <div className="rail-buttons">
         <button type="button" disabled={loading || !props.blockageGeojson} onClick={handleIncident}>

@@ -1,0 +1,25 @@
+{
+  "id": "divided_road_placeholder",
+  "description": "Placeholder: replace with a real route where GTFS shape sits near the opposite carriageway. Blockage should intersect only the served direction.",
+  "route_id": "REPLACE_ROUTE",
+  "direction_id": "0",
+  "service_date": "20260420",
+  "blockage_geojson": {
+    "type": "Polygon",
+    "coordinates": [
+      [
+        [34.8, 32.08],
+        [34.801, 32.08],
+        [34.801, 32.081],
+        [34.8, 32.081],
+        [34.8, 32.08]
+      ]
+    ]
+  },
+  "expect": {
+    "blocked_gtfs_edge_keys": [],
+    "entry_segment_id": null,
+    "rejoin_segment_id": null,
+    "detour_valid": null
+  }
+}

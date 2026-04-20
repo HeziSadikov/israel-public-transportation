@@ -111,6 +111,19 @@ class ServicePolicy:
 
 
 @dataclass
+class PhysicalPathPolicy:
+    """Thresholds for persisted pattern-edge physical geometry (env: PHYSICAL_PATH_*)."""
+
+    min_trip_coverage_ratio: float = 0.72
+    max_ambiguous_stop_pairs: int = 2
+    min_summary_confidence: float = 0.35
+    max_mean_offset_m: float = 35.0
+    anchor_min_coverage_ratio: float = 0.72
+    max_weak_stop_pairs: int = 8
+    hard_reject_wrong_entry_exit_segment: bool = True
+
+
+@dataclass
 class SearchPolicy:
     # Parallel Valhalla calls: max concurrent requests per trip.
     valhalla_concurrency: int = 4
@@ -132,6 +145,7 @@ class DetourPolicyConfig:
     penalty: PenaltyPolicy = field(default_factory=PenaltyPolicy)
     service: ServicePolicy = field(default_factory=ServicePolicy)
     search: SearchPolicy = field(default_factory=SearchPolicy)
+    physical_path: PhysicalPathPolicy = field(default_factory=PhysicalPathPolicy)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -143,6 +157,7 @@ class DetourPolicyConfig:
             "penalty": self.penalty.__dict__,
             "service": self.service.__dict__,
             "search": self.search.__dict__,
+            "physical_path": self.physical_path.__dict__,
         }
 
 
@@ -151,9 +166,13 @@ def load_policy_from_json(path: Optional[str | Path] = None) -> DetourPolicyConf
     env_path = os.getenv("DETOUR_POLICY_JSON", "").strip()
     p = Path(path) if path else (Path(env_path) if env_path else None)
     if not p or not p.is_file():
-        return DetourPolicyConfig()
+        cfg = DetourPolicyConfig()
+        _apply_physical_path_env_overrides(cfg.physical_path)
+        return cfg
     raw = json.loads(p.read_text(encoding="utf-8"))
-    return _policy_from_flat_dict(raw)
+    cfg = _policy_from_flat_dict(raw)
+    _apply_physical_path_env_overrides(cfg.physical_path)
+    return cfg
 
 
 def _policy_from_flat_dict(raw: dict[str, Any]) -> DetourPolicyConfig:
@@ -169,6 +188,7 @@ def _policy_from_flat_dict(raw: dict[str, Any]) -> DetourPolicyConfig:
         (cfg.penalty, "penalty"),
         (cfg.service, "service"),
         (cfg.search, "search"),
+        (cfg.physical_path, "physical_path"),
     ):
         blob = raw.get(name)
         if isinstance(blob, dict):
@@ -176,6 +196,21 @@ def _policy_from_flat_dict(raw: dict[str, Any]) -> DetourPolicyConfig:
                 if hasattr(sub, k):
                     setattr(sub, k, type(getattr(sub, k))(v) if getattr(sub, k) is not None else v)
     return cfg
+
+
+def _apply_physical_path_env_overrides(pp: PhysicalPathPolicy) -> None:
+    """Apply PHYSICAL_PATH_* environment variables (see backend.infra.config)."""
+    try:
+        from backend.infra import config as _cfg
+    except Exception:
+        return
+    pp.min_trip_coverage_ratio = float(_cfg.PHYSICAL_PATH_MIN_TRIP_COVERAGE_RATIO)
+    pp.max_ambiguous_stop_pairs = int(_cfg.PHYSICAL_PATH_MAX_AMBIGUOUS_STOP_PAIRS)
+    pp.min_summary_confidence = float(_cfg.PHYSICAL_PATH_MIN_SUMMARY_CONFIDENCE)
+    pp.max_mean_offset_m = float(_cfg.PHYSICAL_PATH_MAX_MEAN_OFFSET_M)
+    pp.anchor_min_coverage_ratio = float(_cfg.PHYSICAL_PATH_ANCHOR_MIN_COVERAGE_RATIO)
+    pp.max_weak_stop_pairs = int(_cfg.PHYSICAL_PATH_MAX_WEAK_STOP_PAIRS)
+    pp.hard_reject_wrong_entry_exit_segment = bool(_cfg.PHYSICAL_PATH_HARD_REJECT_WRONG_ENTRY_EXIT_SEGMENT)
 
 
 def get_default_policy() -> DetourPolicyConfig:

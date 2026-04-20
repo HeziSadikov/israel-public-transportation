@@ -72,6 +72,8 @@ export type DetourV2ComputeResult = {
     served_stop_ids?: string[];
     stitch_ok?: boolean;
   } | null;
+  /** Present when debug_detour=true: layers for QGIS / inspection */
+  debug?: { geojson?: GeoJSON.FeatureCollection; candidate_generation?: unknown } | null;
 };
 
 export async function postDetourComputeV2(body: {
@@ -83,6 +85,8 @@ export async function postDetourComputeV2(body: {
   blockage_geojson: GeoJSON.Geometry;
   incident_id?: number | null;
   persist?: boolean;
+  debug_detour?: boolean;
+  use_matched_physical?: boolean;
 }): Promise<{ results: DetourV2ComputeResult[]; detour_request_ids: number[]; policy_version: string }> {
   const res = await axios.post(`${API_BASE}/detours/compute`, body);
   return res.data;

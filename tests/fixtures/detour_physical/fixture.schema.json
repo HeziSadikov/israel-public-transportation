@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DetourPhysicalFixture",
+  "type": "object",
+  "required": ["id", "description", "route_id", "service_date", "blockage_geojson", "expect"],
+  "properties": {
+    "id": { "type": "string" },
+    "description": { "type": "string" },
+    "route_id": { "type": "string" },
+    "direction_id": { "type": ["string", "integer", "null"] },
+    "service_date": { "type": "string", "pattern": "^[0-9]{8}$" },
+    "blockage_geojson": { "type": "object" },
+    "expect": {
+      "type": "object",
+      "properties": {
+        "blocked_gtfs_edge_keys": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["from_stop_sequence", "to_stop_sequence"],
+            "properties": {
+              "from_stop_sequence": { "type": "integer" },
+              "to_stop_sequence": { "type": "integer" }
+            }
+          }
+        },
+        "entry_segment_id": { "type": ["integer", "null"] },
+        "rejoin_segment_id": { "type": ["integer", "null"] },
+        "detour_valid": { "type": ["boolean", "null"] }
+      }
+    }
+  }
+}

@@ -482,6 +482,8 @@ export type MapLibreMapProps = {
     rejoinStopId?: string | null;
     skippedStopIds?: string[];
   } | null;
+  /** Optional debug lines from detour v2 `debug.geojson` (merged into same overlay source). */
+  detourV2DebugGeojson?: GeoJSON.FeatureCollection | null;
 };
 
 type StopRole = "first" | "last" | "middle" | "both";
@@ -533,6 +535,7 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
     onManualDetourLineChange,
     showAllRoutesLayer = false,
     detourV2Overlay = null,
+    detourV2DebugGeojson = null,
     allRoutesScope = "all",
     allRoutesStartDate = "",
     allRoutesStartTime = "",
@@ -867,6 +870,31 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
             "circle-color": "#3b82f6",
             "circle-stroke-color": "#1e40af",
             "circle-stroke-width": 2,
+          },
+        });
+        map.addLayer({
+          id: "detour-v2-debug-lines",
+          type: "line",
+          source: SOURCE_V2_OVERLAY,
+          filter: ["all", ["has", "layer"], ["==", ["geometry-type"], "LineString"]],
+          paint: {
+            "line-color": [
+              "match",
+              ["get", "layer"],
+              "matched_physical",
+              "#a855f7",
+              "gtfs_shape",
+              "#64748b",
+              "blocked_span_matched",
+              "#f97316",
+              "raw_valhalla_detour",
+              "#0ea5e9",
+              "decoded_detour",
+              "#22c55e",
+              "#94a3b8",
+            ],
+            "line-width": 3,
+            "line-opacity": 0.85,
           },
         });
       }
@@ -1444,13 +1472,18 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
     source.setData(normalizeToFeatureCollection(detour?.path_geojson ?? null) as any);
   }, [mapReady, detour]);
 
-  // E4: Update v2 overlay (anchor pins + skipped stops).
+  // E4: Update v2 overlay (anchor pins + skipped stops + optional debug lines).
   useEffect(() => {
     const map = mapRef.current;
     if (!map || !mapReady) return;
     const source = map.getSource("detour-v2-overlay") as maplibregl.GeoJSONSource | undefined;
     if (!source) return;
     const features: GeoJSONFeature[] = [];
+    if (detourV2DebugGeojson?.features?.length) {
+      for (const f of detourV2DebugGeojson.features) {
+        if (f && f.type === "Feature") features.push(f as GeoJSONFeature);
+      }
+    }
     const ov = detourV2Overlay;
     if (ov) {
       if (ov.exitLon != null && ov.exitLat != null) {
@@ -1480,7 +1513,7 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
       }
     }
     source.setData({ type: "FeatureCollection", features } as any);
-  }, [mapReady, detourV2Overlay, stops]);
+  }, [mapReady, detourV2Overlay, detourV2DebugGeojson, stops]);
 
   // Stops source data
   useEffect(() => {

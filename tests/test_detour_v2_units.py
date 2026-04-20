@@ -139,6 +139,18 @@ def test_detour_compute_v2_request_accepts_route_id_without_trip_ids():
     assert req.route_id == "R1"
 
 
+def test_detour_compute_v2_request_accepts_debug_flags():
+    req = DetourComputeV2Request(
+        service_date="20250101",
+        trip_ids=["t1"],
+        blockage_geojson=_MIN_POLY,
+        debug_detour=True,
+        use_matched_physical=True,
+    )
+    assert req.debug_detour is True
+    assert req.use_matched_physical is True
+
+
 def test_detour_compute_v2_request_rejects_empty_trip_and_route():
     with pytest.raises(ValidationError):
         DetourComputeV2Request(

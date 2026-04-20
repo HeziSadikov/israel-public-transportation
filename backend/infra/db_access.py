@@ -12,7 +12,7 @@ feed_versions.active indicates the current GTFS feed.
 """
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 # Optional[str] for direction_id in tuple keys (route_id, direction_id)
 RouteDirKey = Tuple[str, Optional[str]]
@@ -4411,6 +4411,918 @@ def _execute_split_ddl(conn, sql_text: str) -> None:
             if not stmt:
                 continue
             cur.execute(stmt + ";")
+
+
+def ensure_pattern_physical_layer_schema(conn=None) -> bool:
+    """
+    CREATE TABLE IF NOT EXISTS for pattern_edge / pattern_edge_match / detour_audit (physical OSM layer).
+    Safe when tables already exist.
+    """
+    if os.getenv("DETOUR_PHYSICAL_SCHEMA_ENSURE", "1").strip().lower() in ("0", "false", "no"):
+        return True
+    path = os.path.normpath(
+        os.path.join(os.path.dirname(__file__), "..", "sql", "migrations", "ensure_pattern_physical_layer.sql")
+    )
+    if not os.path.isfile(path):
+        return False
+    with open(path, encoding="utf-8") as f:
+        sql_text = f.read()
+    close = False
+    if conn is None:
+        conn = _get_conn()
+        close = True
+    try:
+        _execute_split_ddl(conn, sql_text)
+        conn.commit()
+        return True
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        if close:
+            conn.close()
+
+
+def get_pattern_edge_match_summary_for_stop_pair(
+    pattern_id: str,
+    from_stop_sequence: int,
+    to_stop_sequence: int,
+    conn=None,
+) -> Optional[Dict[str, Any]]:
+    """Return joined pattern_edge + match_summary row if physical layer is populated."""
+    close = False
+    if conn is None:
+        conn = _get_conn()
+        close = True
+    try:
+        feed_id = get_active_feed_id(conn)
+        with conn.cursor() as cur:
+            cur.execute("SELECT checksum FROM feed_versions WHERE id = %s", (feed_id,))
+            crow = cur.fetchone()
+            checksum = crow.get("checksum") if crow else None
+            feed_version = str(checksum) if checksum else str(feed_id)
+            cur.execute(
+                """
+                SELECT s.matched_geom, s.entry_segment_id, s.exit_segment_id,
+                       s.confidence, s.coverage_ratio, s.mean_offset_m,
+                       s.mean_heading_error_deg, s.is_ambiguous, s.match_version,
+                       pe.pattern_edge_id
+                FROM pattern_edge pe
+                JOIN pattern_edge_match_summary s ON s.pattern_edge_id = pe.pattern_edge_id
+                WHERE pe.feed_version = %s AND pe.pattern_id = %s
+                  AND pe.from_stop_sequence = %s AND pe.to_stop_sequence = %s
+                LIMIT 1
+                """,
+                (feed_version, pattern_id, from_stop_sequence, to_stop_sequence),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            return dict(row)
+    except Exception:
+        return None
+    finally:
+        if close:
+            conn.close()
+
+
+def get_pattern_id_for_trip(trip_id: str, conn=None) -> Optional[str]:
+    """Resolve pattern_id for a trip: repr_trip_id match first, else route+direction+shape."""
+    close = False
+    if conn is None:
+        conn = _get_conn()
+        close = True
+    try:
+        feed_id = get_active_feed_id(conn)
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT pattern_id FROM patterns
+                WHERE feed_id = %s AND repr_trip_id = %s
+                LIMIT 1
+                """,
+                (feed_id, trip_id),
+            )
+            row = cur.fetchone()
+            if row and row.get("pattern_id") is not None:
+                return str(row["pattern_id"])
+            cur.execute(
+                """
+                SELECT shape_id, route_id, direction_id FROM trips
+                WHERE feed_id = %s AND trip_id = %s
+                LIMIT 1
+                """,
+                (feed_id, trip_id),
+            )
+            trow = cur.fetchone()
+            if not trow:
+                return None
+            shape_id = trow.get("shape_id")
+            route_id = trow.get("route_id")
+            if not shape_id or not route_id:
+                return None
+            dir_id = trow.get("direction_id")
+            cur.execute(
+                """
+                SELECT pattern_id FROM patterns
+                WHERE feed_id = %s AND route_id = %s AND repr_shape_id = %s
+                  AND (direction_id IS NOT DISTINCT FROM %s)
+                LIMIT 1
+                """,
+                (feed_id, str(route_id), str(shape_id), dir_id),
+            )
+            prow = cur.fetchone()
+            if not prow or prow.get("pattern_id") is None:
+                return None
+            return str(prow["pattern_id"])
+    finally:
+        if close:
+            conn.close()
+
+
+def get_active_feed_version_key(conn=None) -> str:
+    """Same feed_version string as pattern_edge / get_pattern_edge_match_summary_for_stop_pair."""
+    close = False
+    if conn is None:
+        conn = _get_conn()
+        close = True
+    try:
+        feed_id = get_active_feed_id(conn)
+        with conn.cursor() as cur:
+            cur.execute("SELECT checksum FROM feed_versions WHERE id = %s", (feed_id,))
+            crow = cur.fetchone()
+            checksum = crow.get("checksum") if crow else None
+            return str(checksum) if checksum else str(feed_id)
+    finally:
+        if close:
+            conn.close()
+
+
+def fetch_pattern_edge_summaries_for_trip_ordered(
+    trip_id: str, conn=None
+) -> Tuple[List[Dict[str, Any]], int]:
+    """
+    Ordered stop-pair summaries aligned to trip stop_times (consecutive pairs).
+    Missing pairs appear as empty dicts so callers can compute coverage gaps.
+    Returns (ordered_rows, pair_count_expected).
+    """
+    close = False
+    if conn is None:
+        conn = _get_conn()
+        close = True
+    try:
+        pattern_id = get_pattern_id_for_trip(trip_id, conn)
+        if not pattern_id:
+            return [], 0
+        stop_rows = get_stop_times_for_trip(trip_id, conn)
+        if len(stop_rows) < 2:
+            return [], 0
+        feed_version = get_active_feed_version_key(conn)
+        pairs: List[Tuple[int, int]] = []
+        for i in range(len(stop_rows) - 1):
+            a = stop_rows[i]
+            b = stop_rows[i + 1]
+            pairs.append((int(a["stop_sequence"]), int(b["stop_sequence"])))
+        pair_count = len(pairs)
+        if not pairs:
+            return [], 0
+        flat: List[Any] = []
+        for a, b in pairs:
+            flat.extend([a, b])
+        placeholders = ",".join(["(%s,%s)"] * len(pairs))
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT s.matched_geom, s.entry_segment_id, s.exit_segment_id,
+                       s.confidence, s.coverage_ratio, s.mean_offset_m,
+                       s.mean_heading_error_deg, s.is_ambiguous, s.match_version,
+                       pe.pattern_edge_id, pe.from_stop_sequence, pe.to_stop_sequence
+                FROM pattern_edge pe
+                JOIN pattern_edge_match_summary s ON s.pattern_edge_id = pe.pattern_edge_id
+                WHERE pe.feed_version = %s AND pe.pattern_id = %s
+                  AND (pe.from_stop_sequence, pe.to_stop_sequence) IN ({placeholders})
+                """,
+                (feed_version, pattern_id, *flat),
+            )
+            fetched = cur.fetchall()
+        by_pair: Dict[Tuple[int, int], Dict[str, Any]] = {}
+        for r in fetched or []:
+            d = dict(r)
+            key = (int(d["from_stop_sequence"]), int(d["to_stop_sequence"]))
+            by_pair[key] = d
+        ordered: List[Dict[str, Any]] = [by_pair.get(p, {}) for p in pairs]
+        return ordered, pair_count
+    finally:
+        if close:
+            conn.close()
+
+
+def upsert_osm_road_segment(
+    *,
+    osm_way_id: int,
+    from_node_id: int,
+    to_node_id: int,
+    geom_wkt: str,
+    length_m: Optional[float] = None,
+    highway: Optional[str] = None,
+    conn=None,
+) -> int:
+    """Insert or return existing segment_id for (way, from_node, to_node)."""
+    close = False
+    if conn is None:
+        conn = _get_conn()
+        close = True
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT segment_id FROM osm_road_segments
+                WHERE osm_way_id = %s AND from_node_id = %s AND to_node_id = %s
+                LIMIT 1
+                """,
+                (osm_way_id, from_node_id, to_node_id),
+            )
+            ex = cur.fetchone()
+            if ex and ex.get("segment_id") is not None:
+                sid = int(ex["segment_id"])
+                if close:
+                    conn.commit()
+                return sid
+            cur.execute(
+                """
+                INSERT INTO osm_road_segments
+                  (osm_way_id, from_node_id, to_node_id, geom, length_m, highway)
+                VALUES (%s, %s, %s, ST_GeomFromText(%s, 4326), %s, %s)
+                RETURNING segment_id
+                """,
+                (osm_way_id, from_node_id, to_node_id, geom_wkt, length_m, highway),
+            )
+            row = cur.fetchone()
+        if close:
+            conn.commit()
+        if not row:
+            raise RuntimeError("upsert_osm_road_segment: insert returned no row")
+        return int(row["segment_id"])
+    except Exception:
+        if close:
+            conn.rollback()
+        raise
+    finally:
+        if close:
+            conn.close()
+
+
+def upsert_pattern_edge_row(
+    *,
+    feed_version: str,
+    pattern_id: str,
+    route_id: str,
+    direction_id: Optional[int],
+    from_stop_id: str,
+    to_stop_id: str,
+    from_stop_sequence: int,
+    to_stop_sequence: int,
+    representative_trip_id: Optional[str],
+    representative_shape_id: Optional[str],
+    gtfs_geom_wkt: Optional[str],
+    gtfs_length_m: Optional[float],
+    conn=None,
+) -> int:
+    close = False
+    if conn is None:
+        conn = _get_conn()
+        close = True
+    try:
+        with conn.cursor() as cur:
+            if gtfs_geom_wkt:
+                cur.execute(
+                    """
+                    INSERT INTO pattern_edge (
+                      feed_version, pattern_id, route_id, direction_id,
+                      from_stop_id, to_stop_id, from_stop_sequence, to_stop_sequence,
+                      representative_trip_id, representative_shape_id, gtfs_geom, gtfs_length_m
+                    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, ST_GeomFromText(%s,4326), %s)
+                    ON CONFLICT (feed_version, pattern_id, from_stop_sequence, to_stop_sequence)
+                    DO UPDATE SET
+                      route_id = EXCLUDED.route_id,
+                      direction_id = EXCLUDED.direction_id,
+                      from_stop_id = EXCLUDED.from_stop_id,
+                      to_stop_id = EXCLUDED.to_stop_id,
+                      representative_trip_id = EXCLUDED.representative_trip_id,
+                      representative_shape_id = EXCLUDED.representative_shape_id,
+                      gtfs_geom = EXCLUDED.gtfs_geom,
+                      gtfs_length_m = EXCLUDED.gtfs_length_m
+                    RETURNING pattern_edge_id
+                    """,
+                    (
+                        feed_version,
+                        pattern_id,
+                        route_id,
+                        direction_id,
+                        from_stop_id,
+                        to_stop_id,
+                        from_stop_sequence,
+                        to_stop_sequence,
+                        representative_trip_id,
+                        representative_shape_id,
+                        gtfs_geom_wkt,
+                        gtfs_length_m,
+                    ),
+                )
+            else:
+                cur.execute(
+                    """
+                    INSERT INTO pattern_edge (
+                      feed_version, pattern_id, route_id, direction_id,
+                      from_stop_id, to_stop_id, from_stop_sequence, to_stop_sequence,
+                      representative_trip_id, representative_shape_id, gtfs_geom, gtfs_length_m
+                    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, NULL, %s)
+                    ON CONFLICT (feed_version, pattern_id, from_stop_sequence, to_stop_sequence)
+                    DO UPDATE SET
+                      route_id = EXCLUDED.route_id,
+                      direction_id = EXCLUDED.direction_id,
+                      from_stop_id = EXCLUDED.from_stop_id,
+                      to_stop_id = EXCLUDED.to_stop_id,
+                      representative_trip_id = EXCLUDED.representative_trip_id,
+                      representative_shape_id = EXCLUDED.representative_shape_id,
+                      gtfs_length_m = EXCLUDED.gtfs_length_m
+                    RETURNING pattern_edge_id
+                    """,
+                    (
+                        feed_version,
+                        pattern_id,
+                        route_id,
+                        direction_id,
+                        from_stop_id,
+                        to_stop_id,
+                        from_stop_sequence,
+                        to_stop_sequence,
+                        representative_trip_id,
+                        representative_shape_id,
+                        gtfs_length_m,
+                    ),
+                )
+            row = cur.fetchone()
+        if close:
+            conn.commit()
+        if not row:
+            raise RuntimeError("upsert_pattern_edge_row: insert returned no row")
+        return int(row["pattern_edge_id"])
+    except Exception:
+        if close:
+            conn.rollback()
+        raise
+    finally:
+        if close:
+            conn.close()
+
+
+def replace_pattern_edge_matches(
+    pattern_edge_id: int,
+    rows: List[Dict[str, Any]],
+    conn=None,
+) -> None:
+    """rows: ordinal, segment_id, segment_forward, offset_mean_m, heading_error_deg."""
+    close = False
+    if conn is None:
+        conn = _get_conn()
+        close = True
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM pattern_edge_match WHERE pattern_edge_id = %s", (pattern_edge_id,))
+            for r in rows:
+                cur.execute(
+                    """
+                    INSERT INTO pattern_edge_match (
+                      pattern_edge_id, ordinal, segment_id, segment_forward,
+                      offset_mean_m, heading_error_deg
+                    ) VALUES (%s,%s,%s,%s,%s,%s)
+                    """,
+                    (
+                        pattern_edge_id,
+                        int(r["ordinal"]),
+                        int(r["segment_id"]),
+                        bool(r.get("segment_forward", True)),
+                        r.get("offset_mean_m"),
+                        r.get("heading_error_deg"),
+                    ),
+                )
+        if close:
+            conn.commit()
+    except Exception:
+        if close:
+            conn.rollback()
+        raise
+    finally:
+        if close:
+            conn.close()
+
+
+def upsert_pattern_edge_match_summary_row(
+    pattern_edge_id: int,
+    *,
+    matched_geom_wkt: Optional[str],
+    entry_segment_id: Optional[int],
+    exit_segment_id: Optional[int],
+    confidence: Optional[float],
+    coverage_ratio: Optional[float],
+    mean_offset_m: Optional[float],
+    mean_heading_error_deg: Optional[float],
+    is_ambiguous: bool,
+    match_version: Optional[str],
+    conn=None,
+) -> None:
+    close = False
+    if conn is None:
+        conn = _get_conn()
+        close = True
+    try:
+        with conn.cursor() as cur:
+            if matched_geom_wkt:
+                cur.execute(
+                    """
+                    INSERT INTO pattern_edge_match_summary (
+                      pattern_edge_id, matched_geom, entry_segment_id, exit_segment_id,
+                      confidence, coverage_ratio, mean_offset_m, mean_heading_error_deg,
+                      is_ambiguous, match_version
+                    ) VALUES (%s, ST_GeomFromText(%s,4326), %s,%s,%s,%s,%s,%s,%s,%s)
+                    ON CONFLICT (pattern_edge_id) DO UPDATE SET
+                      matched_geom = EXCLUDED.matched_geom,
+                      entry_segment_id = EXCLUDED.entry_segment_id,
+                      exit_segment_id = EXCLUDED.exit_segment_id,
+                      confidence = EXCLUDED.confidence,
+                      coverage_ratio = EXCLUDED.coverage_ratio,
+                      mean_offset_m = EXCLUDED.mean_offset_m,
+                      mean_heading_error_deg = EXCLUDED.mean_heading_error_deg,
+                      is_ambiguous = EXCLUDED.is_ambiguous,
+                      match_version = EXCLUDED.match_version
+                    """,
+                    (
+                        pattern_edge_id,
+                        matched_geom_wkt,
+                        entry_segment_id,
+                        exit_segment_id,
+                        confidence,
+                        coverage_ratio,
+                        mean_offset_m,
+                        mean_heading_error_deg,
+                        is_ambiguous,
+                        match_version,
+                    ),
+                )
+            else:
+                cur.execute(
+                    """
+                    INSERT INTO pattern_edge_match_summary (
+                      pattern_edge_id, matched_geom, entry_segment_id, exit_segment_id,
+                      confidence, coverage_ratio, mean_offset_m, mean_heading_error_deg,
+                      is_ambiguous, match_version
+                    ) VALUES (%s, NULL, %s,%s,%s,%s,%s,%s,%s,%s)
+                    ON CONFLICT (pattern_edge_id) DO UPDATE SET
+                      matched_geom = EXCLUDED.matched_geom,
+                      entry_segment_id = EXCLUDED.entry_segment_id,
+                      exit_segment_id = EXCLUDED.exit_segment_id,
+                      confidence = EXCLUDED.confidence,
+                      coverage_ratio = EXCLUDED.coverage_ratio,
+                      mean_offset_m = EXCLUDED.mean_offset_m,
+                      mean_heading_error_deg = EXCLUDED.mean_heading_error_deg,
+                      is_ambiguous = EXCLUDED.is_ambiguous,
+                      match_version = EXCLUDED.match_version
+                    """,
+                    (
+                        pattern_edge_id,
+                        entry_segment_id,
+                        exit_segment_id,
+                        confidence,
+                        coverage_ratio,
+                        mean_offset_m,
+                        mean_heading_error_deg,
+                        is_ambiguous,
+                        match_version,
+                    ),
+                )
+        if close:
+            conn.commit()
+    except Exception:
+        if close:
+            conn.rollback()
+        raise
+    finally:
+        if close:
+            conn.close()
+
+
+def count_pattern_edge_summaries_with_match_version(
+    conn,
+    feed_version: str,
+    pattern_id: str,
+    match_version: str,
+) -> int:
+    """How many pattern legs have a summary row with the given match_version."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT COUNT(*)::int AS c
+            FROM pattern_edge pe
+            JOIN pattern_edge_match_summary s ON s.pattern_edge_id = pe.pattern_edge_id
+            WHERE pe.feed_version = %s AND pe.pattern_id = %s AND s.match_version = %s
+            """,
+            (feed_version, pattern_id, match_version),
+        )
+        row = cur.fetchone()
+        return int(row["c"]) if row and row.get("c") is not None else 0
+
+
+def list_pattern_edge_pairs_with_match_version(
+    conn,
+    feed_version: str,
+    pattern_id: str,
+    match_version: str,
+    *,
+    accept_ambiguous: bool = False,
+) -> Set[Tuple[int, int]]:
+    """
+    (from_stop_sequence, to_stop_sequence) pairs that already have the given match_version.
+
+    By default, legs marked is_ambiguous on the summary are NOT counted, so backfill will
+    retry them. Pass accept_ambiguous=True to treat ambiguous matches as satisfied (legacy).
+    """
+    with conn.cursor() as cur:
+        base = """
+            SELECT pe.from_stop_sequence, pe.to_stop_sequence
+            FROM pattern_edge pe
+            JOIN pattern_edge_match_summary s ON s.pattern_edge_id = pe.pattern_edge_id
+            WHERE pe.feed_version = %s AND pe.pattern_id = %s AND s.match_version = %s
+            """
+        if not accept_ambiguous:
+            base += " AND s.is_ambiguous = FALSE"
+        cur.execute(base, (feed_version, pattern_id, match_version))
+        out: Set[Tuple[int, int]] = set()
+        for r in cur.fetchall() or []:
+            out.add((int(r["from_stop_sequence"]), int(r["to_stop_sequence"])))
+        return out
+
+
+def bulk_upsert_osm_road_segments(
+    rows: List[Dict[str, Any]],
+    conn,
+) -> Dict[Tuple[int, int, int], int]:
+    """
+    Resolve segment_id for each (osm_way_id, from_node_id, to_node_id). conn must not auto-commit.
+    rows: dicts with keys osm_way_id, from_node_id, to_node_id, geom_wkt, length_m, highway.
+    """
+    from psycopg2.extras import execute_values
+
+    if not rows:
+        return {}
+    seen: Dict[Tuple[int, int, int], Dict[str, Any]] = {}
+    for r in rows:
+        key = (int(r["osm_way_id"]), int(r["from_node_id"]), int(r["to_node_id"]))
+        if key not in seen:
+            seen[key] = r
+    mapping: Dict[Tuple[int, int, int], int] = {}
+    keys_list = list(seen.keys())
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT osm_way_id, from_node_id, to_node_id, segment_id
+            FROM osm_road_segments
+            WHERE (osm_way_id, from_node_id, to_node_id) IN %s
+            """,
+            (tuple(keys_list),),
+        )
+        for r in cur.fetchall() or []:
+            k = (int(r["osm_way_id"]), int(r["from_node_id"]), int(r["to_node_id"]))
+            mapping[k] = int(r["segment_id"])
+    missing_keys = [k for k in keys_list if k not in mapping]
+    if not missing_keys:
+        return mapping
+    to_insert = [seen[k] for k in missing_keys]
+    tpls = [
+        (
+            int(r["osm_way_id"]),
+            int(r["from_node_id"]),
+            int(r["to_node_id"]),
+            str(r["geom_wkt"]),
+            r.get("length_m"),
+            r.get("highway"),
+        )
+        for r in to_insert
+    ]
+    with conn.cursor() as cur:
+        execute_values(
+            cur,
+            """
+            INSERT INTO osm_road_segments (osm_way_id, from_node_id, to_node_id, geom, length_m, highway)
+            VALUES %s
+            RETURNING osm_way_id, from_node_id, to_node_id, segment_id
+            """,
+            tpls,
+        )
+        for r in cur.fetchall() or []:
+            k = (int(r["osm_way_id"]), int(r["from_node_id"]), int(r["to_node_id"]))
+            mapping[k] = int(r["segment_id"])
+    return mapping
+
+
+def bulk_upsert_pattern_edge_rows(
+    rows: List[Dict[str, Any]],
+    conn,
+) -> Dict[Tuple[int, int], int]:
+    """
+    Bulk upsert pattern_edge rows. Each dict: feed_version, pattern_id, route_id, direction_id,
+    from_stop_id, to_stop_id, from_stop_sequence, to_stop_sequence,
+    representative_trip_id, representative_shape_id, gtfs_geom_wkt, gtfs_length_m.
+    Returns (from_stop_sequence, to_stop_sequence) -> pattern_edge_id.
+    """
+    from psycopg2.extras import execute_values
+
+    if not rows:
+        return {}
+    out: Dict[Tuple[int, int], int] = {}
+    with_geom: List[Dict[str, Any]] = []
+    without_geom: List[Dict[str, Any]] = []
+    for r in rows:
+        if r.get("gtfs_geom_wkt"):
+            with_geom.append(r)
+        else:
+            without_geom.append(r)
+    with conn.cursor() as cur:
+        if with_geom:
+            tpls = [
+                (
+                    r["feed_version"],
+                    r["pattern_id"],
+                    r["route_id"],
+                    r.get("direction_id"),
+                    r["from_stop_id"],
+                    r["to_stop_id"],
+                    int(r["from_stop_sequence"]),
+                    int(r["to_stop_sequence"]),
+                    r.get("representative_trip_id"),
+                    r.get("representative_shape_id"),
+                    str(r["gtfs_geom_wkt"]),
+                    r.get("gtfs_length_m"),
+                )
+                for r in with_geom
+            ]
+            execute_values(
+                cur,
+                """
+                INSERT INTO pattern_edge (
+                  feed_version, pattern_id, route_id, direction_id,
+                  from_stop_id, to_stop_id, from_stop_sequence, to_stop_sequence,
+                  representative_trip_id, representative_shape_id, gtfs_geom, gtfs_length_m
+                ) VALUES %s
+                ON CONFLICT (feed_version, pattern_id, from_stop_sequence, to_stop_sequence)
+                DO UPDATE SET
+                  route_id = EXCLUDED.route_id,
+                  direction_id = EXCLUDED.direction_id,
+                  from_stop_id = EXCLUDED.from_stop_id,
+                  to_stop_id = EXCLUDED.to_stop_id,
+                  representative_trip_id = EXCLUDED.representative_trip_id,
+                  representative_shape_id = EXCLUDED.representative_shape_id,
+                  gtfs_geom = EXCLUDED.gtfs_geom,
+                  gtfs_length_m = EXCLUDED.gtfs_length_m
+                RETURNING pattern_edge_id, from_stop_sequence, to_stop_sequence
+                """,
+                tpls,
+                template="(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, ST_GeomFromText(%s,4326), %s)",
+            )
+            for r in cur.fetchall() or []:
+                out[(int(r["from_stop_sequence"]), int(r["to_stop_sequence"]))] = int(r["pattern_edge_id"])
+        if without_geom:
+            tpls = [
+                (
+                    r["feed_version"],
+                    r["pattern_id"],
+                    r["route_id"],
+                    r.get("direction_id"),
+                    r["from_stop_id"],
+                    r["to_stop_id"],
+                    int(r["from_stop_sequence"]),
+                    int(r["to_stop_sequence"]),
+                    r.get("representative_trip_id"),
+                    r.get("representative_shape_id"),
+                    r.get("gtfs_length_m"),
+                )
+                for r in without_geom
+            ]
+            execute_values(
+                cur,
+                """
+                INSERT INTO pattern_edge (
+                  feed_version, pattern_id, route_id, direction_id,
+                  from_stop_id, to_stop_id, from_stop_sequence, to_stop_sequence,
+                  representative_trip_id, representative_shape_id, gtfs_geom, gtfs_length_m
+                ) VALUES %s
+                ON CONFLICT (feed_version, pattern_id, from_stop_sequence, to_stop_sequence)
+                DO UPDATE SET
+                  route_id = EXCLUDED.route_id,
+                  direction_id = EXCLUDED.direction_id,
+                  from_stop_id = EXCLUDED.from_stop_id,
+                  to_stop_id = EXCLUDED.to_stop_id,
+                  representative_trip_id = EXCLUDED.representative_trip_id,
+                  representative_shape_id = EXCLUDED.representative_shape_id,
+                  gtfs_length_m = EXCLUDED.gtfs_length_m
+                RETURNING pattern_edge_id, from_stop_sequence, to_stop_sequence
+                """,
+                tpls,
+            )
+            for r in cur.fetchall() or []:
+                out[(int(r["from_stop_sequence"]), int(r["to_stop_sequence"]))] = int(r["pattern_edge_id"])
+    return out
+
+
+def bulk_delete_and_insert_pattern_edge_matches(
+    match_rows: List[Tuple[int, Dict[str, Any]]],
+    conn,
+) -> None:
+    """
+    For each pattern_edge_id, delete existing matches then insert new rows.
+    match_rows: (pattern_edge_id, row_dict with ordinal, segment_id, segment_forward, offset_mean_m, heading_error_deg).
+    """
+    from psycopg2.extras import execute_values
+
+    if not match_rows:
+        return
+    by_pe: Dict[int, List[Dict[str, Any]]] = {}
+    for peid, row in match_rows:
+        by_pe.setdefault(int(peid), []).append(row)
+    peids = list(by_pe.keys())
+    flat: List[Tuple[Any, ...]] = []
+    for peid, rows in by_pe.items():
+        for r in rows:
+            flat.append(
+                (
+                    peid,
+                    int(r["ordinal"]),
+                    int(r["segment_id"]),
+                    bool(r.get("segment_forward", True)),
+                    r.get("offset_mean_m"),
+                    r.get("heading_error_deg"),
+                )
+            )
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM pattern_edge_match WHERE pattern_edge_id = ANY(%s)", (peids,))
+        if flat:
+            execute_values(
+                cur,
+                """
+                INSERT INTO pattern_edge_match (
+                  pattern_edge_id, ordinal, segment_id, segment_forward,
+                  offset_mean_m, heading_error_deg
+                ) VALUES %s
+                """,
+                flat,
+            )
+
+
+def bulk_upsert_pattern_edge_match_summaries(
+    rows: List[Dict[str, Any]],
+    conn,
+) -> None:
+    """Each dict: pattern_edge_id, matched_geom_wkt, entry_segment_id, exit_segment_id, confidence,
+    coverage_ratio, mean_offset_m, mean_heading_error_deg, is_ambiguous, match_version."""
+    from psycopg2.extras import execute_values
+
+    if not rows:
+        return
+    with_wkt: List[Dict[str, Any]] = []
+    no_wkt: List[Dict[str, Any]] = []
+    for r in rows:
+        if r.get("matched_geom_wkt"):
+            with_wkt.append(r)
+        else:
+            no_wkt.append(r)
+    with conn.cursor() as cur:
+        if with_wkt:
+            tpls = [
+                (
+                    int(r["pattern_edge_id"]),
+                    str(r["matched_geom_wkt"]),
+                    r.get("entry_segment_id"),
+                    r.get("exit_segment_id"),
+                    r.get("confidence"),
+                    r.get("coverage_ratio"),
+                    r.get("mean_offset_m"),
+                    r.get("mean_heading_error_deg"),
+                    bool(r.get("is_ambiguous", False)),
+                    r.get("match_version"),
+                )
+                for r in with_wkt
+            ]
+            execute_values(
+                cur,
+                """
+                INSERT INTO pattern_edge_match_summary (
+                  pattern_edge_id, matched_geom, entry_segment_id, exit_segment_id,
+                  confidence, coverage_ratio, mean_offset_m, mean_heading_error_deg,
+                  is_ambiguous, match_version
+                ) VALUES %s
+                ON CONFLICT (pattern_edge_id) DO UPDATE SET
+                  matched_geom = EXCLUDED.matched_geom,
+                  entry_segment_id = EXCLUDED.entry_segment_id,
+                  exit_segment_id = EXCLUDED.exit_segment_id,
+                  confidence = EXCLUDED.confidence,
+                  coverage_ratio = EXCLUDED.coverage_ratio,
+                  mean_offset_m = EXCLUDED.mean_offset_m,
+                  mean_heading_error_deg = EXCLUDED.mean_heading_error_deg,
+                  is_ambiguous = EXCLUDED.is_ambiguous,
+                  match_version = EXCLUDED.match_version
+                """,
+                tpls,
+                template="(%s, ST_GeomFromText(%s,4326), %s,%s,%s,%s,%s,%s,%s,%s)",
+            )
+        if no_wkt:
+            tpls = [
+                (
+                    int(r["pattern_edge_id"]),
+                    r.get("entry_segment_id"),
+                    r.get("exit_segment_id"),
+                    r.get("confidence"),
+                    r.get("coverage_ratio"),
+                    r.get("mean_offset_m"),
+                    r.get("mean_heading_error_deg"),
+                    bool(r.get("is_ambiguous", False)),
+                    r.get("match_version"),
+                )
+                for r in no_wkt
+            ]
+            execute_values(
+                cur,
+                """
+                INSERT INTO pattern_edge_match_summary (
+                  pattern_edge_id, matched_geom, entry_segment_id, exit_segment_id,
+                  confidence, coverage_ratio, mean_offset_m, mean_heading_error_deg,
+                  is_ambiguous, match_version
+                ) VALUES %s
+                ON CONFLICT (pattern_edge_id) DO UPDATE SET
+                  matched_geom = EXCLUDED.matched_geom,
+                  entry_segment_id = EXCLUDED.entry_segment_id,
+                  exit_segment_id = EXCLUDED.exit_segment_id,
+                  confidence = EXCLUDED.confidence,
+                  coverage_ratio = EXCLUDED.coverage_ratio,
+                  mean_offset_m = EXCLUDED.mean_offset_m,
+                  mean_heading_error_deg = EXCLUDED.mean_heading_error_deg,
+                  is_ambiguous = EXCLUDED.is_ambiguous,
+                  match_version = EXCLUDED.match_version
+                """,
+                tpls,
+                template="(%s, NULL, %s,%s,%s,%s,%s,%s,%s,%s)",
+            )
+
+
+def insert_detour_audit_row(
+    *,
+    detour_id: str,
+    request_hash: Optional[str] = None,
+    route_id: Optional[str] = None,
+    direction_id: Optional[int] = None,
+    trip_id: Optional[str] = None,
+    entry_segment_id: Optional[int] = None,
+    rejoin_segment_id: Optional[int] = None,
+    validation_status: Optional[str] = None,
+    validation_reason: Optional[str] = None,
+    debug_json: Optional[Dict[str, Any]] = None,
+    conn=None,
+) -> None:
+    close = False
+    if conn is None:
+        conn = _get_conn()
+        close = True
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO detour_audit (
+                  detour_id, request_hash, route_id, direction_id, trip_id,
+                  entry_segment_id, rejoin_segment_id,
+                  validation_status, validation_reason, debug_json
+                ) VALUES (%s::uuid, %s,%s,%s,%s,%s,%s,%s,%s, %s::jsonb)
+                """,
+                (
+                    detour_id,
+                    request_hash,
+                    route_id,
+                    direction_id,
+                    trip_id,
+                    entry_segment_id,
+                    rejoin_segment_id,
+                    validation_status,
+                    validation_reason,
+                    json.dumps(debug_json) if debug_json is not None else None,
+                ),
+            )
+        if close:
+            conn.commit()
+    except Exception:
+        if close:
+            conn.rollback()
+        raise
+    finally:
+        if close:
+            conn.close()
 
 
 def ensure_detour_v2_support_schema(conn=None) -> bool:

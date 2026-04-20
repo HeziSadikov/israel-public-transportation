@@ -294,6 +294,22 @@ class DetourComputeV2Request(BaseModel):
     persist: bool = True
     route_id: Optional[str] = None
     direction_id: Optional[str] = None
+    detour_debug: bool = Field(
+        default=False,
+        description=(
+            "When true: include debug GeoJSON in the response and emit one structured detours/v2/compute_ai log line per trip "
+            "(same as debug_detour plus log_ai_summary). Prefer this over the legacy flags. "
+            "For AI logs on every compute without GeoJSON, start the API with DETOUR_V2_DEBUG=1 "
+            "(bash/zsh: DETOUR_V2_DEBUG=1 python -m run_uvicorn; PowerShell: $env:DETOUR_V2_DEBUG='1'; python -m run_uvicorn) "
+            "or python -m run_uvicorn --detour-debug."
+        ),
+    )
+    # Legacy: GeoJSON only — prefer detour_debug.
+    debug_detour: bool = False
+    # Legacy: compute_ai log only — prefer detour_debug (or DETOUR_V2_DEBUG / --detour-debug for global log-only).
+    log_ai_summary: bool = False
+    # Prefer PostGIS matched physical geometry when backfilled (USE_MATCHED_PHYSICAL_GEOMETRY also gates this).
+    use_matched_physical: bool = False
 
     @model_validator(mode="after")
     def trip_ids_or_route_id(self) -> "DetourComputeV2Request":

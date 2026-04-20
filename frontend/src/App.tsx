@@ -209,6 +209,7 @@ const App: React.FC = () => {
     exitStopId?: string | null; rejoinStopId?: string | null;
     skippedStopIds?: string[];
   } | null>(null);
+  const [detourV2DebugGeojson, setDetourV2DebugGeojson] = useState<GeoJSON.FeatureCollection | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [feedCalendarNotice, setFeedCalendarNotice] = useState<string | null>(null);
   const [feedCalMin, setFeedCalMin] = useState<number | null>(null);
@@ -738,6 +739,7 @@ const App: React.FC = () => {
     if (!result) {
       setDetour(null);
       setDetourV2Overlay(null);
+      setDetourV2DebugGeojson(null);
       return;
     }
     const mapped = mapV2ResultToDetour(result);
@@ -763,6 +765,12 @@ const App: React.FC = () => {
       });
     } else {
       setDetourV2Overlay(null);
+    }
+    const dbg = result.debug?.geojson;
+    if (dbg && dbg.type === "FeatureCollection") {
+      setDetourV2DebugGeojson(dbg as GeoJSON.FeatureCollection);
+    } else {
+      setDetourV2DebugGeojson(null);
     }
   };
 
@@ -1585,6 +1593,7 @@ const App: React.FC = () => {
           showRoutesHeatLayer={showRoutesHeatLayer}
           allRoutesRenderMode={allRoutesRenderMode}
           detourV2Overlay={detourV2Overlay}
+          detourV2DebugGeojson={detourV2DebugGeojson}
         />
         {explorerOpen && (
           <ExplorerWindow
