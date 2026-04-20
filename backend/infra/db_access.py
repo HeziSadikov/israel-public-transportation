@@ -25,15 +25,18 @@ import time
 import psycopg2
 from psycopg2.extras import DictCursor
 
+from backend.infra.logging_utils import log
+
 
 # In containers and most environments we prefer an explicit DATABASE_URL.
 # For backward compatibility with the existing Windows setup, fall back to
 # the previous localhost DSN if the env var is not set.
 DB_URL = os.getenv("DATABASE_URL", "postgresql://postgres@localhost:5432/israel_gtfs")
 STOP_ROUTES_STATEMENT_TIMEOUT_MS = int(os.getenv("STOP_ROUTES_STATEMENT_TIMEOUT_MS", "90000"))
-# Area polygon search can be heavy on full national feeds. 0 = no PostgreSQL limit (override server
-# default); cap long runs with the HTTP client or set AREA_ROUTES_STATEMENT_TIMEOUT_MS to e.g. 600000.
+# Area polygon search can be heavy on full national feeds. 0 = no PostgreSQL statement limit.
+# Set AREA_ROUTES_STATEMENT_TIMEOUT_MS to e.g. 180000 to cap long queries (milliseconds).
 AREA_ROUTES_STATEMENT_TIMEOUT_MS = int(os.getenv("AREA_ROUTES_STATEMENT_TIMEOUT_MS", "0"))
+ROUTES_TILE_STATEMENT_TIMEOUT_MS = int(os.getenv("ROUTES_TILE_STATEMENT_TIMEOUT_MS", "15000"))
 
 
 class StopRoutesQueryTimeoutError(RuntimeError):
@@ -126,10 +129,17 @@ def get_routes_in_polygon(
         close = True
     try:
         feed_id = get_active_feed_id(conn)
+        log(
+            "area/routes",
+            f"phase=pg_single_day_begin feed_id={feed_id} date={date_ymd} "
+            f"time_window_sec={start_sec}-{end_sec} wkt_chars={len(polygon_wkt)} "
+            f"statement_timeout_ms={AREA_ROUTES_STATEMENT_TIMEOUT_MS}",
+        )
         with conn.cursor() as cur:
             cur.execute(
                 "SET LOCAL statement_timeout = %s", (AREA_ROUTES_STATEMENT_TIMEOUT_MS,)
             )
+            t_exec = time.perf_counter()
             cur.execute(
                 """
                 WITH active_services AS (
@@ -153,7 +163,7 @@ def get_routes_in_polygon(
                       AND cd.date = %s
                       AND cd.exception_type = 1
                 ),
-                shapes_in_area AS (
+                shapes_in_area AS MATERIALIZED (
                     SELECT sl.feed_id, sl.shape_id
                     FROM shapes_lines sl
                     WHERE sl.feed_id = %s
@@ -226,8 +236,17 @@ def get_routes_in_polygon(
                     feed_id,
                 ),
             )
+            exec_ms = int((time.perf_counter() - t_exec) * 1000)
+            log("area/routes", f"phase=pg_single_day_execute_done elapsed_ms={exec_ms}")
+            t_fetch = time.perf_counter()
+            raw_rows = cur.fetchall()
+            fetch_ms = int((time.perf_counter() - t_fetch) * 1000)
+            log(
+                "area/routes",
+                f"phase=pg_single_day_fetch_done rows={len(raw_rows)} elapsed_ms={fetch_ms}",
+            )
             rows = []
-            for r in cur.fetchall():
+            for r in raw_rows:
                 rows.append(
                     RouteInAreaRow(
                         route_id=r["route_id"],
@@ -2827,11 +2846,32 @@ def get_routes_in_polygon_range(
         conn = _get_conn()
         close = True
     try:
+        # UI and most clients send the same start/end calendar day. The multi-day query below
+        # builds per-day rows (generate_series + calendar joins) and can be orders of magnitude
+        # slower on full national feeds, effectively hanging /area/routes. Single-day path matches
+        # the legacy get_routes_in_polygon implementation.
+        sd = (start_date_ymd or "").strip()
+        ed = (end_date_ymd or "").strip()
+        if sd and sd == ed:
+            log(
+                "area/routes",
+                f"phase=db_branch branch=single_day_sql date={sd} wkt_chars={len(polygon_wkt)} "
+                f"statement_timeout_ms={AREA_ROUTES_STATEMENT_TIMEOUT_MS}",
+            )
+            return get_routes_in_polygon(polygon_wkt, sd, start_sec, end_sec, conn=conn)
+
         feed_id = get_active_feed_id(conn)
+        log(
+            "area/routes",
+            f"phase=pg_multi_day_begin feed_id={feed_id} start_date={sd} end_date={ed} "
+            f"time_window_sec={start_sec}-{end_sec} wkt_chars={len(polygon_wkt)} "
+            f"statement_timeout_ms={AREA_ROUTES_STATEMENT_TIMEOUT_MS}",
+        )
         with conn.cursor() as cur:
             cur.execute(
                 "SET LOCAL statement_timeout = %s", (AREA_ROUTES_STATEMENT_TIMEOUT_MS,)
             )
+            t_exec = time.perf_counter()
             cur.execute(
                 """
                 WITH bounds AS (
@@ -2891,7 +2931,7 @@ def get_routes_in_polygon_range(
                       ON r.date_ymd = bs.date_ymd AND r.service_id = bs.service_id
                     WHERE r.service_id IS NULL
                 ),
-                shapes_in_area AS (
+                shapes_in_area AS MATERIALIZED (
                     SELECT sl.feed_id, sl.shape_id
                     FROM shapes_lines sl
                     WHERE sl.feed_id = %s
@@ -2963,6 +3003,15 @@ def get_routes_in_polygon_range(
                     feed_id,
                 ),
             )
+            exec_ms = int((time.perf_counter() - t_exec) * 1000)
+            log("area/routes", f"phase=pg_multi_day_execute_done elapsed_ms={exec_ms}")
+            t_fetch = time.perf_counter()
+            raw_rows = cur.fetchall()
+            fetch_ms = int((time.perf_counter() - t_fetch) * 1000)
+            log(
+                "area/routes",
+                f"phase=pg_multi_day_fetch_done rows={len(raw_rows)} elapsed_ms={fetch_ms}",
+            )
             return [
                 RouteInAreaRow(
                     route_id=r["route_id"],
@@ -2976,8 +3025,447 @@ def get_routes_in_polygon_range(
                     trip_count=r["trip_count"],
                     last_stop_name=r.get("last_stop_name"),
                 )
-                for r in cur.fetchall()
+                for r in raw_rows
             ]
+    finally:
+        if close:
+            conn.close()
+
+
+def get_routes_vector_tile_mvt(
+    z: int,
+    x: int,
+    y: int,
+    scope: str = "all",
+    render_mode: str = "balanced",
+    start_date_ymd: Optional[str] = None,
+    start_sec: Optional[int] = None,
+    end_date_ymd: Optional[str] = None,
+    end_sec: Optional[int] = None,
+    conn=None,
+) -> bytes:
+    """
+    Return Mapbox Vector Tile bytes for route geometries clipped to one tile.
+
+    scope='all' returns all route-direction shapes in the active feed.
+    scope='time_window' filters to route-direction pairs active in the supplied window.
+    """
+    if scope not in ("all", "time_window"):
+        raise ValueError("scope must be 'all' or 'time_window'")
+    if render_mode not in ("always_visible", "balanced"):
+        raise ValueError("render_mode must be 'always_visible' or 'balanced'")
+    if scope == "time_window":
+        if (
+            start_date_ymd is None
+            or start_sec is None
+            or end_date_ymd is None
+            or end_sec is None
+        ):
+            raise ValueError(
+                "time_window scope requires start_date_ymd/start_sec/end_date_ymd/end_sec"
+            )
+
+    def _simplify_tolerance_for_zoom(zoom: int, mode: str) -> float:
+        # Smoothly decay simplification by zoom to avoid abrupt geometry jumps
+        # between adjacent zoom bands.
+        if mode == "always_visible":
+            if zoom >= 8:
+                return 0.0
+            z = max(0, min(8, int(zoom)))
+            base_tol_deg = 0.0022
+            decay = 0.68 ** max(0, z - 2)
+            tol = base_tol_deg * decay
+            return max(0.00008, tol)
+        if zoom >= 13:
+            return 0.0
+        z = max(0, min(13, int(zoom)))
+        base_tol_deg = 0.02
+        decay = 0.58 ** max(0, z - 2)
+        tol = base_tol_deg * decay
+        return max(0.00025, tol)
+
+    simplify_tolerance = _simplify_tolerance_for_zoom(z, render_mode)
+
+    close = False
+    if conn is None:
+        conn = _get_conn()
+        close = True
+    try:
+        feed_id = get_active_feed_id(conn)
+        with conn.cursor() as cur:
+            cur.execute("SET LOCAL statement_timeout = %s", (ROUTES_TILE_STATEMENT_TIMEOUT_MS,))
+            if scope == "all":
+                cur.execute(
+                    """
+                    WITH tile AS (
+                        SELECT
+                            ST_TileEnvelope(%s, %s, %s) AS geom_3857,
+                            ST_Transform(ST_TileEnvelope(%s, %s, %s), 4326) AS geom_4326
+                    ),
+                    route_shapes AS (
+                        SELECT DISTINCT
+                            t.route_id,
+                            t.direction_id,
+                            r.short_name AS route_short_name,
+                            r.agency_id,
+                            t.shape_id,
+                            sl.geom
+                        FROM trips t
+                        JOIN routes r
+                          ON r.feed_id = t.feed_id
+                         AND r.route_id = t.route_id
+                        JOIN shapes_lines sl
+                          ON sl.feed_id = t.feed_id
+                         AND sl.shape_id = t.shape_id
+                        JOIN tile tb ON sl.geom && tb.geom_4326
+                        WHERE t.feed_id = %s
+                          AND t.shape_id IS NOT NULL
+                          AND ST_Intersects(sl.geom, tb.geom_4326)
+                    ),
+                    counts AS (
+                        SELECT
+                            route_id,
+                            direction_id,
+                            COUNT(*)::int AS shape_count
+                        FROM route_shapes
+                        GROUP BY route_id, direction_id
+                    ),
+                    stats AS (
+                        SELECT
+                            COALESCE(MIN(shape_count), 0)::double precision AS min_shape_count,
+                            COALESCE(MAX(shape_count), 0)::double precision AS max_shape_count
+                        FROM counts
+                    ),
+                    prepared AS (
+                        SELECT
+                            rs.route_id,
+                            rs.direction_id,
+                            rs.route_short_name,
+                            rs.agency_id,
+                            c.shape_count,
+                            CASE
+                                WHEN %s::double precision > 0
+                                    THEN ST_SimplifyPreserveTopology(rs.geom, %s::double precision)
+                                ELSE rs.geom
+                            END AS geom
+                        FROM route_shapes rs
+                        JOIN counts c
+                          ON c.route_id = rs.route_id
+                         AND COALESCE(c.direction_id, -1) = COALESCE(rs.direction_id, -1)
+                    ),
+                    mvtgeom AS (
+                        SELECT
+                            p.route_id,
+                            p.direction_id::text AS direction_id,
+                            route_short_name,
+                            agency_id,
+                            shape_count,
+                            CASE
+                                WHEN st.max_shape_count <= st.min_shape_count THEN 0.35
+                                ELSE LEAST(
+                                    1.0,
+                                    GREATEST(
+                                        0.0,
+                                        (
+                                            LN(shape_count::double precision + 1.0) - LN(st.min_shape_count + 1.0)
+                                        ) / NULLIF(
+                                            LN(st.max_shape_count + 1.0) - LN(st.min_shape_count + 1.0),
+                                            0.0
+                                        )
+                                    )
+                                )
+                            END AS intensity,
+                            ST_AsMVTGeom(
+                                ST_Transform(p.geom, 3857),
+                                tile.geom_3857,
+                                4096,
+                                64,
+                                true
+                            ) AS geom
+                        FROM prepared p
+                        CROSS JOIN stats st
+                        CROSS JOIN tile
+                        WHERE p.geom IS NOT NULL
+                    )
+                    SELECT ST_AsMVT(mvtgeom, 'routes', 4096, 'geom') AS tile
+                    FROM mvtgeom
+                    """,
+                    (z, x, y, z, x, y, feed_id, simplify_tolerance, simplify_tolerance),
+                )
+            else:
+                cur.execute(
+                    """
+                    WITH tile AS (
+                        SELECT
+                            ST_TileEnvelope(%s, %s, %s) AS geom_3857,
+                            ST_Transform(ST_TileEnvelope(%s, %s, %s), 4326) AS geom_4326
+                    ),
+                    bounds AS (
+                        SELECT
+                            to_date(%s::text, 'YYYYMMDD') AS start_date,
+                            to_date(%s::text, 'YYYYMMDD') AS end_date,
+                            %s::int AS start_sec,
+                            %s::int AS end_sec
+                    ),
+                    day_windows AS (
+                        SELECT
+                            to_char(gs::date, 'YYYYMMDD')::int AS date_ymd,
+                            EXTRACT(DOW FROM gs::date)::int AS dow,
+                            CASE WHEN gs::date = b.start_date THEN b.start_sec ELSE 0 END AS day_start_sec,
+                            CASE WHEN gs::date = b.end_date THEN b.end_sec ELSE 27 * 3600 END AS day_end_sec
+                        FROM bounds b
+                        JOIN LATERAL generate_series(b.start_date, b.end_date, interval '1 day') gs ON TRUE
+                    ),
+                    calendar_services AS (
+                        SELECT dw.date_ymd, dw.day_start_sec, dw.day_end_sec, c.service_id
+                        FROM day_windows dw
+                        JOIN calendar c ON c.feed_id = %s
+                         AND dw.date_ymd BETWEEN c.start_date AND c.end_date
+                         AND (
+                            (dw.dow = 0 AND c.sunday = 1)
+                            OR (dw.dow = 1 AND c.monday = 1)
+                            OR (dw.dow = 2 AND c.tuesday = 1)
+                            OR (dw.dow = 3 AND c.wednesday = 1)
+                            OR (dw.dow = 4 AND c.thursday = 1)
+                            OR (dw.dow = 5 AND c.friday = 1)
+                            OR (dw.dow = 6 AND c.saturday = 1)
+                         )
+                    ),
+                    add_services AS (
+                        SELECT dw.date_ymd, dw.day_start_sec, dw.day_end_sec, cd.service_id
+                        FROM day_windows dw
+                        JOIN calendar_dates cd ON cd.feed_id = %s
+                         AND cd.date = dw.date_ymd
+                         AND cd.exception_type = 1
+                    ),
+                    remove_services AS (
+                        SELECT dw.date_ymd, cd.service_id
+                        FROM day_windows dw
+                        JOIN calendar_dates cd ON cd.feed_id = %s
+                         AND cd.date = dw.date_ymd
+                         AND cd.exception_type = 2
+                    ),
+                    base_services AS (
+                        SELECT date_ymd, day_start_sec, day_end_sec, service_id FROM calendar_services
+                        UNION
+                        SELECT date_ymd, day_start_sec, day_end_sec, service_id FROM add_services
+                    ),
+                    active_services AS (
+                        SELECT bs.date_ymd, bs.day_start_sec, bs.day_end_sec, bs.service_id
+                        FROM base_services bs
+                        LEFT JOIN remove_services r
+                          ON r.date_ymd = bs.date_ymd
+                         AND r.service_id = bs.service_id
+                        WHERE r.service_id IS NULL
+                    ),
+                    active_trips AS (
+                        SELECT DISTINCT
+                            t.trip_id,
+                            t.route_id,
+                            t.direction_id,
+                            t.shape_id
+                        FROM trips t
+                        JOIN active_services s
+                          ON s.service_id = t.service_id
+                        JOIN trip_time_bounds b
+                          ON b.feed_id = t.feed_id
+                         AND b.trip_id = t.trip_id
+                        WHERE t.feed_id = %s
+                          AND t.shape_id IS NOT NULL
+                          AND b.last_sec >= s.day_start_sec
+                          AND b.first_sec <= s.day_end_sec
+                    ),
+                    route_shapes AS (
+                        SELECT DISTINCT
+                            at.route_id,
+                            at.direction_id,
+                            r.short_name AS route_short_name,
+                            r.agency_id,
+                            at.shape_id,
+                            sl.geom
+                        FROM active_trips at
+                        JOIN routes r
+                          ON r.feed_id = %s
+                         AND r.route_id = at.route_id
+                        JOIN shapes_lines sl
+                          ON sl.feed_id = %s
+                         AND sl.shape_id = at.shape_id
+                        JOIN tile tb ON sl.geom && tb.geom_4326
+                        WHERE ST_Intersects(sl.geom, tb.geom_4326)
+                    ),
+                    counts AS (
+                        SELECT
+                            route_id,
+                            direction_id,
+                            COUNT(*)::int AS shape_count
+                        FROM route_shapes
+                        GROUP BY route_id, direction_id
+                    ),
+                    stats AS (
+                        SELECT
+                            COALESCE(MIN(shape_count), 0)::double precision AS min_shape_count,
+                            COALESCE(MAX(shape_count), 0)::double precision AS max_shape_count
+                        FROM counts
+                    ),
+                    prepared AS (
+                        SELECT
+                            rs.route_id,
+                            rs.direction_id,
+                            rs.route_short_name,
+                            rs.agency_id,
+                            c.shape_count,
+                            CASE
+                                WHEN %s::double precision > 0
+                                    THEN ST_SimplifyPreserveTopology(rs.geom, %s::double precision)
+                                ELSE rs.geom
+                            END AS geom
+                        FROM route_shapes rs
+                        JOIN counts c
+                          ON c.route_id = rs.route_id
+                         AND COALESCE(c.direction_id, -1) = COALESCE(rs.direction_id, -1)
+                    ),
+                    mvtgeom AS (
+                        SELECT
+                            p.route_id,
+                            p.direction_id::text AS direction_id,
+                            route_short_name,
+                            agency_id,
+                            shape_count,
+                            CASE
+                                WHEN st.max_shape_count <= st.min_shape_count THEN 0.35
+                                ELSE LEAST(
+                                    1.0,
+                                    GREATEST(
+                                        0.0,
+                                        (
+                                            LN(shape_count::double precision + 1.0) - LN(st.min_shape_count + 1.0)
+                                        ) / NULLIF(
+                                            LN(st.max_shape_count + 1.0) - LN(st.min_shape_count + 1.0),
+                                            0.0
+                                        )
+                                    )
+                                )
+                            END AS intensity,
+                            ST_AsMVTGeom(
+                                ST_Transform(p.geom, 3857),
+                                tile.geom_3857,
+                                4096,
+                                64,
+                                true
+                            ) AS geom
+                        FROM prepared p
+                        CROSS JOIN stats st
+                        CROSS JOIN tile
+                        WHERE p.geom IS NOT NULL
+                    )
+                    SELECT ST_AsMVT(mvtgeom, 'routes', 4096, 'geom') AS tile
+                    FROM mvtgeom
+                    """,
+                    (
+                        z,
+                        x,
+                        y,
+                        z,
+                        x,
+                        y,
+                        start_date_ymd,
+                        end_date_ymd,
+                        start_sec,
+                        end_sec,
+                        feed_id,
+                        feed_id,
+                        feed_id,
+                        feed_id,
+                        feed_id,
+                        feed_id,
+                        simplify_tolerance,
+                        simplify_tolerance,
+                    ),
+                )
+            row = cur.fetchone()
+            tile = row["tile"] if row else None
+            return bytes(tile) if tile else b""
+    finally:
+        if close:
+            conn.close()
+
+
+def get_routes_coverage_tile_mvt(
+    z: int,
+    x: int,
+    y: int,
+    conn=None,
+) -> bytes:
+    """
+    Return a low-zoom generalized route coverage tile.
+
+    This layer is intentionally coarse and feed-wide so users keep route
+    presence context while zoomed out, then transition to detailed tiles.
+    """
+    def _coverage_tolerance_for_zoom(zoom: int) -> float:
+        if zoom >= 10:
+            return 0.0
+        zc = max(0, min(10, int(zoom)))
+        base_tol_deg = 0.03
+        decay = 0.62 ** max(0, zc - 2)
+        tol = base_tol_deg * decay
+        return max(0.0004, tol)
+
+    simplify_tolerance = _coverage_tolerance_for_zoom(z)
+    close = False
+    if conn is None:
+        conn = _get_conn()
+        close = True
+    try:
+        feed_id = get_active_feed_id(conn)
+        with conn.cursor() as cur:
+            cur.execute("SET LOCAL statement_timeout = %s", (ROUTES_TILE_STATEMENT_TIMEOUT_MS,))
+            cur.execute(
+                """
+                WITH tile AS (
+                    SELECT
+                        ST_TileEnvelope(%s, %s, %s) AS geom_3857,
+                        ST_Transform(ST_TileEnvelope(%s, %s, %s), 4326) AS geom_4326
+                ),
+                collected AS (
+                    SELECT ST_UnaryUnion(ST_Collect(sl.geom)) AS geom
+                    FROM shapes_lines sl
+                    JOIN tile t ON sl.geom && ST_Expand(t.geom_4326, 0.05)
+                    WHERE sl.feed_id = %s
+                      AND ST_Intersects(sl.geom, t.geom_4326)
+                ),
+                simplified AS (
+                    SELECT
+                        CASE
+                            WHEN %s::double precision > 0
+                                THEN ST_SimplifyPreserveTopology(geom, %s::double precision)
+                            ELSE geom
+                        END AS geom
+                    FROM collected
+                    WHERE geom IS NOT NULL
+                ),
+                mvtgeom AS (
+                    SELECT
+                        ST_AsMVTGeom(
+                            ST_Transform(geom, 3857),
+                            tile.geom_3857,
+                            4096,
+                            256,
+                            true
+                        ) AS geom,
+                        0.22::double precision AS intensity
+                    FROM simplified
+                    CROSS JOIN tile
+                    WHERE geom IS NOT NULL
+                )
+                SELECT ST_AsMVT(mvtgeom, 'coverage', 4096, 'geom') AS tile
+                FROM mvtgeom
+                """,
+                (z, x, y, z, x, y, feed_id, simplify_tolerance, simplify_tolerance),
+            )
+            row = cur.fetchone()
+            tile = row["tile"] if row else None
+            return bytes(tile) if tile else b""
     finally:
         if close:
             conn.close()
@@ -3371,3 +3859,585 @@ def search_routes_pg_range(
         if close:
             conn.close()
 
+
+
+# --- Detour v2 -----------------------------------------------------------------
+
+
+def get_trip_route_shape(trip_id: str, conn=None) -> Optional[Dict[str, Any]]:
+    close = False
+    if conn is None:
+        conn = _get_conn()
+        close = True
+    try:
+        feed_id = get_active_feed_id(conn)
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT route_id, shape_id
+                FROM trips
+                WHERE feed_id = %s AND trip_id = %s
+                LIMIT 1
+                """,
+                (feed_id, trip_id),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            return {"route_id": row["route_id"], "shape_id": row["shape_id"]}
+    finally:
+        if close:
+            conn.close()
+
+
+def get_stop_lonlat_bulk(stop_ids: List[str], conn=None) -> Dict[str, Tuple[float, float]]:
+    if not stop_ids:
+        return {}
+    close = False
+    if conn is None:
+        conn = _get_conn()
+        close = True
+    try:
+        feed_id = get_active_feed_id(conn)
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT stop_id, lon, lat
+                FROM stops
+                WHERE feed_id = %s AND stop_id = ANY(%s)
+                """,
+                (feed_id, stop_ids),
+            )
+            out: Dict[str, Tuple[float, float]] = {}
+            for r in cur.fetchall():
+                sid = str(r["stop_id"])
+                if r.get("lon") is not None and r.get("lat") is not None:
+                    out[sid] = (float(r["lon"]), float(r["lat"]))
+            return out
+    finally:
+        if close:
+            conn.close()
+
+
+def osm_segments_intersecting_polygon(feed_id: int, polygon_geojson: Dict[str, Any], conn=None) -> List[Dict[str, Any]]:
+    """Return osm_road_segments rows intersecting polygon."""
+    del feed_id
+    close = False
+    if conn is None:
+        conn = _get_conn()
+        close = True
+    try:
+        gj = json.dumps(polygon_geojson)
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT osm_way_id, direction
+                FROM osm_road_segments
+                WHERE ST_Intersects(
+                    geom::geography,
+                    ST_SetSRID(ST_GeomFromGeoJSON(%s), 4326)::geography
+                )
+                LIMIT 5000
+                """,
+                (gj,),
+            )
+            return [dict(r) for r in cur.fetchall()]
+    except Exception:
+        return []
+    finally:
+        if close:
+            conn.close()
+
+
+def insert_incident(
+    polygon_geojson: Dict[str, Any],
+    incident_type: Optional[str],
+    description: Optional[str],
+    start_time: Optional[str],
+    end_time: Optional[str],
+    created_by: Optional[str],
+    conn=None,
+) -> int:
+    close = False
+    if conn is None:
+        conn = _get_conn()
+        close = True
+    try:
+        gj = json.dumps(polygon_geojson)
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO incidents (polygon_geom, incident_type, description, start_time, end_time, created_by)
+                VALUES (
+                    ST_SetSRID(ST_GeomFromGeoJSON(%s), 4326),
+                    %s, %s, %s::timestamptz, %s::timestamptz, %s
+                )
+                RETURNING id
+                """,
+                (gj, incident_type, description, start_time, end_time, created_by),
+            )
+            row = cur.fetchone()
+            conn.commit()
+            return int(row["id"])
+    finally:
+        if close:
+            conn.close()
+
+
+def insert_detour_request(
+    *,
+    feed_id: int,
+    trip_id: str,
+    route_id: str,
+    service_date: str,
+    incident_id: Optional[int],
+    status: str,
+    payload_json: Dict[str, Any],
+    conn=None,
+) -> int:
+    close = False
+    if conn is None:
+        conn = _get_conn()
+        close = True
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO detour_requests (feed_id, trip_id, route_id, service_date, incident_id, status, payload_json)
+                VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb)
+                RETURNING id
+                """,
+                (
+                    feed_id,
+                    trip_id,
+                    route_id,
+                    service_date,
+                    incident_id,
+                    status,
+                    json.dumps(payload_json),
+                ),
+            )
+            row = cur.fetchone()
+            conn.commit()
+            return int(row["id"])
+    finally:
+        if close:
+            conn.close()
+
+
+def insert_detour_candidate(
+    *,
+    detour_request_id: int,
+    candidate_rank: int,
+    strategy: Optional[str],
+    geometry_json: Optional[Dict[str, Any]],
+    road_sequence_json: Any,
+    turn_sequence_json: Any,
+    travel_time_s: float,
+    distance_m: float,
+    score: float,
+    accepted: bool,
+    rejection_reasons_json: Any,
+    score_breakdown_json: Dict[str, Any],
+    conn=None,
+) -> None:
+    close = False
+    if conn is None:
+        conn = _get_conn()
+        close = True
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO detour_candidates (
+                    detour_request_id, candidate_rank, strategy, geometry_json,
+                    road_sequence_json, turn_sequence_json, travel_time_s, distance_m,
+                    score, accepted, rejection_reasons_json, score_breakdown_json
+                )
+                VALUES (%s, %s, %s, %s::jsonb, %s::jsonb, %s::jsonb, %s, %s, %s, %s, %s::jsonb, %s::jsonb)
+                """,
+                (
+                    detour_request_id,
+                    candidate_rank,
+                    strategy,
+                    json.dumps(geometry_json) if geometry_json is not None else None,
+                    json.dumps(road_sequence_json),
+                    json.dumps(turn_sequence_json),
+                    travel_time_s,
+                    distance_m,
+                    score,
+                    accepted,
+                    json.dumps(rejection_reasons_json),
+                    json.dumps(score_breakdown_json),
+                ),
+            )
+            conn.commit()
+    finally:
+        if close:
+            conn.close()
+
+
+def get_detour_request_full(detour_request_id: int, conn=None) -> Optional[Dict[str, Any]]:
+    close = False
+    if conn is None:
+        conn = _get_conn()
+        close = True
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, feed_id, trip_id, route_id, service_date, incident_id, status, payload_json, created_at
+                FROM detour_requests WHERE id = %s
+                """,
+                (detour_request_id,),
+            )
+            req = cur.fetchone()
+            if not req:
+                return None
+            cur.execute(
+                """
+                SELECT * FROM detour_candidates WHERE detour_request_id = %s ORDER BY candidate_rank
+                """,
+                (detour_request_id,),
+            )
+            cands = [dict(r) for r in cur.fetchall()]
+            return {"request": dict(req), "candidates": cands}
+    finally:
+        if close:
+            conn.close()
+
+
+def insert_approved_detour(
+    *,
+    feed_id: int,
+    route_id: str,
+    trip_pattern_key: str,
+    incident_signature: str,
+    geometry_json: Dict[str, Any],
+    road_sequence_json: Any,
+    turn_sequence_json: Any,
+    approved_by: Optional[str],
+    conn=None,
+) -> int:
+    close = False
+    if conn is None:
+        conn = _get_conn()
+        close = True
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO approved_detours (
+                    feed_id, route_id, trip_pattern_key, incident_signature,
+                    geometry_json, road_sequence_json, turn_sequence_json, approved_by
+                )
+                VALUES (%s, %s, %s, %s, %s::jsonb, %s::jsonb, %s::jsonb, %s)
+                RETURNING id
+                """,
+                (
+                    feed_id,
+                    route_id,
+                    trip_pattern_key,
+                    incident_signature,
+                    json.dumps(geometry_json),
+                    json.dumps(road_sequence_json),
+                    json.dumps(turn_sequence_json),
+                    approved_by,
+                ),
+            )
+            row = cur.fetchone()
+            conn.commit()
+            return int(row["id"])
+    finally:
+        if close:
+            conn.close()
+
+
+def bump_bus_edge_evidence(osm_way_id: int, direction: Optional[str], conn=None) -> None:
+    close = False
+    if conn is None:
+        conn = _get_conn()
+        close = True
+    try:
+        d = direction if direction is not None else ""
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO bus_edge_evidence (osm_way_id, direction, approved_detour_count, last_seen_at)
+                VALUES (%s, %s, 1, NOW())
+                ON CONFLICT (osm_way_id, direction) DO UPDATE SET
+                    approved_detour_count = bus_edge_evidence.approved_detour_count + 1,
+                    last_seen_at = NOW()
+                """,
+                (osm_way_id, d),
+            )
+            conn.commit()
+    except Exception:
+        pass
+    finally:
+        if close:
+            conn.close()
+
+
+def get_gtfs_bus_way_evidence_bulk(
+    feed_id: int,
+    osm_way_ids: List[int],
+    conn=None,
+) -> Dict[int, Dict[str, Any]]:
+    """
+    Return feed-scoped GTFS evidence rows keyed by osm_way_id.
+    If multiple direction rows exist, keep the highest confidence row per way.
+    """
+    if not osm_way_ids:
+        return {}
+    close = False
+    if conn is None:
+        conn = _get_conn()
+        close = True
+    try:
+        out: Dict[int, Dict[str, Any]] = {}
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT osm_way_id, direction, trip_count, route_count, confidence_score, sample_trip_ids_json
+                FROM gtfs_bus_way_evidence
+                WHERE feed_id = %s
+                  AND osm_way_id = ANY(%s)
+                """,
+                (feed_id, osm_way_ids),
+            )
+            for row in cur.fetchall():
+                wid = int(row["osm_way_id"])
+                conf = float(row["confidence_score"] or 0.0)
+                prev = out.get(wid)
+                if prev is None or conf > float(prev.get("confidence_score") or 0.0):
+                    out[wid] = {
+                        "osm_way_id": wid,
+                        "direction": row["direction"],
+                        "trip_count": int(row["trip_count"] or 0),
+                        "route_count": int(row["route_count"] or 0),
+                        "confidence_score": conf,
+                        "sample_trip_ids_json": row.get("sample_trip_ids_json"),
+                    }
+        return out
+    finally:
+        if close:
+            conn.close()
+
+
+def get_candidate_osm_segments_for_polyline(
+    coordinates: List[Tuple[float, float]],
+    *,
+    max_distance_m: float = 35.0,
+    limit: int = 400,
+    conn=None,
+) -> List[Dict[str, Any]]:
+    """
+    Approximate map-matching by selecting OSM road segments near an input polyline
+    and ordering by projected position along that line.
+    """
+    if len(coordinates) < 2:
+        return []
+    wkt_coords = ", ".join(f"{float(lon)} {float(lat)}" for lon, lat in coordinates)
+    line_wkt = f"LINESTRING({wkt_coords})"
+    close = False
+    if conn is None:
+        conn = _get_conn()
+        close = True
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                WITH q AS (
+                    SELECT ST_SetSRID(ST_GeomFromText(%s), 4326) AS line
+                )
+                SELECT
+                    ors.segment_id,
+                    ors.osm_way_id,
+                    ors.from_node_id,
+                    ors.to_node_id,
+                    ors.direction,
+                    ors.highway,
+                    ors.access,
+                    ors.bus,
+                    ors.psv,
+                    ors.service,
+                    ST_Length(ors.geom::geography) AS length_m
+                FROM osm_road_segments ors, q
+                WHERE ST_DWithin(ors.geom::geography, q.line::geography, %s)
+                ORDER BY ST_LineLocatePoint(q.line, ST_LineInterpolatePoint(ors.geom, 0.5))
+                LIMIT %s
+                """,
+                (line_wkt, float(max_distance_m), int(limit)),
+            )
+            return [dict(r) for r in cur.fetchall()]
+    finally:
+        if close:
+            conn.close()
+
+
+def upsert_gtfs_bus_way_evidence_rows(
+    feed_id: int,
+    rows: List[Dict[str, Any]],
+    conn=None,
+) -> None:
+    """
+    Upsert GTFS->OSM way evidence rows for one feed.
+    Each row should include osm_way_id and may include direction, trip_count, route_count,
+    sample_trip_ids_json, confidence_score.
+    """
+    if not rows:
+        return
+    close = False
+    if conn is None:
+        conn = _get_conn()
+        close = True
+    try:
+        with conn.cursor() as cur:
+            for r in rows:
+                cur.execute(
+                    """
+                    INSERT INTO gtfs_bus_way_evidence (
+                        feed_id, osm_way_id, direction, trip_count, route_count,
+                        sample_trip_ids_json, confidence_score, last_computed_at
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s, NOW())
+                    ON CONFLICT (feed_id, osm_way_id, direction) DO UPDATE SET
+                        trip_count = EXCLUDED.trip_count,
+                        route_count = EXCLUDED.route_count,
+                        sample_trip_ids_json = EXCLUDED.sample_trip_ids_json,
+                        confidence_score = EXCLUDED.confidence_score,
+                        last_computed_at = NOW()
+                    """,
+                    (
+                        int(feed_id),
+                        int(r.get("osm_way_id") or 0),
+                        str(r.get("direction") or ""),
+                        int(r.get("trip_count") or 0),
+                        int(r.get("route_count") or 0),
+                        json.dumps(r.get("sample_trip_ids_json")),
+                        float(r.get("confidence_score") or 0.0),
+                    ),
+                )
+            conn.commit()
+    finally:
+        if close:
+            conn.close()
+
+
+def insert_bus_edge_constraint(
+    *,
+    osm_way_id: int,
+    direction: Optional[str],
+    constraint_type: str,
+    severity: float,
+    reason_code: Optional[str],
+    notes: Optional[str],
+    created_by: Optional[str],
+    conn=None,
+) -> int:
+    close = False
+    if conn is None:
+        conn = _get_conn()
+        close = True
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO bus_edge_constraints (
+                    osm_way_id, direction, constraint_type, severity, reason_code, notes, created_by
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
+                """,
+                (osm_way_id, direction, constraint_type, severity, reason_code, notes, created_by),
+            )
+            row = cur.fetchone()
+            conn.commit()
+            return int(row["id"])
+    finally:
+        if close:
+            conn.close()
+
+
+def insert_bus_turn_constraint(
+    *,
+    from_way_id: int,
+    via_node_id: int,
+    to_way_id: int,
+    constraint_type: str,
+    severity: float,
+    reason_code: Optional[str],
+    notes: Optional[str],
+    created_by: Optional[str],
+    conn=None,
+) -> int:
+    close = False
+    if conn is None:
+        conn = _get_conn()
+        close = True
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO bus_turn_constraints (
+                    from_way_id, via_node_id, to_way_id, constraint_type, severity, reason_code, notes, created_by
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
+                """,
+                (from_way_id, via_node_id, to_way_id, constraint_type, severity, reason_code, notes, created_by),
+            )
+            row = cur.fetchone()
+            conn.commit()
+            return int(row["id"])
+    finally:
+        if close:
+            conn.close()
+
+
+def _execute_split_ddl(conn, sql_text: str) -> None:
+    """Run semicolon-separated DDL (no semicolons inside literals in our migration files)."""
+    lines: List[str] = []
+    for line in sql_text.splitlines():
+        s = line.strip()
+        if not s or s.startswith("--"):
+            continue
+        lines.append(line)
+    buf = "\n".join(lines)
+    with conn.cursor() as cur:
+        for part in buf.split(";"):
+            stmt = part.strip()
+            if not stmt:
+                continue
+            cur.execute(stmt + ";")
+
+
+def ensure_detour_v2_support_schema(conn=None) -> bool:
+    """
+    CREATE TABLE IF NOT EXISTS for incident + detour v2 persistence when the DB predates that DDL.
+    Called on API startup unless DETOUR_V2_SCHEMA_ENSURE is 0/false/no.
+    """
+    if os.getenv("DETOUR_V2_SCHEMA_ENSURE", "1").strip().lower() in ("0", "false", "no"):
+        return True
+    path = os.path.normpath(
+        os.path.join(os.path.dirname(__file__), "..", "sql", "migrations", "ensure_detour_v2_support.sql")
+    )
+    if not os.path.isfile(path):
+        return False
+    with open(path, encoding="utf-8") as f:
+        sql_text = f.read()
+    close = False
+    if conn is None:
+        conn = _get_conn()
+        close = True
+    try:
+        _execute_split_ddl(conn, sql_text)
+        conn.commit()
+        return True
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        if close:
+            conn.close()

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import time
 from typing import Dict, List, Any, Optional, Tuple
 
 from shapely.geometry import LineString, shape
 
 from backend.infra.config import SHAPES_BY_ID_CACHE, TRIP_TIME_BOUNDS_CACHE
 from backend.infra.db_access import get_routes_in_polygon_range
+from backend.infra.logging_utils import log
 from .service_calendar import ServiceCalendar, parse_gtfs_time_to_seconds
 
 
@@ -218,12 +220,24 @@ def find_routes_in_polygon(
   _ = ServiceCalendar  # silence unused-variable warnings
 
   wkt = poly.wkt
+  t0 = time.perf_counter()
+  log(
+    "area/routes",
+    f"phase=domain_pg_call_start wkt_chars={len(wkt)} "
+    f"start_date={start_date_ymd} end_date={end_date_ymd} "
+    f"start_sec={start_sec} end_sec={end_sec}",
+  )
   rows = get_routes_in_polygon_range(
     polygon_wkt=wkt,
     start_date_ymd=start_date_ymd,
     start_sec=start_sec,
     end_date_ymd=end_date_ymd,
     end_sec=end_sec,
+  )
+  elapsed_ms = int((time.perf_counter() - t0) * 1000)
+  log(
+    "area/routes",
+    f"phase=domain_pg_call_done elapsed_ms={elapsed_ms} route_rows={len(rows)}",
   )
   return [
     {

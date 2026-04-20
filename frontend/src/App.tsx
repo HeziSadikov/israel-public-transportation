@@ -11,8 +11,15 @@ import {
   type StopLineResult,
 } from "./ExplorerWindow";
 import type { AreaRouteResult, RouteInfo } from "./ExplorerWindow";
-import MapLibreMap, { type BasemapKind, type MapLibreMapHandle } from "./MapLibreMap";
+import MapLibreMap, {
+  type AllRoutesRenderMode,
+  type AllRoutesScope,
+  type BasemapKind,
+  type MapLibreMapHandle,
+} from "./MapLibreMap";
 import { isGovmapBasemapConfigured } from "./govmapBasemapEnv";
+import { IncidentDetourV2Panel } from "./IncidentDetourV2Panel";
+import type { DetourV2ComputeResult } from "./api/detourV2";
 
 type StopInfo = {
   stop_id: string;
@@ -108,7 +115,17 @@ const API_BASE: string =
 const DEFAULT_EXPLORER_POSITION = { x: 24, y: 24 };
 const DEFAULT_EXPLORER_SIZE = { width: 620, height: 420 };
 
-const HHMM_RE = /^([01]\d|2[0-3]):([0-5]\d)$/;
+/** HH:MM or HH:MM:SS (some browsers emit seconds from HTML time inputs). */
+const HHMM_RE = /^([01]\d|2[0-3]):([0-5]\d)(?::([0-5]\d))?$/;
+
+/** Collapse HTML time values to HH:MM so validation and controlled inputs stay stable. */
+function normalizeHtmlTimeValue(v: string): string {
+  const m = v.trim().match(/^(\d{1,2}):(\d{2})(?::\d{2})?$/);
+  if (!m) return v.trim();
+  const h = Math.min(23, Math.max(0, parseInt(m[1], 10)));
+  const min = Math.min(59, Math.max(0, parseInt(m[2], 10)));
+  return `${String(h).padStart(2, "0")}:${String(min).padStart(2, "0")}`;
+}
 const YMD_RE = /^\d{8}$/;
 
 const toIsoDate = (yyyymmdd: string): string => {
@@ -131,13 +148,17 @@ const isValidYmd = (yyyymmdd: string): boolean => {
 };
 
 const toLocalDateTime = (yyyymmdd: string, hhmm: string): Date | null => {
-  if (!isValidYmd(yyyymmdd) || !HHMM_RE.test(hhmm)) return null;
+  const t = normalizeHtmlTimeValue(hhmm);
+  if (!isValidYmd(yyyymmdd) || !HHMM_RE.test(t)) return null;
   const y = Number(yyyymmdd.slice(0, 4));
-  const m = Number(yyyymmdd.slice(4, 6)) - 1;
+  const mo = Number(yyyymmdd.slice(4, 6)) - 1;
   const d = Number(yyyymmdd.slice(6, 8));
-  const hh = Number(hhmm.slice(0, 2));
-  const mm = Number(hhmm.slice(3, 5));
-  const dt = new Date(y, m, d, hh, mm, 0, 0);
+  const tm = t.match(HHMM_RE);
+  if (!tm) return null;
+  const hh = Number(tm[1]);
+  const mm = Number(tm[2]);
+  const ss = tm[3] != null ? Number(tm[3]) : 0;
+  const dt = new Date(y, mo, d, hh, mm, ss, 0);
   if (Number.isNaN(dt.getTime())) return null;
   return dt;
 };
@@ -182,6 +203,12 @@ const App: React.FC = () => {
   const [detourAreaResults, setDetourAreaResults] = useState<DetourByAreaRouteResult[] | null>(null);
   const [detourLoading, setDetourLoading] = useState(false);
   const [detour, setDetour] = useState<DetourResponse | null>(null);
+  const [detourV2Overlay, setDetourV2Overlay] = useState<{
+    exitLon?: number | null; exitLat?: number | null;
+    rejoinLon?: number | null; rejoinLat?: number | null;
+    exitStopId?: string | null; rejoinStopId?: string | null;
+    skippedStopIds?: string[];
+  } | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [feedCalendarNotice, setFeedCalendarNotice] = useState<string | null>(null);
   const [feedCalMin, setFeedCalMin] = useState<number | null>(null);
@@ -227,6 +254,10 @@ const App: React.FC = () => {
 
   const [pinPosition, setPinPosition] = useState<[number, number] | null>(null);
   const [basemap, setBasemap] = useState<BasemapKind>("osm");
+  const [showAllRoutesLayer, setShowAllRoutesLayer] = useState(false);
+  const [showRoutesHeatLayer, setShowRoutesHeatLayer] = useState(false);
+  const [allRoutesScope, setAllRoutesScope] = useState<AllRoutesScope>("all");
+  const [allRoutesRenderMode, setAllRoutesRenderMode] = useState<AllRoutesRenderMode>("balanced");
   const [drawMode, setDrawMode] = useState<string>("simple_select");
   const govmapBasemapAvailable = isGovmapBasemapConfigured();
 
@@ -285,13 +316,20 @@ const App: React.FC = () => {
     };
   }, []);
 
+  useEffect(() => {
+    setAreaStartTime((t) => normalizeHtmlTimeValue(t));
+    setAreaEndTime((t) => normalizeHtmlTimeValue(t));
+  }, []);
+
   const timeWindowError = useMemo(() => {
     if (!isValidYmd(areaStartDate.trim())) return "Start date must be valid and formatted as YYYYMMDD.";
     if (!isValidYmd(areaEndDate.trim())) return "End date must be valid and formatted as YYYYMMDD.";
-    if (!HHMM_RE.test(areaStartTime.trim())) return "Start time must be in HH:MM (24h).";
-    if (!HHMM_RE.test(areaEndTime.trim())) return "End time must be in HH:MM (24h).";
-    const startDt = toLocalDateTime(areaStartDate.trim(), areaStartTime.trim());
-    const endDt = toLocalDateTime(areaEndDate.trim(), areaEndTime.trim());
+    if (!HHMM_RE.test(normalizeHtmlTimeValue(areaStartTime)))
+      return "Start time must be in HH:MM or HH:MM:SS (24h).";
+    if (!HHMM_RE.test(normalizeHtmlTimeValue(areaEndTime)))
+      return "End time must be in HH:MM or HH:MM:SS (24h).";
+    const startDt = toLocalDateTime(areaStartDate.trim(), normalizeHtmlTimeValue(areaStartTime));
+    const endDt = toLocalDateTime(areaEndDate.trim(), normalizeHtmlTimeValue(areaEndTime));
     if (!startDt || !endDt) return "Invalid date/time value.";
     if (endDt.getTime() < startDt.getTime()) return "End date/time must be later than or equal to start date/time.";
     return null;
@@ -409,9 +447,9 @@ const App: React.FC = () => {
       }>(`${API_BASE}/area/routes`, {
         polygon_geojson: blockageGeojson,
         start_date: areaStartDate.trim(),
-        start_time: areaStartTime.trim() || "04:00",
+        start_time: normalizeHtmlTimeValue(areaStartTime) || "04:00",
         end_date: areaEndDate.trim(),
-        end_time: areaEndTime.trim() || "23:59",
+        end_time: normalizeHtmlTimeValue(areaEndTime) || "23:59",
         max_results: 200,
       }, { timeout: 600000, headers: { "Content-Type": "application/json" } });
       setAreaRoutes(res.data.routes);
@@ -446,9 +484,9 @@ const App: React.FC = () => {
         q: lineSearchQuery.trim(),
         limit: 20,
         start_date: areaStartDate.trim(),
-        start_time: areaStartTime.trim() || "04:00",
+        start_time: normalizeHtmlTimeValue(areaStartTime) || "04:00",
         end_date: areaEndDate.trim(),
-        end_time: areaEndTime.trim() || "23:59",
+        end_time: normalizeHtmlTimeValue(areaEndTime) || "23:59",
       });
       setLineSearchResults(res.data);
     } catch (e) {
@@ -594,9 +632,9 @@ const App: React.FC = () => {
       const res = await axios.post<StopRoutesResponse>(`${API_BASE}/stop/routes`, {
         stop_id: selectedStop.stop_id,
         start_date: areaStartDate.trim(),
-        start_time: areaStartTime.trim() || "04:00",
+        start_time: normalizeHtmlTimeValue(areaStartTime) || "04:00",
         end_date: areaEndDate.trim(),
-        end_time: areaEndTime.trim() || "23:59",
+        end_time: normalizeHtmlTimeValue(areaEndTime) || "23:59",
         max_results: 100,
       }, {
         signal: controller.signal,
@@ -664,6 +702,70 @@ const App: React.FC = () => {
     };
   };
 
+  const mapV2ResultToDetour = (r: DetourV2ComputeResult): DetourResponse | null => {
+    const raw = (r.selected?.geometry_geojson ?? null) as
+      | GeoJSON.FeatureCollection
+      | GeoJSON.Feature
+      | null;
+    if (!raw) return null;
+    const asFeatureCollection: GeoJSON.FeatureCollection =
+      raw.type === "FeatureCollection"
+        ? (raw as GeoJSON.FeatureCollection)
+        : raw.type === "Feature"
+          ? { type: "FeatureCollection", features: [raw as GeoJSON.Feature] }
+          : { type: "FeatureCollection", features: [] };
+    return {
+      blocked_edges_count: 0,
+      stop_path: [],
+      path_geojson: asFeatureCollection,
+      blocked_edges_geojson: { type: "FeatureCollection", features: [] } as GeoJSON.FeatureCollection,
+      total_travel_time_s: null,
+      total_distance_m: null,
+      used_shape: false,
+      used_osm_snapping: true,
+      feed_version: "",
+      turn_by_turn: null,
+      from_override: false,
+      instructions_only: false,
+      reason_code: null,
+      strategy_used: r.selected?.strategy ?? null,
+      confidence: null,
+      diagnostics: { source: "detour_v2" },
+    };
+  };
+
+  const handleV2Computed = (result: DetourV2ComputeResult | null) => {
+    if (!result) {
+      setDetour(null);
+      setDetourV2Overlay(null);
+      return;
+    }
+    const mapped = mapV2ResultToDetour(result);
+    if (mapped?.path_geojson?.features?.length) {
+      setDetour(mapped);
+      mapRef.current?.fitToDetour();
+    } else {
+      setDetour(null);
+      setMessage("Detour v2 completed but returned no drawable geometry.");
+    }
+    // E4: build v2 overlay from anchors and stitching.
+    const anchors = result.anchors;
+    const skipped = result.stitching?.skipped_stop_ids ?? [];
+    if (anchors) {
+      setDetourV2Overlay({
+        exitLon: anchors.exit_lon,
+        exitLat: anchors.exit_lat,
+        rejoinLon: anchors.rejoin_lon,
+        rejoinLat: anchors.rejoin_lat,
+        exitStopId: anchors.exit_stop_id,
+        rejoinStopId: anchors.rejoin_stop_id,
+        skippedStopIds: skipped,
+      });
+    } else {
+      setDetourV2Overlay(null);
+    }
+  };
+
   const handleComputeDetour = async () => {
     if (!isTimeWindowValid) {
       setMessage(timeWindowError);
@@ -685,9 +787,9 @@ const App: React.FC = () => {
       const body: Record<string, unknown> = {
         mode: detourMode,
         start_date: areaStartDate.trim(),
-        start_time: areaStartTime.trim() || "04:00",
+        start_time: normalizeHtmlTimeValue(areaStartTime) || "04:00",
         end_date: areaEndDate.trim(),
-        end_time: areaEndTime.trim() || "23:59",
+        end_time: normalizeHtmlTimeValue(areaEndTime) || "23:59",
         blockage_geojson: blockageGeojson,
         max_routes: 20,
         transfer_radius_m: 250,
@@ -817,9 +919,9 @@ const App: React.FC = () => {
       const body: Record<string, unknown> = {
         mode: "route",
         start_date: areaStartDate.trim(),
-        start_time: areaStartTime.trim() || "04:00",
+        start_time: normalizeHtmlTimeValue(areaStartTime) || "04:00",
         end_date: areaEndDate.trim(),
-        end_time: areaEndTime.trim() || "23:59",
+        end_time: normalizeHtmlTimeValue(areaEndTime) || "23:59",
         blockage_geojson: blockageGeojson,
         max_routes: 20,
         transfer_radius_m: 250,
@@ -1001,8 +1103,12 @@ const App: React.FC = () => {
             <input
               ref={timeStartInputRef}
               type="time"
-              value={HHMM_RE.test(areaStartTime.trim()) ? areaStartTime.trim() : ""}
-              onChange={(e) => setAreaStartTime(e.target.value)}
+              value={
+                HHMM_RE.test(normalizeHtmlTimeValue(areaStartTime))
+                  ? normalizeHtmlTimeValue(areaStartTime)
+                  : ""
+              }
+              onChange={(e) => setAreaStartTime(normalizeHtmlTimeValue(e.target.value))}
               onKeyDown={(e) => {
                 if (e.key !== "Enter") return;
                 e.preventDefault();
@@ -1026,8 +1132,12 @@ const App: React.FC = () => {
             <input
               ref={timeEndInputRef}
               type="time"
-              value={HHMM_RE.test(areaEndTime.trim()) ? areaEndTime.trim() : ""}
-              onChange={(e) => setAreaEndTime(e.target.value)}
+              value={
+                HHMM_RE.test(normalizeHtmlTimeValue(areaEndTime))
+                  ? normalizeHtmlTimeValue(areaEndTime)
+                  : ""
+              }
+              onChange={(e) => setAreaEndTime(normalizeHtmlTimeValue(e.target.value))}
               onKeyDown={(e) => {
                 if (e.key !== "Enter") return;
                 e.preventDefault();
@@ -1114,6 +1224,15 @@ const App: React.FC = () => {
           >
             {detourLoading ? "Computing…" : "Compute detour"}
           </button>
+          <IncidentDetourV2Panel
+            blockageGeojson={blockageGeojson}
+            startDateYmd={areaStartDate.trim()}
+            startTime={normalizeHtmlTimeValue(areaStartTime)}
+            endDateYmd={areaEndDate.trim()}
+            endTime={normalizeHtmlTimeValue(areaEndTime)}
+            selectedRoute={selectedRoute}
+            onV2Computed={handleV2Computed}
+          />
           <button
             type="button"
             className="btn-time-preset"
@@ -1313,6 +1432,41 @@ const App: React.FC = () => {
             </option>
             <option value="vector_liberty">Vector Liberty (OpenFreeMap)</option>
           </select>
+          <label style={{ display: "block", marginTop: 8 }}>
+            <input
+              type="checkbox"
+              checked={showAllRoutesLayer}
+              onChange={(e) => setShowAllRoutesLayer(e.target.checked)}
+            />{" "}
+            Show all routes
+          </label>
+          <label style={{ display: "block", marginTop: 6 }}>All-routes scope</label>
+          <select
+            className="rail-select"
+            value={allRoutesScope}
+            onChange={(e) => setAllRoutesScope(e.target.value as AllRoutesScope)}
+          >
+            <option value="all">All feed routes</option>
+            <option value="time_window">Active in time window</option>
+          </select>
+          <label style={{ display: "block", marginTop: 6 }}>All-routes mode</label>
+          <select
+            className="rail-select"
+            value={allRoutesRenderMode}
+            onChange={(e) => setAllRoutesRenderMode(e.target.value as AllRoutesRenderMode)}
+          >
+            <option value="balanced">Balanced</option>
+            <option value="always_visible">Always visible</option>
+          </select>
+          <label style={{ display: "block", marginTop: 8 }}>
+            <input
+              type="checkbox"
+              checked={showRoutesHeatLayer}
+              onChange={(e) => setShowRoutesHeatLayer(e.target.checked)}
+              disabled={!showAllRoutesLayer}
+            />{" "}
+            Show overlap heat
+          </label>
           <div className="rail-buttons">
             <button type="button" onClick={() => mapRef.current?.fitToBlockage()} disabled={!blockageGeojson}>
               Fit blockage
@@ -1407,6 +1561,7 @@ const App: React.FC = () => {
       <div className="map-container">
         <MapLibreMap
           ref={mapRef}
+          apiBase={API_BASE}
           center={center}
           stops={stops}
           routeGeojson={routeGeojson as GeoJSON.FeatureCollection | null}
@@ -1421,6 +1576,15 @@ const App: React.FC = () => {
           onStopClick={handleMapStopClick}
           onStopOpenInExplorer={handleOpenStopInExplorer}
           onDrawModeChange={setDrawMode}
+          showAllRoutesLayer={showAllRoutesLayer}
+          allRoutesScope={allRoutesScope}
+          allRoutesStartDate={areaStartDate}
+          allRoutesStartTime={normalizeHtmlTimeValue(areaStartTime)}
+          allRoutesEndDate={areaEndDate}
+          allRoutesEndTime={normalizeHtmlTimeValue(areaEndTime)}
+          showRoutesHeatLayer={showRoutesHeatLayer}
+          allRoutesRenderMode={allRoutesRenderMode}
+          detourV2Overlay={detourV2Overlay}
         />
         {explorerOpen && (
           <ExplorerWindow

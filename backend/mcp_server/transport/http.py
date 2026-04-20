@@ -7,6 +7,7 @@ import hashlib
 import logging.config
 import pickle
 import time
+import traceback
 
 import httpx
 from fastapi import FastAPI, HTTPException, Response
@@ -14,7 +15,12 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from backend.infra.gtfs_updater import update_feed, get_feed_status
 from backend.infra.feed_postgis import load_active_feed
-from backend.domain.pattern_builder import PatternBuilder, RoutePattern
+from backend.domain.pattern_builder import (
+    PatternBuilder,
+    RoutePattern,
+    resolve_most_frequent_route_pattern,
+    resolve_representative_trip_id,
+)
 from backend.domain.graph_builder import (
     GraphBuilder,
     build_graph_for_pattern_from_postgis,
@@ -52,7 +58,7 @@ from backend.domain.detour_street_override_response import (
     build_detour_response_from_road_override,
     build_detour_response_instructions_only,
 )
-from backend.infra.config import VALHALLA_URL, HYBRID_DETOUR_ENABLED
+from backend.infra.config import VALHALLA_URL, HYBRID_DETOUR_ENABLED, DETOUR_V2_ENABLED
 from backend.mcp_server.schemas.api_models import (
     RouteSearchRequest,
     RouteInfo,
@@ -78,6 +84,16 @@ from backend.mcp_server.schemas.api_models import (
     DetourByAreaMode,
     DetourTurnStep,
     GeocodeResult,
+    IncidentCreateRequest,
+    IncidentCreateResponse,
+    DetourComputeV2Request,
+    DetourComputeV2Response,
+    BusEdgeConstraintRequest,
+    BusTurnConstraintRequest,
+    ConstraintCreateResponse,
+    DetourApproveV2Request,
+    DetourApproveV2Response,
+    DetourV2DetailResponse,
 )
 from backend.infra.config import (
     GOVMAP_TILE_UPSTREAM_TEMPLATE,
@@ -97,6 +113,12 @@ from backend.infra import db_access as db_access_module
 from backend.infra.logging_utils import log
 from backend.domain.service_calendar import ServiceCalendar, resolve_service_profile
 from backend.infra.uvicorn_logging import LOGGING_CONFIG
+from backend.domain.detour_v2.compute import compute_detour_for_trip
+from backend.domain.detour_v2.serialize import detour_compute_output_to_dict
+from backend.domain.detour_v2.policy import get_default_policy
+from backend.domain.detour_v2.incident_projector import project_incident_polygon
+from backend.domain.detour_v2 import detour_memory as detour_memory_v2
+from backend.adapters.osm_detour import valhalla_health
 
 logging.config.dictConfig(LOGGING_CONFIG)
 
@@ -402,6 +424,102 @@ def govmap_tile_proxy(z: int, x: int, y: int):
     )
 
 
+@app.get("/api/v1/routes/tiles/{z}/{x}/{y}.mvt")
+def routes_vector_tile(
+    z: int,
+    x: int,
+    y: int,
+    scope: str = "all",
+    render_mode: str = "balanced",
+    start_date: Optional[str] = None,
+    start_time: Optional[str] = None,
+    end_date: Optional[str] = None,
+    end_time: Optional[str] = None,
+):
+    """
+    Route vector tiles for rendering an all-routes background layer.
+
+    scope='all': all route-direction geometries in the active feed.
+    scope='time_window': only route-direction geometries active in the supplied window.
+    """
+    if z < 0 or z > 22:
+        raise HTTPException(status_code=400, detail="z must be between 0 and 22")
+    if x < 0 or y < 0:
+        raise HTTPException(status_code=400, detail="x/y must be non-negative")
+
+    normalized_scope = (scope or "all").strip().lower()
+    if normalized_scope not in ("all", "time_window"):
+        raise HTTPException(status_code=400, detail="scope must be one of: all, time_window")
+    normalized_render_mode = (render_mode or "balanced").strip().lower()
+    if normalized_render_mode not in ("always_visible", "balanced"):
+        raise HTTPException(status_code=400, detail="render_mode must be one of: always_visible, balanced")
+
+    start_date_ymd: Optional[str] = None
+    start_sec: Optional[int] = None
+    end_date_ymd: Optional[str] = None
+    end_sec: Optional[int] = None
+    if normalized_scope == "time_window":
+        start_date_ymd, start_sec, end_date_ymd, end_sec = _parse_window_range(
+            start_date, start_time, end_date, end_time
+        )
+
+    try:
+        tile = db_access_module.get_routes_vector_tile_mvt(
+            z=z,
+            x=x,
+            y=y,
+            scope=normalized_scope,
+            render_mode=normalized_render_mode,
+            start_date_ymd=start_date_ymd,
+            start_sec=start_sec,
+            end_date_ymd=end_date_ymd,
+            end_sec=end_sec,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Could not build route vector tile: {e}")
+
+    # Keep tile caching short so zoom/pan reflects backend tile changes quickly.
+    cache_control = "public, max-age=90, must-revalidate"
+    if normalized_scope == "time_window":
+        cache_control = "public, max-age=30, must-revalidate"
+    log(
+        "routes/tiles",
+        f"scope={normalized_scope} render_mode={normalized_render_mode} z={z} x={x} y={y} bytes={len(tile)}",
+    )
+    return Response(
+        content=tile,
+        media_type="application/vnd.mapbox-vector-tile",
+        headers={
+            "Cache-Control": cache_control,
+        },
+    )
+
+
+@app.get("/api/v1/routes/coverage/{z}/{x}/{y}.mvt")
+def routes_coverage_tile(
+    z: int,
+    x: int,
+    y: int,
+):
+    """Generalized low-zoom route-presence tiles (feed-wide context)."""
+    if z < 0 or z > 22:
+        raise HTTPException(status_code=400, detail="z must be between 0 and 22")
+    if x < 0 or y < 0:
+        raise HTTPException(status_code=400, detail="x/y must be non-negative")
+    try:
+        tile = db_access_module.get_routes_coverage_tile_mvt(z=z, x=x, y=y)
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Could not build route coverage tile: {e}")
+    log("routes/coverage", f"z={z} x={x} y={y} bytes={len(tile)}")
+    return Response(
+        content=tile,
+        media_type="application/vnd.mapbox-vector-tile",
+        headers={"Cache-Control": "public, max-age=180, must-revalidate"},
+    )
+
+
 def _run_graph_cache_warmup(
     profiles: Optional[List[str]] = None,
     *,
@@ -544,6 +662,32 @@ def _run_graph_cache_warmup(
         f"previews_skipped_stale={preview_skip}, errors={GRAPH_WARMUP_STATUS['errors']}",
     )
     return dict(GRAPH_WARMUP_STATUS)
+
+
+@app.on_event("startup")
+def startup_detour_v2_schema():
+    """Create detour v2 / incident tables when missing (older local DBs)."""
+    try:
+        db_access_module.ensure_detour_v2_support_schema()
+        log("db/schema", "detour v2 support tables ensured (if missing)")
+    except Exception as e:
+        log("db/schema", f"ensure detour v2 support schema failed (persist may error until fixed): {e}")
+
+
+@app.on_event("startup")
+def startup_detour_v2_health():
+    """Log Valhalla health at startup (C2). Does not crash on failure."""
+    try:
+        health = valhalla_health(timeout_s=5.0)
+        if health.get("ok"):
+            log(
+                "valhalla/health",
+                f"ok=true version={health.get('version')} tileset_last_modified={health.get('tileset_last_modified')}",
+            )
+        else:
+            log("valhalla/health", f"ok=false error={health.get('error')}")
+    except Exception as e:
+        log("valhalla/health", f"health check exception: {e}")
 
 
 @app.on_event("startup")
@@ -2638,14 +2782,9 @@ def _compute_route_detour_by_area(
         f"cache=miss mode={cache_mode} route_id={route_id!r} direction_id={direction_id!r}",
     )
 
-    patterns_builder = PatternBuilder(feed)
-    patterns = patterns_builder.build_patterns_for_route(
-        route_id=route_id,
-        direction_id=direction_id,
-        yyyymmdd=date_str,
-        max_trips=None,
+    chosen = resolve_most_frequent_route_pattern(
+        feed, route_id, direction_id, date_str
     )
-    chosen = patterns_builder.pick_most_frequent_pattern(patterns) if patterns else None
     if chosen is None:
         res = DetourByAreaRouteResult(
             route_id=route_id,
@@ -3346,17 +3485,46 @@ def area_routes(req: AreaRoutesQuery):
     if not req.polygon_geojson:
         raise HTTPException(status_code=400, detail="polygon_geojson is required")
 
+    request_t0 = time.perf_counter()
     start_date_ymd, start_sec, end_date_ymd, end_sec = _parse_window_range(
         req.start_date, req.start_time, req.end_date, req.end_time
+    )
+    single_day = start_date_ymd == end_date_ymd
+    try:
+        feed_id = db_access_module.get_active_feed_id()
+    except Exception as e:
+        feed_id = "error"
+        log("area/routes", f"phase=feed_lookup_error error_type={type(e).__name__} error={e!s}")
+
+    log(
+        "area/routes",
+        f"phase=request start_date={start_date_ymd} end_date={end_date_ymd} "
+        f"start_time={req.start_time} end_time={req.end_time} max_results={req.max_results} "
+        f"single_day={str(single_day).lower()} feed_id={feed_id}",
     )
 
     try:
         polygon_geojson = _normalize_area_geometry(req.polygon_geojson)
-    except HTTPException:
+    except HTTPException as e:
+        log("area/routes", f"phase=bad_geometry status_code={e.status_code}")
         raise
     except Exception as e:
+        log("area/routes", f"phase=bad_geometry error_type={type(e).__name__} error={e!s}")
         raise HTTPException(status_code=400, detail=f"Invalid polygon_geojson: {e}")
 
+    geom_type = str(polygon_geojson.get("type") or "unknown")
+    bbox_txt = "n/a"
+    try:
+        from shapely.geometry import shape as shapely_shape
+
+        g = shapely_shape(polygon_geojson)
+        minx, miny, maxx, maxy = g.bounds
+        bbox_txt = f"{minx:.5f},{miny:.5f},{maxx:.5f},{maxy:.5f}"
+    except Exception as e:
+        log("area/routes", f"phase=geometry_bounds_error error_type={type(e).__name__} error={e!s}")
+    log("area/routes", f"phase=geometry geom_type={geom_type} bbox={bbox_txt}")
+
+    query_t0 = time.perf_counter()
     try:
         routes_raw = find_routes_in_polygon(
             feed=None,
@@ -3366,12 +3534,19 @@ def area_routes(req: AreaRoutesQuery):
             end_date_ymd=end_date_ymd,
             end_sec=end_sec,
         )
-    except HTTPException:
+        query_elapsed_ms = int((time.perf_counter() - query_t0) * 1000)
+        log("area/routes", f"phase=query_ok elapsed_ms={query_elapsed_ms} route_rows={len(routes_raw)}")
+    except HTTPException as e:
+        query_elapsed_ms = int((time.perf_counter() - query_t0) * 1000)
+        log("area/routes", f"phase=query_http_error status_code={e.status_code} elapsed_ms={query_elapsed_ms}")
         raise
     except Exception as e:
+        query_elapsed_ms = int((time.perf_counter() - query_t0) * 1000)
+        log(
+            "area/routes",
+            f"phase=query_error elapsed_ms={query_elapsed_ms} error_type={type(e).__name__} error={e!s}",
+        )
         # Log full traceback to help diagnose encoding / PostGIS issues.
-        import traceback
-
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Area search failed: {e}")
 
@@ -3438,9 +3613,12 @@ def area_routes(req: AreaRoutesQuery):
                     "Area search only includes trips on scheduled service days."
                 )
 
+    total_elapsed_ms = int((time.perf_counter() - request_t0) * 1000)
     log(
         "area/routes",
-        f"window={start_date_ymd} {req.start_time}-{end_date_ymd} {req.end_time} routes={len(results)}",
+        f"phase=done window={start_date_ymd} {req.start_time}-{end_date_ymd} {req.end_time} "
+        f"routes={len(results)} elapsed_ms={total_elapsed_ms} "
+        f"calendar_hint={'set' if calendar_hint else 'none'}",
     )
     return AreaRoutesResponse(routes=results, calendar_hint=calendar_hint)
 
@@ -3612,4 +3790,343 @@ def stop_routes(req: StopRoutesRequest):
         stop_id=req.stop_id,
         routes=[StopRouteResult(**r) for r in routes_raw],
     )
+
+
+@app.post("/api/v1/incidents", response_model=IncidentCreateResponse)
+def post_incident(req: IncidentCreateRequest):
+    """Create an incident from a polygon; preview affected routes and derived OSM edge bans."""
+    if not DETOUR_V2_ENABLED:
+        raise HTTPException(status_code=503, detail="Detour v2 API is disabled (DETOUR_V2_ENABLED=0).")
+    try:
+        polygon_geojson = _normalize_area_geometry(req.polygon_geojson)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid polygon_geojson: {e}")
+    start_date_ymd, start_sec, end_date_ymd, end_sec = _parse_window_range(
+        req.start_date, req.start_time, req.end_date, req.end_time
+    )
+    try:
+        feed = load_active_feed()
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"GTFS feed could not be loaded: {e}")
+    try:
+        routes_raw = find_routes_in_polygon(
+            feed=feed,
+            polygon_geojson=polygon_geojson,
+            start_date_ymd=start_date_ymd,
+            start_sec=start_sec,
+            end_date_ymd=end_date_ymd,
+            end_sec=end_sec,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Area search failed: {e}")
+    feed_id = db_access_module.get_active_feed_id()
+    proj = project_incident_polygon(
+        blockage_geojson=polygon_geojson,
+        feed_id=feed_id,
+        db_osm_available=True,
+    )
+    try:
+        incident_id = db_access_module.insert_incident(
+            polygon_geojson,
+            req.incident_type,
+            req.description,
+            None,
+            None,
+            req.created_by,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not save incident: {e}")
+    pol = get_default_policy()
+    log(
+        "detours/v2/incident",
+        f"incident_id={incident_id} affected_routes={len(routes_raw)} edge_bans={len(proj.edge_bans)} policy={pol.version}",
+    )
+    return IncidentCreateResponse(
+        incident_id=incident_id,
+        affected_route_count=len(routes_raw),
+        derived_edge_ban_count=len(proj.edge_bans),
+        policy_version=pol.version,
+    )
+
+
+@app.post("/api/v1/detours/compute", response_model=DetourComputeV2Response)
+def post_detours_compute_v2(req: DetourComputeV2Request):
+    """Compute road-graph detours for one or more trips (detour v2 engine)."""
+    if not DETOUR_V2_ENABLED:
+        raise HTTPException(status_code=503, detail="Detour v2 API is disabled (DETOUR_V2_ENABLED=0).")
+    if not req.blockage_geojson:
+        raise HTTPException(status_code=400, detail="blockage_geojson is required")
+    stripped_trip_ids = [t.strip() for t in req.trip_ids if t and str(t).strip()]
+    trip_ids_to_compute: list[str]
+    source: str
+    if stripped_trip_ids:
+        trip_ids_to_compute = stripped_trip_ids
+        source = "trip_ids"
+    else:
+        route = (req.route_id or "").strip()
+        try:
+            feed = load_active_feed()
+        except Exception as e:
+            raise HTTPException(
+                status_code=503,
+                detail=f"GTFS feed could not be loaded. ({e})",
+            )
+        tid = resolve_representative_trip_id(feed, route, req.direction_id, req.service_date)
+        if not tid:
+            raise HTTPException(
+                status_code=400,
+                detail="No patterns found for route/date/direction",
+            )
+        trip_ids_to_compute = [tid]
+        source = "route_id"
+    pol = get_default_policy()
+    log(
+        "detours/v2/compute",
+        " ".join(
+            [
+                f"service_date={req.service_date}",
+                f"incident_id={req.incident_id}",
+                f"persist={req.persist}",
+                f"trip_count={len(trip_ids_to_compute)}",
+                f"source={source}",
+                f"route_id={req.route_id or ''}",
+                f"direction_id={req.direction_id if req.direction_id is not None else ''}",
+            ]
+        ),
+    )
+    results: list[dict] = []
+    detour_request_ids: list[int] = []
+    feed_id = db_access_module.get_active_feed_id()
+    # B3: shared Valhalla response cache for trips on the same shape within this request.
+    valhalla_cache: Dict[str, Any] = {}
+    for trip_id in trip_ids_to_compute:
+        t0 = time.time()
+        rid: Optional[int] = None
+        out = None
+        payload: Dict[str, Any]
+        try:
+            out = compute_detour_for_trip(
+                trip_id=trip_id,
+                blockage_geojson=req.blockage_geojson,
+                service_date=req.service_date,
+                incident_id=req.incident_id,
+                _valhalla_cache=valhalla_cache,
+            )
+            payload = detour_compute_output_to_dict(out)
+        except Exception as e:
+            payload = {
+                "status": "error",
+                "trip_id": trip_id,
+                "route_id": "",
+                "policy_version": pol.version,
+                "error": "compute_exception",
+                "error_type": type(e).__name__,
+                "error_message": str(e),
+                "candidates": [],
+            }
+            log(
+                "detours/v2/compute",
+                " ".join(
+                    [
+                        f"trip_id={trip_id}",
+                        f"service_date={req.service_date}",
+                        f"incident_id={req.incident_id}",
+                        f"source={source}",
+                        f"route_id={req.route_id or ''}",
+                        f"direction_id={req.direction_id if req.direction_id is not None else ''}",
+                        f"error_type={type(e).__name__}",
+                        f"error={e!s}",
+                    ]
+                ),
+            )
+            log("detours/v2/compute", f"trip_id={trip_id} traceback={traceback.format_exc().strip()}")
+        elapsed_ms = int(round((time.time() - t0) * 1000.0))
+        results.append(payload)
+        selected_strategy = ""
+        selected = payload.get("selected")
+        if isinstance(selected, dict):
+            selected_strategy = str(selected.get("strategy") or "")
+        if req.persist:
+            try:
+                route_id_for_persist = ""
+                status_for_persist = str(payload.get("status") or "error")
+                if out is not None:
+                    route_id_for_persist = out.route_id
+                else:
+                    route_id_for_persist = str(payload.get("route_id") or req.route_id or "")
+                rid = detour_memory_v2.save_detour_request(
+                    feed_id=feed_id,
+                    trip_id=trip_id,
+                    route_id=route_id_for_persist,
+                    service_date=req.service_date,
+                    incident_id=req.incident_id,
+                    status=status_for_persist,
+                    payload_json=payload,
+                )
+                if out is not None:
+                    detour_memory_v2.save_candidates(rid, out.candidates)
+                detour_request_ids.append(rid)
+                log("detours/v2/compute", f"trip_id={trip_id} persist_ok=true request_id={rid}")
+            except Exception as e:
+                log(
+                    "detours/v2/compute",
+                    f"persist_error trip_id={trip_id} error_type={type(e).__name__} err={e!s}",
+                )
+                log("detours/v2/compute", f"persist_error trip_id={trip_id} traceback={traceback.format_exc().strip()}")
+        log(
+            "detours/v2/compute",
+            " ".join(
+                [
+                    f"trip_id={trip_id}",
+                    f"route_id={payload.get('route_id') or ''}",
+                    f"status={payload.get('status') or ''}",
+                    f"error={payload.get('error') or ''}",
+                    f"candidates={len(payload.get('candidates') or [])}",
+                    f"selected_strategy={selected_strategy}",
+                    f"request_id={rid if rid is not None else ''}",
+                    f"elapsed_ms={elapsed_ms}",
+                ]
+            ),
+        )
+    return DetourComputeV2Response(
+        results=results,
+        detour_request_ids=detour_request_ids,
+        policy_version=pol.version,
+    )
+
+
+@app.get("/api/v1/detours/policy")
+def get_detour_policy():
+    """Return the live DetourPolicyConfig as JSON (F1 - debug endpoint)."""
+    if not DETOUR_V2_ENABLED:
+        raise HTTPException(status_code=503, detail="Detour v2 API is disabled.")
+    return get_default_policy().to_dict()
+
+
+@app.post("/api/v1/constraints/edge", response_model=ConstraintCreateResponse)
+def post_bus_edge_constraint(req: BusEdgeConstraintRequest):
+    if not DETOUR_V2_ENABLED:
+        raise HTTPException(status_code=503, detail="Detour v2 API is disabled.")
+    try:
+        cid = db_access_module.insert_bus_edge_constraint(
+            osm_way_id=req.osm_way_id,
+            direction=req.direction,
+            constraint_type=req.constraint_type,
+            severity=req.severity,
+            reason_code=req.reason_code,
+            notes=req.notes,
+            created_by=req.created_by,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    return ConstraintCreateResponse(id=cid)
+
+
+@app.post("/api/v1/constraints/turn", response_model=ConstraintCreateResponse)
+def post_bus_turn_constraint(req: BusTurnConstraintRequest):
+    if not DETOUR_V2_ENABLED:
+        raise HTTPException(status_code=503, detail="Detour v2 API is disabled.")
+    try:
+        cid = db_access_module.insert_bus_turn_constraint(
+            from_way_id=req.from_way_id,
+            via_node_id=req.via_node_id,
+            to_way_id=req.to_way_id,
+            constraint_type=req.constraint_type,
+            severity=req.severity,
+            reason_code=req.reason_code,
+            notes=req.notes,
+            created_by=req.created_by,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    return ConstraintCreateResponse(id=cid)
+
+
+@app.post("/api/v1/detours/{detour_request_id}/approve", response_model=DetourApproveV2Response)
+def post_detour_approve_v2(detour_request_id: int, req: DetourApproveV2Request):
+    if not DETOUR_V2_ENABLED:
+        raise HTTPException(status_code=503, detail="Detour v2 API is disabled.")
+    full = db_access_module.get_detour_request_full(detour_request_id)
+    if not full:
+        log("detours/v2/approve", f"detour_request_id={detour_request_id} not_found=true")
+        raise HTTPException(status_code=404, detail="detour request not found")
+    req_row = full["request"]
+    cands = full.get("candidates") or []
+    chosen = None
+    for c in cands:
+        if c.get("accepted"):
+            chosen = c
+            break
+    if chosen is None and cands:
+        chosen = min(cands, key=lambda x: float(x.get("score") or 1e30))
+    if chosen is None:
+        log("detours/v2/approve", f"detour_request_id={detour_request_id} no_candidates=true")
+        raise HTTPException(status_code=400, detail="no candidates to approve")
+    import json as _json
+
+    road_seq = chosen.get("road_sequence_json")
+    if isinstance(road_seq, str):
+        try:
+            road_seq = _json.loads(road_seq)
+        except Exception:
+            road_seq = []
+    elif road_seq is None:
+        road_seq = []
+    geom = chosen.get("geometry_json")
+    if isinstance(geom, str):
+        try:
+            geom = _json.loads(geom)
+        except Exception:
+            geom = {}
+    feed_id = int(req_row["feed_id"])
+    route_id = str(req_row["route_id"])
+    trip_id = str(req_row["trip_id"])
+    sig = f"{trip_id}:{req_row.get('service_date')}"
+    inc = req_row.get("incident_id")
+    inc_sig = str(inc) if inc is not None else "none"
+    try:
+        aid = db_access_module.insert_approved_detour(
+            feed_id=feed_id,
+            route_id=route_id,
+            trip_pattern_key=sig,
+            incident_signature=inc_sig,
+            geometry_json=geom if isinstance(geom, dict) else {},
+            road_sequence_json=road_seq,
+            turn_sequence_json=chosen.get("turn_sequence_json") or [],
+            approved_by=req.approved_by,
+        )
+    except Exception as e:
+        log(
+            "detours/v2/approve",
+            f"detour_request_id={detour_request_id} write_failed=true error_type={type(e).__name__} err={e!s}",
+        )
+        log("detours/v2/approve", f"detour_request_id={detour_request_id} traceback={traceback.format_exc().strip()}")
+        raise HTTPException(status_code=500, detail=str(e))
+    for seg in road_seq:
+        if not isinstance(seg, dict):
+            continue
+        wid = seg.get("osm_way_id")
+        if wid:
+            try:
+                detour_memory_v2.bump_edge_evidence(int(wid), seg.get("direction"))
+            except Exception:
+                pass
+    log(
+        "detours/v2/approve",
+        f"detour_request_id={detour_request_id} approved_detour_id={aid} route_id={route_id} trip_id={trip_id}",
+    )
+    return DetourApproveV2Response(approved_detour_id=aid)
+
+
+@app.get("/api/v1/detours/{detour_request_id}", response_model=DetourV2DetailResponse)
+def get_detour_v2_detail(detour_request_id: int):
+    if not DETOUR_V2_ENABLED:
+        raise HTTPException(status_code=503, detail="Detour v2 API is disabled.")
+    full = db_access_module.get_detour_request_full(detour_request_id)
+    if not full:
+        log("detours/v2/detail", f"detour_request_id={detour_request_id} not_found=true")
+        raise HTTPException(status_code=404, detail="detour request not found")
+    return DetourV2DetailResponse(request=dict(full["request"]), candidates=full.get("candidates") or [])
 

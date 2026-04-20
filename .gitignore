@@ -16,6 +16,8 @@ frontend/.vite/
 
 ### Local data, caches, binaries
 data/
+osm/valhalla_tiles/
+*.osm.pbf
 *.db
 *.sqlite
 *.sqlite3

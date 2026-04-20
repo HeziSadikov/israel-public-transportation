@@ -115,3 +115,31 @@ class PatternBuilder:
             return None
         return max(patterns.values(), key=lambda p: p.frequency)
 
+
+def resolve_most_frequent_route_pattern(
+    feed: Any,
+    route_id: str,
+    direction_id: Optional[str],
+    yyyymmdd: str,
+) -> Optional[RoutePattern]:
+    """Same pattern choice as legacy detours/by-area: most frequent stop-sequence pattern on service date."""
+    pb = PatternBuilder(feed)
+    patterns = pb.build_patterns_for_route(
+        route_id=route_id,
+        direction_id=direction_id,
+        yyyymmdd=yyyymmdd,
+        max_trips=None,
+    )
+    return pb.pick_most_frequent_pattern(patterns) if patterns else None
+
+
+def resolve_representative_trip_id(
+    feed: Any,
+    route_id: str,
+    direction_id: Optional[str],
+    yyyymmdd: str,
+) -> Optional[str]:
+    """GTFS trip id for the representative trip of the main pattern (detour v2 trip-scoped context)."""
+    chosen = resolve_most_frequent_route_pattern(feed, route_id, direction_id, yyyymmdd)
+    return chosen.representative_trip_id if chosen else None
+

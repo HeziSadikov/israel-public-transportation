@@ -36,6 +36,8 @@ const RASTER_BASEMAP_PAINT: maplibregl.RasterLayerSpecification["paint"] = {
 };
 
 export type BasemapKind = "osm" | "carto_light" | "vector_liberty" | "govmap";
+export type AllRoutesScope = "all" | "time_window";
+export type AllRoutesRenderMode = "always_visible" | "balanced";
 const BASEMAP_RASTER_SOURCE = "basemap-raster-source";
 const BASEMAP_RASTER_LAYER = "basemap-raster";
 
@@ -230,6 +232,11 @@ const DRAW_STYLES: any[] = [
 ];
 
 const SOURCE_ROUTE = "route";
+const SOURCE_ALL_ROUTES_COVERAGE = "all-routes-coverage";
+const SOURCE_ALL_ROUTES = "all-routes";
+const LAYER_ALL_ROUTES_COVERAGE = "all-routes-coverage-line";
+const LAYER_ALL_ROUTES = "all-routes-line";
+const LAYER_ALL_ROUTES_HEAT = "all-routes-heat-line";
 const SOURCE_DETOUR = "detour";
 const SOURCE_STOPS = "stops";
 const SOURCE_PIN = "pin";
@@ -241,6 +248,63 @@ const SOURCE_MANUAL_DETOUR_DRAFT = "manual-detour-draft";
 const LAYER_MANUAL_DETOUR_DRAFT = "manual-detour-draft-line";
 
 const EMPTY_FC: GeoJSONFeatureCollection = { type: "FeatureCollection", features: [] };
+
+function normalizeApiBase(apiBase: string): string {
+  return apiBase.endsWith("/") ? apiBase.slice(0, -1) : apiBase;
+}
+
+function allRoutesTilesUrl(
+  apiBase: string,
+  scope: AllRoutesScope,
+  renderMode: AllRoutesRenderMode,
+  startDate: string,
+  startTime: string,
+  endDate: string,
+  endTime: string
+): string {
+  const params = new URLSearchParams();
+  params.set("scope", scope);
+  params.set("render_mode", renderMode);
+  if (scope === "time_window") {
+    params.set("start_date", startDate);
+    params.set("start_time", startTime);
+    params.set("end_date", endDate);
+    params.set("end_time", endTime);
+  }
+  return `${normalizeApiBase(apiBase)}/routes/tiles/{z}/{x}/{y}.mvt?${params.toString()}`;
+}
+
+function allRoutesCoverageTilesUrl(apiBase: string): string {
+  return `${normalizeApiBase(apiBase)}/routes/coverage/{z}/{x}/{y}.mvt`;
+}
+
+function baseLineWidthExpr(mode: AllRoutesRenderMode): any[] {
+  if (mode === "always_visible") {
+    return ["interpolate", ["linear"], ["zoom"], 0, 0.36, 4, 0.52, 7, 0.82, 11, 1.55, 14, 2.4, 16, 3.0, 19, 3.9];
+  }
+  return ["interpolate", ["linear"], ["zoom"], 0, 0.2, 4, 0.28, 7, 0.42, 11, 1.0, 14, 1.7, 16, 2.2, 19, 2.8];
+}
+
+function baseLineOpacityExpr(mode: AllRoutesRenderMode): any[] {
+  if (mode === "always_visible") {
+    return ["interpolate", ["linear"], ["zoom"], 0, 0.2, 5, 0.25, 8, 0.3, 12, 0.37, 16, 0.43, 19, 0.5];
+  }
+  return ["interpolate", ["linear"], ["zoom"], 0, 0.12, 5, 0.15, 8, 0.2, 12, 0.27, 16, 0.33, 19, 0.38];
+}
+
+function heatLineWidthExpr(mode: AllRoutesRenderMode): any[] {
+  if (mode === "always_visible") {
+    return ["interpolate", ["linear"], ["zoom"], 0, 0.48, 4, 0.66, 7, 1.0, 11, 2.0, 14, 3.1, 16, 4.0, 19, 5.0];
+  }
+  return ["interpolate", ["linear"], ["zoom"], 0, 0.28, 4, 0.38, 7, 0.6, 11, 1.5, 14, 2.5, 16, 3.1, 19, 3.8];
+}
+
+function heatLineOpacityExpr(mode: AllRoutesRenderMode): any[] {
+  if (mode === "always_visible") {
+    return ["interpolate", ["linear"], ["zoom"], 0, 0.32, 5, 0.4, 8, 0.5, 12, 0.6, 16, 0.68, 19, 0.74];
+  }
+  return ["interpolate", ["linear"], ["zoom"], 0, 0.22, 5, 0.3, 8, 0.4, 12, 0.5, 16, 0.57, 19, 0.63];
+}
 
 function normalizeToFeatureCollection(input: unknown): GeoJSONFeatureCollection {
   if (!input || typeof input !== "object") return EMPTY_FC;
@@ -371,6 +435,7 @@ export type MapLibreMapHandle = {
 };
 
 export type MapLibreMapProps = {
+  apiBase: string;
   /** Center as [lat, lng] (converted to [lng, lat] for MapLibre) */
   center: [number, number];
   stops: { stop_id: string; name: string; stop_code?: string | null; lat: number; lon: number; sequence: number }[];
@@ -396,6 +461,27 @@ export type MapLibreMapProps = {
   manualDraftDetourLine?: GeoJSON.LineString | null;
   /** Called when the user finishes or edits the manual detour line in MapboxDraw. */
   onManualDetourLineChange?: (geom: GeoJSON.LineString | null) => void;
+  /** Show country-level routes layer sourced from vector tiles. */
+  showAllRoutesLayer?: boolean;
+  /** Layer scope: all feed routes or routes active in selected time window. */
+  allRoutesScope?: AllRoutesScope;
+  /** Time window passed to vector-tile API when allRoutesScope is time_window. */
+  allRoutesStartDate?: string;
+  allRoutesStartTime?: string;
+  allRoutesEndDate?: string;
+  allRoutesEndTime?: string;
+  showRoutesHeatLayer?: boolean;
+  allRoutesRenderMode?: AllRoutesRenderMode;
+  /** Detour v2 overlay: exit/rejoin anchor pins and skipped-stop markers (E4). */
+  detourV2Overlay?: {
+    exitLon?: number | null;
+    exitLat?: number | null;
+    rejoinLon?: number | null;
+    rejoinLat?: number | null;
+    exitStopId?: string | null;
+    rejoinStopId?: string | null;
+    skippedStopIds?: string[];
+  } | null;
 };
 
 type StopRole = "first" | "last" | "middle" | "both";
@@ -430,6 +516,7 @@ function rolesForStops(stops: MapLibreMapProps["stops"]): Map<string, StopRole> 
 
 const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(function MapLibreMap(
   {
+    apiBase,
     center,
     stops,
     routeGeojson,
@@ -444,6 +531,15 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
     onDrawModeChange,
     manualDraftDetourLine = null,
     onManualDetourLineChange,
+    showAllRoutesLayer = false,
+    detourV2Overlay = null,
+    allRoutesScope = "all",
+    allRoutesStartDate = "",
+    allRoutesStartTime = "",
+    allRoutesEndDate = "",
+    allRoutesEndTime = "",
+    showRoutesHeatLayer = false,
+    allRoutesRenderMode = "balanced",
   },
   ref
 ) {
@@ -469,6 +565,13 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
   const basemapRef = useRef<BasemapKind>(effectiveBasemap(basemap));
   const initialBasemapRef = useRef<BasemapKind>(effectiveBasemap(basemap));
   const [mapReady, setMapReady] = useState(false);
+  const allRoutesTileUrlRef = useRef("");
+  const allRoutesTileUrlAppliedRef = useRef("");
+  const allRoutesCoverageTileUrlRef = useRef("");
+  const allRoutesCoverageTileUrlAppliedRef = useRef("");
+  const showAllRoutesLayerRef = useRef(false);
+  const showRoutesHeatLayerRef = useRef(false);
+  const allRoutesRenderModeRef = useRef<AllRoutesRenderMode>("balanced");
 
   blockageRef.current = blockageGeojson;
   blockagePropRef.current = blockageGeojson;
@@ -486,6 +589,19 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
   onManualDetourLineChangeRef.current = onManualDetourLineChange;
   const manualDraftDetourLinePropRef = useRef<GeoJSON.LineString | null>(null);
   manualDraftDetourLinePropRef.current = manualDraftDetourLine;
+  allRoutesTileUrlRef.current = allRoutesTilesUrl(
+    apiBase,
+    allRoutesScope,
+    allRoutesRenderMode,
+    allRoutesStartDate,
+    allRoutesStartTime,
+    allRoutesEndDate,
+    allRoutesEndTime
+  );
+  allRoutesCoverageTileUrlRef.current = allRoutesCoverageTilesUrl(apiBase);
+  showAllRoutesLayerRef.current = showAllRoutesLayer;
+  showRoutesHeatLayerRef.current = showRoutesHeatLayer;
+  allRoutesRenderModeRef.current = allRoutesRenderMode;
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -586,6 +702,123 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
         });
       }
 
+      if (!map.getSource(SOURCE_ALL_ROUTES)) {
+        map.addSource(SOURCE_ALL_ROUTES, {
+          type: "vector",
+          tiles: [allRoutesTileUrlRef.current],
+          minzoom: 0,
+          maxzoom: 22,
+        } as maplibregl.VectorTileSourceSpecification);
+        allRoutesTileUrlAppliedRef.current = allRoutesTileUrlRef.current;
+      }
+      if (!map.getSource(SOURCE_ALL_ROUTES_COVERAGE)) {
+        map.addSource(SOURCE_ALL_ROUTES_COVERAGE, {
+          type: "vector",
+          tiles: [allRoutesCoverageTileUrlRef.current],
+          minzoom: 0,
+          maxzoom: 22,
+        } as maplibregl.VectorTileSourceSpecification);
+        allRoutesCoverageTileUrlAppliedRef.current = allRoutesCoverageTileUrlRef.current;
+      }
+      if (!map.getLayer(LAYER_ALL_ROUTES_COVERAGE)) {
+        map.addLayer(
+          {
+            id: LAYER_ALL_ROUTES_COVERAGE,
+            type: "line",
+            source: SOURCE_ALL_ROUTES_COVERAGE,
+            "source-layer": "coverage",
+            minzoom: 0,
+            maxzoom: 10.5,
+            layout: {
+              visibility: showAllRoutesLayerRef.current ? "visible" : "none",
+              "line-cap": "round",
+              "line-join": "round",
+            },
+            paint: {
+              "line-color": "#2563eb",
+              "line-width": ["interpolate", ["linear"], ["zoom"], 0, 0.6, 3, 0.8, 6, 1.1, 9, 1.6, 10.5, 2.0],
+              "line-opacity": ["interpolate", ["linear"], ["zoom"], 0, 0.3, 4, 0.35, 8, 0.42, 10.5, 0.48],
+            },
+          },
+          "route-line"
+        );
+      } else {
+        map.setLayoutProperty(
+          LAYER_ALL_ROUTES_COVERAGE,
+          "visibility",
+          showAllRoutesLayerRef.current ? "visible" : "none"
+        );
+      }
+      if (!map.getLayer(LAYER_ALL_ROUTES)) {
+        map.addLayer(
+          {
+            id: LAYER_ALL_ROUTES,
+            type: "line",
+            source: SOURCE_ALL_ROUTES,
+            "source-layer": "routes",
+            minzoom: 7,
+            layout: {
+              visibility: showAllRoutesLayerRef.current ? "visible" : "none",
+              "line-cap": "round",
+              "line-join": "round",
+            },
+            paint: {
+              "line-color": "#1d4ed8",
+              "line-width": baseLineWidthExpr(allRoutesRenderModeRef.current),
+              "line-opacity": baseLineOpacityExpr(allRoutesRenderModeRef.current),
+            },
+          },
+          "route-line"
+        );
+      } else {
+        map.setLayoutProperty(
+          LAYER_ALL_ROUTES,
+          "visibility",
+          showAllRoutesLayerRef.current ? "visible" : "none"
+        );
+      }
+      if (!map.getLayer(LAYER_ALL_ROUTES_HEAT)) {
+        map.addLayer(
+          {
+            id: LAYER_ALL_ROUTES_HEAT,
+            type: "line",
+            source: SOURCE_ALL_ROUTES,
+            "source-layer": "routes",
+            minzoom: 7,
+            layout: {
+              visibility:
+                showAllRoutesLayerRef.current && showRoutesHeatLayerRef.current ? "visible" : "none",
+              "line-cap": "round",
+              "line-join": "round",
+            },
+            paint: {
+              "line-color": [
+                "interpolate",
+                ["linear"],
+                ["coalesce", ["get", "intensity"], 0],
+                0,
+                "#1d4ed8",
+                0.35,
+                "#06b6d4",
+                0.6,
+                "#f59e0b",
+                1,
+                "#dc2626",
+              ],
+              "line-width": heatLineWidthExpr(allRoutesRenderModeRef.current),
+              "line-opacity": heatLineOpacityExpr(allRoutesRenderModeRef.current),
+            },
+          },
+          "route-line"
+        );
+      } else {
+        map.setLayoutProperty(
+          LAYER_ALL_ROUTES_HEAT,
+          "visibility",
+          showAllRoutesLayerRef.current && showRoutesHeatLayerRef.current ? "visible" : "none"
+        );
+      }
+
       if (!map.getSource(SOURCE_DETOUR)) {
         map.addSource(SOURCE_DETOUR, { type: "geojson", data: emptyFc });
         map.addLayer({
@@ -593,6 +826,48 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
           type: "line",
           source: SOURCE_DETOUR,
           paint: { "line-color": "#16a34a", "line-width": 6 },
+        });
+      }
+
+      // Detour v2 anchor + skipped-stop overlay (E4).
+      const SOURCE_V2_OVERLAY = "detour-v2-overlay";
+      if (!map.getSource(SOURCE_V2_OVERLAY)) {
+        map.addSource(SOURCE_V2_OVERLAY, { type: "geojson", data: emptyFc });
+        map.addLayer({
+          id: "detour-v2-skipped-stops",
+          type: "circle",
+          source: SOURCE_V2_OVERLAY,
+          filter: ["==", ["get", "role"], "skipped"],
+          paint: {
+            "circle-radius": 7,
+            "circle-color": "#9ca3af",
+            "circle-stroke-color": "#6b7280",
+            "circle-stroke-width": 1.5,
+          },
+        });
+        map.addLayer({
+          id: "detour-v2-anchor-exit",
+          type: "circle",
+          source: SOURCE_V2_OVERLAY,
+          filter: ["==", ["get", "role"], "exit"],
+          paint: {
+            "circle-radius": 9,
+            "circle-color": "#f59e0b",
+            "circle-stroke-color": "#92400e",
+            "circle-stroke-width": 2,
+          },
+        });
+        map.addLayer({
+          id: "detour-v2-anchor-rejoin",
+          type: "circle",
+          source: SOURCE_V2_OVERLAY,
+          filter: ["==", ["get", "role"], "rejoin"],
+          paint: {
+            "circle-radius": 9,
+            "circle-color": "#3b82f6",
+            "circle-stroke-color": "#1e40af",
+            "circle-stroke-width": 2,
+          },
         });
       }
 
@@ -1014,7 +1289,143 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
     syncManualDetourDraftOverlay(map, manualDraftDetourLine);
   }, [mapReady, manualDraftDetourLine]);
 
+  // Route tiles source + all-routes layers (base + heat)
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !mapReady) return;
+    const desiredUrl = allRoutesTileUrlRef.current;
+    const currentUrl = allRoutesTileUrlAppliedRef.current;
+    if (currentUrl !== desiredUrl) {
+      if (map.getLayer(LAYER_ALL_ROUTES_HEAT)) map.removeLayer(LAYER_ALL_ROUTES_HEAT);
+      if (map.getLayer(LAYER_ALL_ROUTES)) map.removeLayer(LAYER_ALL_ROUTES);
+      if (map.getSource(SOURCE_ALL_ROUTES)) map.removeSource(SOURCE_ALL_ROUTES);
+      map.addSource(SOURCE_ALL_ROUTES, {
+        type: "vector",
+        tiles: [desiredUrl],
+        minzoom: 0,
+        maxzoom: 22,
+      } as maplibregl.VectorTileSourceSpecification);
+      map.addLayer(
+        {
+          id: LAYER_ALL_ROUTES,
+          type: "line",
+          source: SOURCE_ALL_ROUTES,
+          "source-layer": "routes",
+          minzoom: 7,
+          layout: {
+            visibility: showAllRoutesLayer ? "visible" : "none",
+            "line-cap": "round",
+            "line-join": "round",
+          },
+          paint: {
+            "line-color": "#1d4ed8",
+            "line-width": baseLineWidthExpr(allRoutesRenderMode),
+            "line-opacity": baseLineOpacityExpr(allRoutesRenderMode),
+          },
+        },
+        "route-line"
+      );
+      map.addLayer(
+        {
+          id: LAYER_ALL_ROUTES_HEAT,
+          type: "line",
+          source: SOURCE_ALL_ROUTES,
+          "source-layer": "routes",
+          minzoom: 7,
+          layout: {
+            visibility: showAllRoutesLayer && showRoutesHeatLayer ? "visible" : "none",
+            "line-cap": "round",
+            "line-join": "round",
+          },
+          paint: {
+            "line-color": [
+              "interpolate",
+              ["linear"],
+              ["coalesce", ["get", "intensity"], 0],
+              0,
+              "#1d4ed8",
+              0.35,
+              "#06b6d4",
+              0.6,
+              "#f59e0b",
+              1,
+              "#dc2626",
+            ],
+            "line-width": heatLineWidthExpr(allRoutesRenderMode),
+            "line-opacity": heatLineOpacityExpr(allRoutesRenderMode),
+          },
+        },
+        "route-line"
+      );
+      allRoutesTileUrlAppliedRef.current = desiredUrl;
+      return;
+    }
+    if (map.getLayer(LAYER_ALL_ROUTES)) {
+      map.setLayoutProperty(LAYER_ALL_ROUTES, "visibility", showAllRoutesLayer ? "visible" : "none");
+    }
+    if (map.getLayer(LAYER_ALL_ROUTES_COVERAGE)) {
+      map.setLayoutProperty(LAYER_ALL_ROUTES_COVERAGE, "visibility", showAllRoutesLayer ? "visible" : "none");
+    }
+    if (map.getLayer(LAYER_ALL_ROUTES_HEAT)) {
+      map.setLayoutProperty(
+        LAYER_ALL_ROUTES_HEAT,
+        "visibility",
+        showAllRoutesLayer && showRoutesHeatLayer ? "visible" : "none"
+      );
+    }
+  }, [
+    mapReady,
+    showAllRoutesLayer,
+    showRoutesHeatLayer,
+    allRoutesRenderMode,
+    allRoutesScope,
+    allRoutesStartDate,
+    allRoutesStartTime,
+    allRoutesEndDate,
+    allRoutesEndTime,
+    apiBase,
+  ]);
+
+  // Coverage source URL stays stable but can change with API base.
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !mapReady) return;
+    const desiredCoverageUrl = allRoutesCoverageTileUrlRef.current;
+    if (allRoutesCoverageTileUrlAppliedRef.current === desiredCoverageUrl) return;
+    if (map.getLayer(LAYER_ALL_ROUTES_COVERAGE)) map.removeLayer(LAYER_ALL_ROUTES_COVERAGE);
+    if (map.getSource(SOURCE_ALL_ROUTES_COVERAGE)) map.removeSource(SOURCE_ALL_ROUTES_COVERAGE);
+    map.addSource(SOURCE_ALL_ROUTES_COVERAGE, {
+      type: "vector",
+      tiles: [desiredCoverageUrl],
+      minzoom: 0,
+      maxzoom: 22,
+    } as maplibregl.VectorTileSourceSpecification);
+    map.addLayer(
+      {
+        id: LAYER_ALL_ROUTES_COVERAGE,
+        type: "line",
+        source: SOURCE_ALL_ROUTES_COVERAGE,
+        "source-layer": "coverage",
+        minzoom: 0,
+        maxzoom: 10.5,
+        layout: {
+          visibility: showAllRoutesLayer ? "visible" : "none",
+          "line-cap": "round",
+          "line-join": "round",
+        },
+        paint: {
+          "line-color": "#2563eb",
+          "line-width": ["interpolate", ["linear"], ["zoom"], 0, 0.6, 3, 0.8, 6, 1.1, 9, 1.6, 10.5, 2.0],
+          "line-opacity": ["interpolate", ["linear"], ["zoom"], 0, 0.3, 4, 0.35, 8, 0.42, 10.5, 0.48],
+        },
+      },
+      "route-line"
+    );
+    allRoutesCoverageTileUrlAppliedRef.current = desiredCoverageUrl;
+  }, [mapReady, apiBase, showAllRoutesLayer]);
+
   // Route source data
+
   useEffect(() => {
     const map = mapRef.current;
     if (!map || !mapReady) return;
@@ -1032,6 +1443,44 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
     if (!source) return;
     source.setData(normalizeToFeatureCollection(detour?.path_geojson ?? null) as any);
   }, [mapReady, detour]);
+
+  // E4: Update v2 overlay (anchor pins + skipped stops).
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !mapReady) return;
+    const source = map.getSource("detour-v2-overlay") as maplibregl.GeoJSONSource | undefined;
+    if (!source) return;
+    const features: GeoJSONFeature[] = [];
+    const ov = detourV2Overlay;
+    if (ov) {
+      if (ov.exitLon != null && ov.exitLat != null) {
+        features.push({
+          type: "Feature",
+          geometry: { type: "Point", coordinates: [ov.exitLon, ov.exitLat] },
+          properties: { role: "exit", stop_id: ov.exitStopId ?? "" },
+        });
+      }
+      if (ov.rejoinLon != null && ov.rejoinLat != null) {
+        features.push({
+          type: "Feature",
+          geometry: { type: "Point", coordinates: [ov.rejoinLon, ov.rejoinLat] },
+          properties: { role: "rejoin", stop_id: ov.rejoinStopId ?? "" },
+        });
+      }
+      // Skipped stops: find their lon/lat from the route stops list.
+      const skippedSet = new Set(ov.skippedStopIds ?? []);
+      for (const stop of stops) {
+        if (skippedSet.has(stop.stop_id)) {
+          features.push({
+            type: "Feature",
+            geometry: { type: "Point", coordinates: [stop.lon, stop.lat] },
+            properties: { role: "skipped", stop_id: stop.stop_id, name: stop.name },
+          });
+        }
+      }
+    }
+    source.setData({ type: "FeatureCollection", features } as any);
+  }, [mapReady, detourV2Overlay, stops]);
 
   // Stops source data
   useEffect(() => {

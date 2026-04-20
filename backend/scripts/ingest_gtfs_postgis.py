@@ -584,6 +584,82 @@ def ingest_gtfs(
                     f"phase=build_shapes_lines done elapsed_s={time.perf_counter() - t_shapes_lines:.2f}",
                 )
 
+                # Build GTFS->OSM bus-way evidence (feed-scoped) for strict detour-v2 compatibility checks.
+                # This is intentionally a conservative spatial association stage:
+                # shape line buffered proximity -> OSM road segment way ids.
+                print("[ingest] Building gtfs_bus_way_evidence ...", flush=True)
+                log("ingest", "phase=build_gtfs_bus_way_evidence start")
+                t_gtfs_way_ev = time.perf_counter()
+                cur.execute(
+                    """
+                    DELETE FROM gtfs_bus_way_evidence
+                    WHERE feed_id = %s
+                    """,
+                    (feed_id,),
+                )
+                cur.execute(
+                    """
+                    WITH trip_shape_hits AS (
+                        SELECT
+                            t.feed_id,
+                            t.trip_id,
+                            t.route_id,
+                            COALESCE(t.direction_id::text, '') AS direction,
+                            ors.osm_way_id
+                        FROM trips t
+                        JOIN shapes_lines sl
+                          ON sl.feed_id = t.feed_id
+                         AND sl.shape_id = t.shape_id
+                        JOIN osm_road_segments ors
+                          ON ST_DWithin(sl.geom::geography, ors.geom::geography, 30.0)
+                        WHERE t.feed_id = %s
+                          AND t.shape_id IS NOT NULL
+                    ),
+                    agg AS (
+                        SELECT
+                            feed_id,
+                            osm_way_id,
+                            direction,
+                            COUNT(DISTINCT trip_id)::int AS trip_count,
+                            COUNT(DISTINCT route_id)::int AS route_count,
+                            TO_JSONB((ARRAY_AGG(DISTINCT trip_id ORDER BY trip_id))[1:8]) AS sample_trip_ids_json
+                        FROM trip_shape_hits
+                        GROUP BY feed_id, osm_way_id, direction
+                    )
+                    INSERT INTO gtfs_bus_way_evidence (
+                        feed_id,
+                        osm_way_id,
+                        direction,
+                        trip_count,
+                        route_count,
+                        sample_trip_ids_json,
+                        confidence_score,
+                        last_computed_at
+                    )
+                    SELECT
+                        a.feed_id,
+                        a.osm_way_id,
+                        a.direction,
+                        a.trip_count,
+                        a.route_count,
+                        a.sample_trip_ids_json,
+                        LEAST(1.0, GREATEST(0.05, LN(1 + a.trip_count) / LN(1 + 25)))::double precision AS confidence_score,
+                        NOW()
+                    FROM agg a
+                    ON CONFLICT (feed_id, osm_way_id, direction) DO UPDATE SET
+                        trip_count = EXCLUDED.trip_count,
+                        route_count = EXCLUDED.route_count,
+                        sample_trip_ids_json = EXCLUDED.sample_trip_ids_json,
+                        confidence_score = EXCLUDED.confidence_score,
+                        last_computed_at = NOW()
+                    """,
+                    (feed_id,),
+                )
+                log(
+                    "ingest",
+                    f"phase=build_gtfs_bus_way_evidence done elapsed_s={time.perf_counter() - t_gtfs_way_ev:.2f}",
+                )
+
                 # Compute basic trip_time_bounds from stop_times
                 print("[ingest] Computing trip_time_bounds ...", flush=True)
                 log("ingest", "phase=build_trip_time_bounds start")
@@ -630,6 +706,22 @@ def ingest_gtfs(
         conn.commit()
         log("ingest", f"phase=transaction_commit done elapsed_s={time.perf_counter() - t_commit:.2f}")
         print(f"[ingest] Completed successfully for feed_id={feed_id}")
+
+        # Bulk INSERT leaves statistics stale; bad plans can make /area/routes and spatial joins slow.
+        try:
+            t_an = time.perf_counter()
+            with conn.cursor() as cur:
+                cur.execute(
+                    "ANALYZE shapes_lines, trips, trip_time_bounds, calendar, calendar_dates, stop_times"
+                )
+            conn.commit()
+            log(
+                "ingest",
+                f"phase=post_ingest_analyze done elapsed_s={time.perf_counter() - t_an:.2f}",
+            )
+        except Exception as e:
+            conn.rollback()
+            log("ingest", f"phase=post_ingest_analyze failed err={e!s}")
     finally:
         conn.close()
 

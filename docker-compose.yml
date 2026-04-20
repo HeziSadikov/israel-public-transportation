@@ -1,6 +1,5 @@
 # Postgres/PostGIS for Israel GTFS Detour Router (primary data layer).
 # Optional: run the API with DATABASE_URL pointing at this service.
-version: "3.8"
 
 services:
   postgis:
@@ -52,6 +51,8 @@ services:
     image: ghcr.io/valhalla/valhalla-scripted:latest
     container_name: valhalla-israel
     environment:
+      # If auto-download saves a ~200 byte file, delete it and follow osm/README.md (manual .pbf).
+      tile_urls: "https://download.geofabrik.de/asia/israel-and-palestine-latest.osm.pbf"
       use_tiles_ignore_pbf: "False"
     ports:
       - "8002:8002"

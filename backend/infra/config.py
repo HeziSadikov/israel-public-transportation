@@ -52,6 +52,22 @@ OSM_ENGINE_URL = os.getenv("OSM_ENGINE_URL", "http://localhost:5000")
 # If set, /detour will use Valhalla to route around the blocked area on the road network.
 # Example: http://localhost:8002 (Valhalla default port)
 VALHALLA_URL = os.getenv("VALHALLA_URL", "")
+# Meters: search radius to snap /route endpoints to the road graph (helps 442 near stops). 0 = omit (Valhalla default).
+VALHALLA_LOCATION_RADIUS_M = max(0, parse_int_env("VALHALLA_LOCATION_RADIUS_M", 90))
+# Seconds-equivalent penalties used in Valhalla costing_options to reduce awkward maneuvers.
+VALHALLA_MANEUVER_PENALTY_S = max(0, parse_int_env("VALHALLA_MANEUVER_PENALTY_S", 45))
+VALHALLA_SERVICE_PENALTY_S = max(0, parse_int_env("VALHALLA_SERVICE_PENALTY_S", 30))
+# Extended bus costing options (Phase A2).
+VALHALLA_USE_LIVING_STREETS = max(0, parse_int_env("VALHALLA_USE_LIVING_STREETS", 0))
+VALHALLA_USE_TRACKS = max(0, parse_int_env("VALHALLA_USE_TRACKS", 0))
+VALHALLA_SERVICE_FACTOR = float(os.getenv("VALHALLA_SERVICE_FACTOR", "1.5"))
+VALHALLA_PRIVATE_ACCESS_PENALTY = max(0, parse_int_env("VALHALLA_PRIVATE_ACCESS_PENALTY", 600))
+VALHALLA_COUNTRY_CROSSING_PENALTY = max(0, parse_int_env("VALHALLA_COUNTRY_CROSSING_PENALTY", 600))
+# Use /trace_attributes to get exact OSM way IDs from Valhalla route geometry (Phase A1).
+VALHALLA_TRACE_ATTRIBUTES_ENABLED = parse_bool_env("VALHALLA_TRACE_ATTRIBUTES_ENABLED", True)
+# Valhalla circuit breaker: open after N consecutive transport failures within WINDOW_S seconds.
+VALHALLA_CIRCUIT_FAIL_THRESHOLD = max(1, parse_int_env("VALHALLA_CIRCUIT_FAIL_THRESHOLD", 5))
+VALHALLA_CIRCUIT_COOLDOWN_S = max(1, parse_int_env("VALHALLA_CIRCUIT_COOLDOWN_S", 30))
 HYBRID_DETOUR_ENABLED = parse_bool_env("HYBRID_DETOUR_ENABLED", True)
 DETOUR_ALLOW_FEED_FALLBACK = parse_bool_env("DETOUR_ALLOW_FEED_FALLBACK", False)
 # Higher k pulls more pattern variants per route into the detour graph (better urban coverage, more CPU).
@@ -97,4 +113,7 @@ GRAPH_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 # GovMap tile proxy: upstream URL template with {z}, {x}, {y} (see /api/govmap-tiles in app.py).
 GOVMAP_TILE_UPSTREAM_TEMPLATE = os.getenv("GOVMAP_TILE_UPSTREAM_TEMPLATE", "").strip()
+
+# Detour v2 API and pipeline (road-graph-first).
+DETOUR_V2_ENABLED = parse_bool_env("DETOUR_V2_ENABLED", True)
 

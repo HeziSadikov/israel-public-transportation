@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Optional, List, Dict, Any, Literal
 from enum import Enum
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class DetourTurnStep(BaseModel):
@@ -263,4 +263,87 @@ class GeocodeResult(BaseModel):
     lat: float
     lon: float
     place_id: Optional[int] = None
+
+
+# --- Detour v2 -----------------------------------------------------------------
+
+
+class IncidentCreateRequest(BaseModel):
+    polygon_geojson: Dict[str, Any]
+    incident_type: Optional[str] = None
+    description: Optional[str] = None
+    start_date: str
+    start_time: str
+    end_date: str
+    end_time: str
+    created_by: Optional[str] = None
+
+
+class IncidentCreateResponse(BaseModel):
+    incident_id: int
+    affected_route_count: int
+    derived_edge_ban_count: int
+    policy_version: str
+
+
+class DetourComputeV2Request(BaseModel):
+    service_date: str
+    trip_ids: List[str] = Field(default_factory=list)
+    blockage_geojson: Dict[str, Any]
+    incident_id: Optional[int] = None
+    persist: bool = True
+    route_id: Optional[str] = None
+    direction_id: Optional[str] = None
+
+    @model_validator(mode="after")
+    def trip_ids_or_route_id(self) -> "DetourComputeV2Request":
+        has_trips = any(t and str(t).strip() for t in self.trip_ids)
+        has_route = bool(self.route_id and str(self.route_id).strip())
+        if has_trips or has_route:
+            return self
+        raise ValueError("Either non-empty trip_ids or route_id is required")
+
+
+class DetourComputeV2Response(BaseModel):
+    results: List[Dict[str, Any]]
+    detour_request_ids: List[int] = Field(default_factory=list)
+    policy_version: str
+
+
+class BusEdgeConstraintRequest(BaseModel):
+    osm_way_id: int
+    direction: Optional[str] = None
+    constraint_type: str = "ban"
+    severity: float = 1.0
+    reason_code: Optional[str] = None
+    notes: Optional[str] = None
+    created_by: Optional[str] = None
+
+
+class BusTurnConstraintRequest(BaseModel):
+    from_way_id: int
+    via_node_id: int
+    to_way_id: int
+    constraint_type: str = "ban"
+    severity: float = 1.0
+    reason_code: Optional[str] = None
+    notes: Optional[str] = None
+    created_by: Optional[str] = None
+
+
+class ConstraintCreateResponse(BaseModel):
+    id: int
+
+
+class DetourApproveV2Request(BaseModel):
+    approved_by: Optional[str] = None
+
+
+class DetourApproveV2Response(BaseModel):
+    approved_detour_id: int
+
+
+class DetourV2DetailResponse(BaseModel):
+    request: Dict[str, Any]
+    candidates: List[Dict[str, Any]]
 
