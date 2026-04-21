@@ -669,6 +669,8 @@ def match_route_attributes(
     coordinates_lonlat: List[Tuple[float, float]],
     costing: str = "bus",
     timeout_s: float = 10.0,
+    *,
+    base_url: Optional[str] = None,
 ) -> Optional[List[Dict[str, Any]]]:
     """
     Call Valhalla /trace_attributes to get per-edge OSM way IDs and road attributes for a polyline.
@@ -677,13 +679,13 @@ def match_route_attributes(
     """
     if not VALHALLA_TRACE_ATTRIBUTES_ENABLED:
         return None
-    if not VALHALLA_URL or not VALHALLA_URL.strip():
+    resolved = (base_url or VALHALLA_URL or "").strip()
+    if not resolved:
         return None
     if _breaker.is_open():
         return None
     if len(coordinates_lonlat) < 2:
         return None
-    # /trace_attributes expects lat,lon pairs
     detail = match_route_attributes_detailed(
         coordinates_lonlat, costing=costing, timeout_s=timeout_s, base_url=base_url
     )
@@ -774,14 +776,15 @@ def valhalla_locate(
         return None
 
 
-def valhalla_health(timeout_s: float = 5.0) -> Dict[str, Any]:
+def valhalla_health(timeout_s: float = 5.0, *, base_url: Optional[str] = None) -> Dict[str, Any]:
     """
     Call Valhalla /status. Returns dict with keys: ok, version, tileset_last_modified, error.
     Does NOT raise; safe to call at startup.
     """
-    if not VALHALLA_URL or not VALHALLA_URL.strip():
+    resolved = (base_url or VALHALLA_URL or "").strip()
+    if not resolved:
         return {"ok": False, "error": "VALHALLA_URL not configured"}
-    url = f"{VALHALLA_URL.rstrip('/')}/status"
+    url = f"{resolved.rstrip('/')}/status"
     try:
         resp = httpx.get(url, timeout=timeout_s)
         if resp.status_code >= 400:

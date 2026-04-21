@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from backend.domain.detour_physical.legal_anchor_index import (
+    LegalAnchorOsmCaches,
     _is_corridor_continuation,
     merge_and_rank_records,
     score_legal_exit_intersection,
@@ -74,3 +75,58 @@ def test_select_legal_anchor_pair_smoke():
 def test_policy_loader_has_anchor_windows():
     cfg = DetourPolicyConfig()
     assert cfg.anchor.search_before_window_m > 0
+
+
+def test_score_turn_rejection_matches_cache():
+    caches = LegalAnchorOsmCaches(
+        outgoing_by_node={1: [{"osm_way_id": 100, "heading_start_deg": 90.0}]},
+        forbidden_tos={(50, 1): frozenset({100})},
+    )
+    inter = {
+        "begin_heading": 90.0,
+        "road_class": "primary",
+        "driveability": "forward",
+        "use": "road",
+        "to_edge_name_consistency": False,
+    }
+    assert (
+        score_legal_exit_intersection(
+            inter,
+            next_edge={"begin_heading": 0.0},
+            incoming_way_id=50,
+            end_osm_node_id=1,
+            caches=caches,
+            conn=None,
+        )
+        is None
+    )
+
+
+def test_score_cache_allows_when_not_restricted():
+    caches = LegalAnchorOsmCaches(
+        outgoing_by_node={1: [{"osm_way_id": 100, "heading_start_deg": 90.0}]},
+        forbidden_tos={(50, 1): frozenset({999})},
+    )
+    inter = {
+        "begin_heading": 90.0,
+        "road_class": "primary",
+        "driveability": "forward",
+        "use": "road",
+        "to_edge_name_consistency": False,
+    }
+    sc = score_legal_exit_intersection(
+        inter,
+        next_edge={"begin_heading": 0.0},
+        incoming_way_id=50,
+        end_osm_node_id=1,
+        caches=caches,
+        conn=None,
+    )
+    assert sc is not None and sc > 0
+
+
+def test_merge_rank_unchanged_with_cache_build_path():
+    ex = [{"shape_dist_m": 10.0, "score": 2.0, "lon": 34.0, "lat": 32.0, "osm_node_id": 1}]
+    rj = [{"shape_dist_m": 500.0, "score": 2.0, "lon": 34.1, "lat": 32.0, "osm_node_id": 2}]
+    a, b = merge_and_rank_records(ex, rj, per_role_limit=24)
+    assert len(a) == 1 and len(b) == 1

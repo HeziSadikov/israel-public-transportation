@@ -2,15 +2,19 @@
 Precompute pattern_legal_anchor_candidate rows via Valhalla trace_attributes + legal filter.
 
   python -m backend.scripts.precompute_legal_anchors --limit 20
-  python -m backend.scripts.precompute_legal_anchors --pattern-id <hex>
+  python -m backend.scripts.precompute_legal_anchors --workers 4 --valhalla-url http://127.0.0.1:8002
 
-Requires DATABASE_URL, VALHALLA_URL, and ensure_pattern_legal_anchor_schema applied.
+Requires DATABASE_URL, VALHALLA_URL (or --valhalla-url), and ensure_pattern_legal_anchor_schema applied.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple
 
 from shapely.geometry import LineString
@@ -19,47 +23,99 @@ from backend.adapters.osm_detour import match_route_attributes_detailed, valhall
 from backend.domain.detour_physical.edge_matcher import densify_linestring
 from backend.domain.detour_physical.legal_anchor_index import (
     build_exit_candidate_records,
+    build_legal_anchor_osm_caches,
     build_rejoin_candidates_from_reverse_trace,
+    collect_end_osm_node_ids_from_edges,
     merge_and_rank_records,
 )
 from backend.infra import db_access as db
 from backend.infra.logging_utils import ensure_cli_action_logging, log
 
 ANCHOR_VERSION = "legal_anchor_v1"
+TRACE_CACHE_VERSION = ANCHOR_VERSION
+
+# Shared across worker threads (Valhalla HTTP cap).
+_valhalla_sem: threading.BoundedSemaphore | None = None
+_tls = threading.local()
+_pool_conns: List[Any] = []
+_pool_conns_lock = threading.Lock()
 
 
-def _list_patterns(conn, *, limit: Optional[int], pattern_id: Optional[str]) -> List[Tuple[str, str, Optional[str]]]:
+def _pool_init() -> None:
+    c = db._get_conn()
+    _tls.conn = c
+    with _pool_conns_lock:
+        _pool_conns.append(c)
+
+
+def _pool_shutdown() -> None:
+    with _pool_conns_lock:
+        for c in _pool_conns:
+            try:
+                c.close()
+            except Exception:
+                pass
+        _pool_conns.clear()
+
+
+def _worker_conn() -> Any:
+    c = getattr(_tls, "conn", None)
+    if c is None:
+        c = db._get_conn()
+        _tls.conn = c
+    return c
+
+
+def _list_patterns(
+    conn,
+    *,
+    limit: Optional[int],
+    pattern_id: Optional[str],
+    sql_prefilter_shapes: bool,
+) -> List[Tuple[str, str, Optional[str]]]:
     """Return (pattern_id, repr_trip_id, repr_shape_id) for active feed."""
     feed_id = db.get_active_feed_id(conn)
+    shape_clause = ""
+    if sql_prefilter_shapes:
+        shape_clause = """
+          AND p.repr_shape_id IS NOT NULL
+          AND EXISTS (
+            SELECT 1 FROM shapes_lines sl
+            WHERE sl.feed_id = p.feed_id AND sl.shape_id::text = p.repr_shape_id
+          )
+        """
     with conn.cursor() as cur:
         if pattern_id:
             cur.execute(
-                """
-                SELECT pattern_id, repr_trip_id, repr_shape_id
-                FROM patterns
-                WHERE feed_id = %s AND pattern_id = %s
+                f"""
+                SELECT p.pattern_id, p.repr_trip_id, p.repr_shape_id
+                FROM patterns p
+                WHERE p.feed_id = %s AND p.pattern_id = %s
+                {shape_clause}
                 LIMIT 1
                 """,
                 (feed_id, pattern_id),
             )
         elif limit is not None:
             cur.execute(
-                """
-                SELECT pattern_id, repr_trip_id, repr_shape_id
-                FROM patterns
-                WHERE feed_id = %s
-                ORDER BY pattern_id
+                f"""
+                SELECT p.pattern_id, p.repr_trip_id, p.repr_shape_id
+                FROM patterns p
+                WHERE p.feed_id = %s
+                {shape_clause}
+                ORDER BY p.pattern_id
                 LIMIT %s
                 """,
                 (feed_id, int(limit)),
             )
         else:
             cur.execute(
-                """
-                SELECT pattern_id, repr_trip_id, repr_shape_id
-                FROM patterns
-                WHERE feed_id = %s
-                ORDER BY pattern_id
+                f"""
+                SELECT p.pattern_id, p.repr_trip_id, p.repr_shape_id
+                FROM patterns p
+                WHERE p.feed_id = %s
+                {shape_clause}
+                ORDER BY p.pattern_id
                 """,
                 (feed_id,),
             )
@@ -69,54 +125,292 @@ def _list_patterns(conn, *, limit: Optional[int], pattern_id: Optional[str]) -> 
         ]
 
 
-def _shape_for_pattern(conn, feed_id: int, repr_shape_id: Optional[str]) -> Optional[LineString]:
-    if not repr_shape_id:
+def _trace_mem_key(feed_version: str, repr_shape_id: str, direction: str) -> Tuple[str, str, str, str]:
+    return (feed_version, str(repr_shape_id), direction, TRACE_CACHE_VERSION)
+
+
+def _load_trace_from_db_cache(
+    conn: Any,
+    feed_version: str,
+    repr_shape_id: str,
+    direction: str,
+) -> Optional[Dict[str, Any]]:
+    row = db.fetch_pattern_trace_valhalla_cache(
+        feed_version, str(repr_shape_id), direction, TRACE_CACHE_VERSION, conn=conn
+    )
+    if not row:
         return None
-    rows = db.get_shape_lines_bulk(feed_id, [str(repr_shape_id)], conn=conn)
-    g = rows.get(str(repr_shape_id))
-    return g if isinstance(g, LineString) else None
+    edges = row.get("edges_json")
+    if isinstance(edges, str):
+        try:
+            edges = json.loads(edges)
+        except Exception:
+            return None
+    elif isinstance(edges, (bytes, bytearray)):
+        try:
+            edges = json.loads(edges.decode("utf-8"))
+        except Exception:
+            return None
+    if not isinstance(edges, list):
+        return None
+    sl = row.get("shape_lonlat_json")
+    shape_lonlat: Optional[List[Tuple[float, float]]] = None
+    if sl is not None:
+        if isinstance(sl, str):
+            try:
+                sl = json.loads(sl)
+            except Exception:
+                sl = None
+        if isinstance(sl, list):
+            shape_lonlat = []
+            for pair in sl:
+                if isinstance(pair, (list, tuple)) and len(pair) >= 2:
+                    shape_lonlat.append((float(pair[0]), float(pair[1])))
+    total_m = float(row["total_m"] or 0.0)
+    return {"edges": edges, "shape_lonlat": shape_lonlat, "total_m": total_m}
+
+
+def _save_trace_to_db_cache(
+    conn: Any,
+    feed_version: str,
+    repr_shape_id: str,
+    direction: str,
+    edges: List[Dict[str, Any]],
+    shape_lonlat: Optional[List[Tuple[float, float]]],
+    total_m: float,
+) -> None:
+    db.upsert_pattern_trace_valhalla_cache(
+        feed_version=feed_version,
+        repr_shape_id=str(repr_shape_id),
+        direction=direction,
+        trace_version=TRACE_CACHE_VERSION,
+        edges=edges,
+        shape_lonlat=shape_lonlat,
+        total_m=total_m,
+        conn=conn,
+    )
+
+
+def _run_trace_attributes(
+    pts: List[Tuple[float, float]],
+    *,
+    valhalla_base_url: Optional[str],
+    timeout_s: float = 45.0,
+) -> Optional[Dict[str, Any]]:
+    if _valhalla_sem is not None:
+        with _valhalla_sem:
+            return match_route_attributes_detailed(
+                pts, costing="bus", timeout_s=timeout_s, base_url=valhalla_base_url
+            )
+    return match_route_attributes_detailed(pts, costing="bus", timeout_s=timeout_s, base_url=valhalla_base_url)
 
 
 def _process_one_pattern(
-    conn,
+    conn: Any,
+    *,
     feed_id: int,
     feed_version: str,
     pattern_id: str,
     repr_trip_id: str,
     repr_shape_id: Optional[str],
+    shape_map: Dict[str, LineString],
+    trace_mem: Dict[Tuple[str, str, str, str], Dict[str, Any]],
+    trace_mem_lock: threading.Lock,
+    force: bool,
+    valhalla_base_url: Optional[str],
+    use_trace_db_cache: bool,
+    timings_out: Optional[Dict[str, float]] = None,
 ) -> str:
-    line = _shape_for_pattern(conn, feed_id, repr_shape_id)
-    if line is None or line.is_empty:
+    t0 = time.perf_counter()
+    acc: Dict[str, float] = {}
+
+    def _mark(name: str) -> None:
+        nonlocal t0
+        now = time.perf_counter()
+        acc[name] = now - t0
+        t0 = now
+
+    if not force:
+        st = db.fetch_pattern_legal_anchor_pattern_status(
+            feed_version, pattern_id, ANCHOR_VERSION, conn=conn
+        )
+        if st:
+            log(
+                "precompute-legal-anchors",
+                f"pattern_id={pattern_id} skipped_cached_status outcome={st.get('outcome')}",
+            )
+            return "skipped_cached_status"
+        n_existing = db.count_pattern_legal_anchor_candidates(
+            feed_version, pattern_id, ANCHOR_VERSION, conn=conn
+        )
+        if n_existing > 0:
+            log("precompute-legal-anchors", f"pattern_id={pattern_id} skipped_existing_rows n={n_existing}")
+            return "skipped_existing_rows"
+
+    if not repr_shape_id:
+        db.upsert_pattern_legal_anchor_pattern_status(
+            feed_version=feed_version,
+            pattern_id=pattern_id,
+            anchor_version=ANCHOR_VERSION,
+            outcome="no_shape",
+            row_count=0,
+            conn=conn,
+        )
         return "no_shape"
+
+    line = shape_map.get(str(repr_shape_id))
+    if line is None or line.is_empty:
+        db.upsert_pattern_legal_anchor_pattern_status(
+            feed_version=feed_version,
+            pattern_id=pattern_id,
+            anchor_version=ANCHOR_VERSION,
+            outcome="no_shape",
+            row_count=0,
+            conn=conn,
+        )
+        return "no_shape"
+    _mark("shape_lookup")
+
     pts = densify_linestring(line, 15.0)
     if len(pts) < 2:
+        db.upsert_pattern_legal_anchor_pattern_status(
+            feed_version=feed_version,
+            pattern_id=pattern_id,
+            anchor_version=ANCHOR_VERSION,
+            outcome="too_few_points",
+            row_count=0,
+            conn=conn,
+        )
         return "too_few_points"
-    detail = match_route_attributes_detailed(pts, costing="bus", timeout_s=45.0)
+
+    mem_key_f = _trace_mem_key(feed_version, str(repr_shape_id), "forward")
+    mem_key_r = _trace_mem_key(feed_version, str(repr_shape_id), "reverse")
+
+    detail: Optional[Dict[str, Any]] = None
+    with trace_mem_lock:
+        detail = trace_mem.get(mem_key_f)
+    if detail is None and use_trace_db_cache:
+        detail = _load_trace_from_db_cache(conn, feed_version, str(repr_shape_id), "forward")
+    if detail is None:
+        detail = _run_trace_attributes(pts, valhalla_base_url=valhalla_base_url)
+        if detail:
+            with trace_mem_lock:
+                trace_mem[mem_key_f] = detail
+            if use_trace_db_cache:
+                edges = detail.get("edges") or []
+                sl = detail.get("shape_lonlat")
+                tm = sum(float(e.get("length") or 0.0) for e in edges) * 1000.0
+                try:
+                    _save_trace_to_db_cache(
+                        conn,
+                        feed_version,
+                        str(repr_shape_id),
+                        "forward",
+                        list(edges),
+                        list(sl) if sl else None,
+                        tm,
+                    )
+                except Exception:
+                    pass
+    _mark("forward_trace")
+
     if not detail:
+        db.upsert_pattern_legal_anchor_pattern_status(
+            feed_version=feed_version,
+            pattern_id=pattern_id,
+            anchor_version=ANCHOR_VERSION,
+            outcome="trace_failed",
+            row_count=0,
+            conn=conn,
+        )
         return "trace_failed"
     edges = detail.get("edges") or []
     shape_lonlat = detail.get("shape_lonlat")
     if not shape_lonlat:
         shape_lonlat = pts
     total_m = sum(float(e.get("length") or 0.0) for e in edges) * 1000.0
-    exit_raw = build_exit_candidate_records(edges, shape_lonlat, conn=conn, role="exit")
+
+    detail_r: Optional[Dict[str, Any]] = None
     pts_rev = list(reversed(pts))
-    detail_r = match_route_attributes_detailed(pts_rev, costing="bus", timeout_s=45.0)
+    with trace_mem_lock:
+        detail_r = trace_mem.get(mem_key_r)
+    if detail_r is None and use_trace_db_cache:
+        detail_r = _load_trace_from_db_cache(conn, feed_version, str(repr_shape_id), "reverse")
+    if detail_r is None:
+        detail_r = _run_trace_attributes(pts_rev, valhalla_base_url=valhalla_base_url)
+        if detail_r:
+            with trace_mem_lock:
+                trace_mem[mem_key_r] = detail_r
+            if use_trace_db_cache:
+                edges_r0 = detail_r.get("edges") or []
+                sl_r0 = detail_r.get("shape_lonlat")
+                tm_r = sum(float(e.get("length") or 0.0) for e in edges_r0) * 1000.0
+                try:
+                    _save_trace_to_db_cache(
+                        conn,
+                        feed_version,
+                        str(repr_shape_id),
+                        "reverse",
+                        list(edges_r0),
+                        list(sl_r0) if sl_r0 else None,
+                        tm_r,
+                    )
+                except Exception:
+                    pass
+    _mark("reverse_trace")
+
+    edges_r: List[Dict[str, Any]] = []
+    sl_r: Optional[List[Tuple[float, float]]] = None
     if detail_r and detail_r.get("edges"):
         edges_r = detail_r["edges"]
         sl_r = detail_r.get("shape_lonlat") or pts_rev
-        rj = build_rejoin_candidates_from_reverse_trace(edges_r, sl_r, total_m, conn=conn)
-    else:
-        rj = []
+
+    node_ids = collect_end_osm_node_ids_from_edges(edges) | collect_end_osm_node_ids_from_edges(edges_r)
+    caches = build_legal_anchor_osm_caches(sorted(node_ids), conn)
+    _mark("osm_preload")
+
+    exit_raw = build_exit_candidate_records(edges, shape_lonlat, caches=caches, role="exit")
+    rj = build_rejoin_candidates_from_reverse_trace(edges_r, sl_r, total_m, caches=caches)
+    _mark("candidate_build")
+
     ex_done, rj_done = merge_and_rank_records(exit_raw, rj)
     rows_db: List[Dict[str, Any]] = []
     for r in ex_done + rj_done:
         r2 = dict(r)
         r2["anchor_version"] = ANCHOR_VERSION
         rows_db.append(r2)
+    _mark("merge_rank")
+
     if not rows_db:
+        db.upsert_pattern_legal_anchor_pattern_status(
+            feed_version=feed_version,
+            pattern_id=pattern_id,
+            anchor_version=ANCHOR_VERSION,
+            outcome="no_candidates",
+            row_count=0,
+            conn=conn,
+        )
         return "no_candidates"
-    db.replace_pattern_legal_anchor_candidates(feed_version, pattern_id, rows_db, anchor_version=ANCHOR_VERSION, conn=conn)
+    db.replace_pattern_legal_anchor_candidates(
+        feed_version, pattern_id, rows_db, anchor_version=ANCHOR_VERSION, conn=conn
+    )
+    db.upsert_pattern_legal_anchor_pattern_status(
+        feed_version=feed_version,
+        pattern_id=pattern_id,
+        anchor_version=ANCHOR_VERSION,
+        outcome="ok",
+        row_count=len(rows_db),
+        conn=conn,
+    )
+    _mark("db_write")
+    if timings_out is not None:
+        timings_out.clear()
+        timings_out.update(acc)
+    if acc:
+        log(
+            "precompute-legal-anchors",
+            f"pattern_id={pattern_id} phase_s={','.join(f'{k}={v:.3f}' for k, v in sorted(acc.items()))}",
+        )
     return f"ok_rows_{len(rows_db)}"
 
 
@@ -125,33 +419,151 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Precompute legal anchor index for route patterns.")
     ap.add_argument("--limit", type=int, default=None, help="Max patterns (default: all).")
     ap.add_argument("--pattern-id", type=str, default=None, help="Single pattern id.")
+    ap.add_argument("--force", action="store_true", help="Recompute even when status or rows exist.")
+    ap.add_argument("--workers", type=int, default=1, help="Parallel worker threads (default 1).")
+    ap.add_argument(
+        "--valhalla-url",
+        type=str,
+        default=None,
+        help="Override VALHALLA_URL for this run (e.g. http://127.0.0.1:8002).",
+    )
+    ap.add_argument(
+        "--valhalla-max-concurrent",
+        type=int,
+        default=4,
+        help="Max simultaneous Valhalla HTTP calls across workers (default 4).",
+    )
+    ap.add_argument(
+        "--no-trace-db-cache",
+        action="store_true",
+        help="Disable read/write of pattern_trace_valhalla_cache (in-memory cache only).",
+    )
+    ap.add_argument(
+        "--no-sql-prefilter",
+        action="store_true",
+        help="List all patterns including those without a resolvable shape in shapes_lines.",
+    )
     args = ap.parse_args()
 
-    vh = valhalla_health()
+    global _valhalla_sem  # noqa: PLW0603
+    _valhalla_sem = threading.BoundedSemaphore(max(1, int(args.valhalla_max_concurrent)))
+
+    vh = valhalla_health(base_url=args.valhalla_url)
     if not vh.get("ok"):
         log("precompute-legal-anchors", f"valhalla_unhealthy {vh!r}")
-        print("Valhalla not reachable; set VALHALLA_URL and start the service.", file=sys.stderr)
+        print(
+            "Valhalla not reachable. Set VALHALLA_URL or pass --valhalla-url, e.g.\n"
+            '  $env:VALHALLA_URL = "http://127.0.0.1:8002"',
+            file=sys.stderr,
+        )
         sys.exit(2)
 
-    conn = db._get_conn()
+    workers = max(1, int(args.workers))
+
+    trace_mem: Dict[Tuple[str, str, str, str], Dict[str, Any]] = {}
+    trace_mem_lock = threading.Lock()
+    use_trace_db = not bool(args.no_trace_db_cache)
+    sql_prefilter = not bool(args.no_sql_prefilter)
+
+    if workers == 1:
+        conn = db._get_conn()
+        try:
+            db.ensure_pattern_legal_anchor_schema(conn=conn)
+            feed_id = db.get_active_feed_id(conn)
+            feed_version = db.get_active_feed_version_key(conn)
+            patterns = _list_patterns(conn, limit=args.limit, pattern_id=args.pattern_id, sql_prefilter_shapes=sql_prefilter)
+            sids = sorted({str(p[2]) for p in patterns if p[2]})
+            shape_map: Dict[str, LineString] = {}
+            if sids:
+                raw = db.get_shape_lines_bulk(feed_id, sids, conn=conn)
+                for sid, geom in raw.items():
+                    if isinstance(geom, LineString):
+                        shape_map[str(sid)] = geom
+            ok = skipped = 0
+            for pattern_id, repr_trip_id, repr_shape_id in patterns:
+                note = _process_one_pattern(
+                    conn,
+                    feed_id=feed_id,
+                    feed_version=feed_version,
+                    pattern_id=pattern_id,
+                    repr_trip_id=repr_trip_id,
+                    repr_shape_id=repr_shape_id,
+                    shape_map=shape_map,
+                    trace_mem=trace_mem,
+                    trace_mem_lock=trace_mem_lock,
+                    force=bool(args.force),
+                    valhalla_base_url=args.valhalla_url,
+                    use_trace_db_cache=use_trace_db,
+                )
+                log("precompute-legal-anchors", f"pattern_id={pattern_id} result={note}")
+                if note.startswith("ok"):
+                    ok += 1
+                elif "skipped" in note:
+                    skipped += 1
+            print(f"Processed {len(patterns)} patterns, ok={ok}, skipped={skipped}.")
+        finally:
+            conn.close()
+        return
+
+    # workers > 1
+    main_conn = db._get_conn()
     try:
-        db.ensure_pattern_legal_anchor_schema(conn=conn)
-        feed_id = db.get_active_feed_id(conn)
-        feed_version = db.get_active_feed_version_key(conn)
-        patterns = _list_patterns(conn, limit=args.limit, pattern_id=args.pattern_id)
-        if not patterns:
-            log("precompute-legal-anchors", "no_patterns")
-            print("No patterns found.")
-            return
-        ok = 0
-        for pattern_id, repr_trip_id, repr_shape_id in patterns:
-            note = _process_one_pattern(conn, feed_id, feed_version, pattern_id, repr_trip_id, repr_shape_id)
-            log("precompute-legal-anchors", f"pattern_id={pattern_id} result={note}")
-            if note.startswith("ok"):
-                ok += 1
-        print(f"Processed {len(patterns)} patterns, successful inserts: {ok}.")
+        db.ensure_pattern_legal_anchor_schema(conn=main_conn)
+        feed_id = db.get_active_feed_id(main_conn)
+        feed_version = db.get_active_feed_version_key(main_conn)
+        patterns = _list_patterns(
+            main_conn, limit=args.limit, pattern_id=args.pattern_id, sql_prefilter_shapes=sql_prefilter
+        )
+        sids = sorted({str(p[2]) for p in patterns if p[2]})
+        shape_map = {}
+        if sids:
+            raw = db.get_shape_lines_bulk(feed_id, sids, conn=main_conn)
+            for sid, geom in raw.items():
+                if isinstance(geom, LineString):
+                    shape_map[str(sid)] = geom
     finally:
-        conn.close()
+        main_conn.close()
+
+    ok = skipped = 0
+    lock = threading.Lock()
+
+    def _task(tup: Tuple[str, str, Optional[str]]) -> str:
+        pattern_id, repr_trip_id, repr_shape_id = tup
+        wc = _worker_conn()
+        return _process_one_pattern(
+            wc,
+            feed_id=feed_id,
+            feed_version=feed_version,
+            pattern_id=pattern_id,
+            repr_trip_id=repr_trip_id,
+            repr_shape_id=repr_shape_id,
+            shape_map=shape_map,
+            trace_mem=trace_mem,
+            trace_mem_lock=trace_mem_lock,
+            force=bool(args.force),
+            valhalla_base_url=args.valhalla_url,
+            use_trace_db_cache=use_trace_db,
+        )
+
+    try:
+        with ThreadPoolExecutor(max_workers=workers, initializer=_pool_init) as ex:
+            future_to_pid = {ex.submit(_task, p): p[0] for p in patterns}
+            for fut in as_completed(future_to_pid, timeout=86400.0):
+                pid = future_to_pid.get(fut, "?")
+                try:
+                    note = fut.result()
+                except Exception as e:
+                    note = f"error:{e}"
+                log("precompute-legal-anchors", f"pattern_id={pid} result={note}")
+                with lock:
+                    if str(note).startswith("ok"):
+                        ok += 1
+                    elif "skipped" in str(note):
+                        skipped += 1
+    finally:
+        _pool_shutdown()
+
+    print(f"Processed {len(patterns)} patterns, ok={ok}, skipped={skipped}.")
 
 
 if __name__ == "__main__":

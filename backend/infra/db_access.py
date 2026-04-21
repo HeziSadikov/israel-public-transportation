@@ -12,7 +12,7 @@ feed_versions.active indicates the current GTFS feed.
 """
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 # Optional[str] for direction_id in tuple keys (route_id, direction_id)
 RouteDirKey = Tuple[str, Optional[str]]
@@ -5469,6 +5469,228 @@ def replace_pattern_legal_anchor_candidates(
                         str(r.get("anchor_version") or anchor_version),
                     ),
                 )
+            conn.commit()
+    except Exception:
+        if close:
+            conn.rollback()
+        raise
+    finally:
+        if close:
+            conn.close()
+
+
+def fetch_osm_road_segments_by_from_nodes(
+    node_ids: Sequence[int],
+    conn=None,
+) -> List[Dict[str, Any]]:
+    """Bulk-load osm_road_segments rows for outgoing edges at junction nodes (from_node_id)."""
+    ids = sorted({int(x) for x in node_ids if x is not None})
+    if not ids:
+        return []
+    close = False
+    if conn is None:
+        conn = _get_conn()
+        close = True
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT from_node_id, osm_way_id, heading_start_deg
+                FROM osm_road_segments
+                WHERE from_node_id = ANY(%s)
+                """,
+                (ids,),
+            )
+            return [dict(r) for r in cur.fetchall()]
+    finally:
+        if close:
+            conn.close()
+
+
+def fetch_osm_turn_restrictions_by_via_nodes(
+    node_ids: Sequence[int],
+    conn=None,
+) -> List[Dict[str, Any]]:
+    """Bulk-load turn restrictions involving via_node_id in the given set."""
+    ids = sorted({int(x) for x in node_ids if x is not None})
+    if not ids:
+        return []
+    close = False
+    if conn is None:
+        conn = _get_conn()
+        close = True
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT from_way_id, via_node_id, to_way_id
+                FROM osm_turn_restrictions
+                WHERE via_node_id = ANY(%s)
+                """,
+                (ids,),
+            )
+            return [dict(r) for r in cur.fetchall()]
+    finally:
+        if close:
+            conn.close()
+
+
+def fetch_pattern_legal_anchor_pattern_status(
+    feed_version: str,
+    pattern_id: str,
+    anchor_version: str,
+    conn=None,
+) -> Optional[Dict[str, Any]]:
+    close = False
+    if conn is None:
+        conn = _get_conn()
+        close = True
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT outcome, row_count, updated_at
+                FROM pattern_legal_anchor_pattern_status
+                WHERE feed_version = %s AND pattern_id = %s AND anchor_version = %s
+                """,
+                (feed_version, pattern_id, anchor_version),
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
+    finally:
+        if close:
+            conn.close()
+
+
+def upsert_pattern_legal_anchor_pattern_status(
+    *,
+    feed_version: str,
+    pattern_id: str,
+    anchor_version: str,
+    outcome: str,
+    row_count: int = 0,
+    conn=None,
+) -> None:
+    close = False
+    if conn is None:
+        conn = _get_conn()
+        close = True
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO pattern_legal_anchor_pattern_status (
+                    feed_version, pattern_id, anchor_version, outcome, row_count, updated_at
+                )
+                VALUES (%s, %s, %s, %s, %s, NOW())
+                ON CONFLICT (feed_version, pattern_id, anchor_version) DO UPDATE SET
+                    outcome = EXCLUDED.outcome,
+                    row_count = EXCLUDED.row_count,
+                    updated_at = NOW()
+                """,
+                (feed_version, pattern_id, anchor_version, outcome, int(row_count)),
+            )
+            conn.commit()
+    except Exception:
+        if close:
+            conn.rollback()
+        raise
+    finally:
+        if close:
+            conn.close()
+
+
+def count_pattern_legal_anchor_candidates(
+    feed_version: str,
+    pattern_id: str,
+    anchor_version: str,
+    conn=None,
+) -> int:
+    close = False
+    if conn is None:
+        conn = _get_conn()
+        close = True
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT COUNT(*) AS c FROM pattern_legal_anchor_candidate
+                WHERE feed_version = %s AND pattern_id = %s AND anchor_version = %s
+                """,
+                (feed_version, pattern_id, anchor_version),
+            )
+            row = cur.fetchone()
+            return int(row["c"] if row and hasattr(row, "keys") else row[0] or 0)
+    finally:
+        if close:
+            conn.close()
+
+
+def fetch_pattern_trace_valhalla_cache(
+    feed_version: str,
+    repr_shape_id: str,
+    direction: str,
+    trace_version: str,
+    conn=None,
+) -> Optional[Dict[str, Any]]:
+    close = False
+    if conn is None:
+        conn = _get_conn()
+        close = True
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT edges_json, shape_lonlat_json, total_m
+                FROM pattern_trace_valhalla_cache
+                WHERE feed_version = %s AND repr_shape_id = %s AND direction = %s AND trace_version = %s
+                """,
+                (feed_version, repr_shape_id, direction, trace_version),
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
+    finally:
+        if close:
+            conn.close()
+
+
+def upsert_pattern_trace_valhalla_cache(
+    *,
+    feed_version: str,
+    repr_shape_id: str,
+    direction: str,
+    trace_version: str,
+    edges: List[Dict[str, Any]],
+    shape_lonlat: Optional[List[Tuple[float, float]]],
+    total_m: float,
+    conn=None,
+) -> None:
+    close = False
+    if conn is None:
+        conn = _get_conn()
+        close = True
+    try:
+        ej = Json(edges)
+        if shape_lonlat is not None:
+            sj = Json([[float(a), float(b)] for a, b in shape_lonlat])
+        else:
+            sj = Json([])
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO pattern_trace_valhalla_cache (
+                    feed_version, repr_shape_id, direction, trace_version,
+                    edges_json, shape_lonlat_json, total_m, created_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
+                ON CONFLICT (feed_version, repr_shape_id, direction, trace_version) DO UPDATE SET
+                    edges_json = EXCLUDED.edges_json,
+                    shape_lonlat_json = EXCLUDED.shape_lonlat_json,
+                    total_m = EXCLUDED.total_m,
+                    created_at = NOW()
+                """,
+                (feed_version, repr_shape_id, direction, trace_version, ej, sj, float(total_m)),
+            )
             conn.commit()
     except Exception:
         if close:

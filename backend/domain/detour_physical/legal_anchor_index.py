@@ -7,7 +7,10 @@ PostGIS osm_turn_restrictions and osm_road_segments for turn legality.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+
+from backend.infra import db_access as db
 
 
 def _heading_diff_deg(a: float, b: float) -> float:
@@ -107,6 +110,56 @@ def _cum_dist_at_edge_ends(edges: List[Dict[str, Any]]) -> List[float]:
     return cum
 
 
+def collect_end_osm_node_ids_from_edges(edges: List[Dict[str, Any]]) -> Set[int]:
+    """Collect OSM node ids at edge end nodes (same logic as build_exit_candidate_records)."""
+    out: Set[int] = set()
+    for e in edges:
+        end_n = e.get("end_osm_node_id")
+        if end_n is None:
+            en = e.get("end_node")
+            if isinstance(en, dict):
+                end_n = en.get("node_id")
+        try:
+            if end_n is not None:
+                out.add(int(end_n))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+@dataclass(frozen=True)
+class LegalAnchorOsmCaches:
+    """In-memory OSM lookups for one pattern (bulk-loaded; avoids N+1 queries)."""
+
+    outgoing_by_node: Dict[int, List[Dict[str, Any]]]
+    forbidden_tos: Dict[Tuple[int, int], frozenset[int]]
+
+
+def build_legal_anchor_osm_caches(node_ids: Sequence[int], conn: Any) -> LegalAnchorOsmCaches:
+    """Bulk-load segments and turn restrictions for the given junction node ids."""
+    rows_seg = db.fetch_osm_road_segments_by_from_nodes(list(node_ids), conn=conn)
+    outgoing: Dict[int, List[Dict[str, Any]]] = {}
+    for r in rows_seg:
+        fn = r.get("from_node_id")
+        if fn is None:
+            continue
+        k = int(fn)
+        outgoing.setdefault(k, []).append(r)
+
+    rows_tr = db.fetch_osm_turn_restrictions_by_via_nodes(list(node_ids), conn=conn)
+    forb: Dict[Tuple[int, int], Set[int]] = {}
+    for r in rows_tr:
+        fw = r.get("from_way_id")
+        vn = r.get("via_node_id")
+        tw = r.get("to_way_id")
+        if fw is None or vn is None or tw is None:
+            continue
+        key = (int(fw), int(vn))
+        forb.setdefault(key, set()).add(int(tw))
+    frozen = {k: frozenset(v) for k, v in forb.items()}
+    return LegalAnchorOsmCaches(outgoing_by_node=outgoing, forbidden_tos=frozen)
+
+
 def _lookup_osm_way_for_intersecting(
     conn: Any,
     *,
@@ -117,8 +170,6 @@ def _lookup_osm_way_for_intersecting(
     """Best-effort: resolve outgoing way_id at node matching Valhalla begin_heading."""
     if not via_node_id:
         return None
-    from backend.infra import db_access as db
-
     close = False
     if conn is None:
         conn = db._get_conn()
@@ -160,6 +211,33 @@ def _lookup_osm_way_for_intersecting(
             conn.close()
 
 
+def _lookup_way_from_cache(
+    caches: LegalAnchorOsmCaches,
+    *,
+    via_node_id: int,
+    begin_heading: float,
+    tol_deg: float = 22.0,
+) -> Optional[int]:
+    rows = caches.outgoing_by_node.get(int(via_node_id)) or []
+    best_wid: Optional[int] = None
+    best_d = 1e9
+    for r in rows:
+        h = r.get("heading_start_deg")
+        wid = r.get("osm_way_id")
+        if h is None or wid is None:
+            continue
+        try:
+            d = _heading_diff_deg(float(h), float(begin_heading))
+        except (TypeError, ValueError):
+            continue
+        if d < best_d:
+            best_d = d
+            best_wid = int(wid)
+    if best_wid is not None and best_d <= tol_deg:
+        return best_wid
+    return None
+
+
 def _turn_restricted(
     conn: Any,
     *,
@@ -169,8 +247,6 @@ def _turn_restricted(
 ) -> bool:
     if not from_way_id or not via_node_id or not to_way_id:
         return False
-    from backend.infra import db_access as db
-
     close = False
     if conn is None:
         conn = db._get_conn()
@@ -193,17 +269,32 @@ def _turn_restricted(
             conn.close()
 
 
+def _turn_restricted_from_cache(
+    caches: LegalAnchorOsmCaches,
+    *,
+    from_way_id: int,
+    via_node_id: int,
+    to_way_id: int,
+) -> bool:
+    if not from_way_id or not via_node_id or not to_way_id:
+        return False
+    tos = caches.forbidden_tos.get((int(from_way_id), int(via_node_id)))
+    return bool(tos) and int(to_way_id) in tos
+
+
 def score_legal_exit_intersection(
     inter: Dict[str, Any],
     *,
     next_edge: Optional[Dict[str, Any]],
     incoming_way_id: int,
     end_osm_node_id: Optional[int],
-    conn: Any,
+    conn: Any = None,
+    caches: Optional[LegalAnchorOsmCaches] = None,
     node_traffic_signal: Optional[bool] = None,
 ) -> Optional[float]:
     """
     Return a higher-is-better score for a non-continuation intersecting edge, or None to reject.
+    If ``caches`` is set, use bulk-loaded OSM data; else fall back to per-query ``conn`` (legacy).
     """
     if _is_corridor_continuation(inter, next_edge):
         return None
@@ -217,16 +308,32 @@ def score_legal_exit_intersection(
     to_wid: Optional[int] = None
     if end_osm_node_id and ih is not None:
         try:
-            to_wid = _lookup_osm_way_for_intersecting(conn, via_node_id=end_osm_node_id, begin_heading=float(ih))
+            if caches is not None:
+                to_wid = _lookup_way_from_cache(
+                    caches, via_node_id=end_osm_node_id, begin_heading=float(ih)
+                )
+            elif conn is not None:
+                to_wid = _lookup_osm_way_for_intersecting(
+                    conn, via_node_id=end_osm_node_id, begin_heading=float(ih)
+                )
         except (TypeError, ValueError):
             to_wid = None
-    if (
-        to_wid is not None
-        and incoming_way_id
-        and end_osm_node_id
-        and _turn_restricted(conn, from_way_id=incoming_way_id, via_node_id=end_osm_node_id, to_way_id=to_wid)
-    ):
-        return None
+    if to_wid is not None and incoming_way_id and end_osm_node_id:
+        if caches is not None:
+            forbidden = _turn_restricted_from_cache(
+                caches,
+                from_way_id=incoming_way_id,
+                via_node_id=end_osm_node_id,
+                to_way_id=to_wid,
+            )
+        elif conn is not None:
+            forbidden = _turn_restricted(
+                conn, from_way_id=incoming_way_id, via_node_id=end_osm_node_id, to_way_id=to_wid
+            )
+        else:
+            forbidden = False
+        if forbidden:
+            return None
     return base
 
 
@@ -235,6 +342,7 @@ def build_exit_candidate_records(
     shape_lonlat: Optional[Sequence[Tuple[float, float]]],
     *,
     conn: Any = None,
+    caches: Optional[LegalAnchorOsmCaches] = None,
     role: str = "exit",
 ) -> List[Dict[str, Any]]:
     """
@@ -263,7 +371,6 @@ def build_exit_candidate_records(
         inters = enode.get("intersecting_edges")
         if not isinstance(inters, list) or not inters:
             continue
-        ei_b = e.get("begin_shape_index")
         ei_e = e.get("end_shape_index")
         try:
             esi = int(ei_e) if ei_e is not None else None
@@ -274,7 +381,10 @@ def build_exit_candidate_records(
         else:
             ll = None
         if ll is None and shape_lonlat and cum_end:
-            approx_idx = min(len(shape_lonlat) - 1, max(0, int((cum_end[i] / max(cum_end[-1], 1.0)) * (len(shape_lonlat) - 1))))
+            approx_idx = min(
+                len(shape_lonlat) - 1,
+                max(0, int((cum_end[i] / max(cum_end[-1], 1.0)) * (len(shape_lonlat) - 1))),
+            )
             ll = (float(shape_lonlat[approx_idx][0]), float(shape_lonlat[approx_idx][1]))
         dist_m = cum_end[i] if cum_end else 0.0
 
@@ -287,7 +397,8 @@ def build_exit_candidate_records(
                 next_edge=next_e,
                 incoming_way_id=way_in,
                 end_osm_node_id=end_osm_node_id,
-                conn=conn,
+                conn=conn if caches is None else None,
+                caches=caches,
                 node_traffic_signal=bool(node_sig) if node_sig is not None else None,
             )
             if sc is None:
@@ -319,11 +430,14 @@ def build_rejoin_candidates_from_reverse_trace(
     total_path_m: float,
     *,
     conn: Any = None,
+    caches: Optional[LegalAnchorOsmCaches] = None,
 ) -> List[Dict[str, Any]]:
     """
     Rejoin candidates: run exit logic on reversed path; map shape_dist_m to forward frame.
     """
-    raw = build_exit_candidate_records(edges_rev, shape_lonlat_rev, conn=conn, role="rejoin_raw")
+    raw = build_exit_candidate_records(
+        edges_rev, shape_lonlat_rev, conn=conn, caches=caches, role="rejoin_raw"
+    )
     out: List[Dict[str, Any]] = []
     for r in raw:
         r2 = dict(r)
