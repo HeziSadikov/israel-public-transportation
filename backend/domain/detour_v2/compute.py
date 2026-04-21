@@ -16,6 +16,7 @@ from shapely.geometry import LineString, shape
 from backend.infra import db_access as db
 from backend.infra.config import (
     DETOUR_V2_TIMING_LOG,
+    LEGAL_ANCHOR_INDEX_ENABLED,
     USE_MATCHED_PHYSICAL_GEOMETRY,
     VALIDATE_DETOUR_CARRIAGEWAY,
 )
@@ -30,6 +31,7 @@ from backend.domain.detour_physical.matched_trip_geometry import MatchedTripPhys
 from backend.infra import pattern_edge_match_repo as pattern_edge_match_repo
 
 from .anchor_selector import enumerate_anchor_candidates
+from . import legal_anchor_runtime
 from .bus_feasibility_evaluator import evaluate_candidate
 from .detour_validator import validate_detour_carriageway
 from .candidate_decoder import decode_valhalla_candidate
@@ -463,6 +465,35 @@ def compute_detour_for_trip(
             policy=pol,
             max_pairs=pol.anchor.candidate_pairs_k,
         )
+        if (
+            LEGAL_ANCHOR_INDEX_ENABLED
+            and physical_path_used
+            and impact.blocked is not None
+        ):
+            try:
+                fv = db.get_active_feed_version_key()
+                pid = db.get_pattern_id_for_trip(trip_id)
+                if pid:
+                    idx_rows = db.fetch_pattern_legal_anchor_candidates(fv, pid)
+                    if idx_rows:
+                        ex_rows, rj_rows = legal_anchor_runtime.load_index_rows(idx_rows)
+                        total_for_idx = float(impact.blocked.shape_length_m or 0.0)
+                        if total_for_idx <= 0.0:
+                            from .trip_impact_analyzer import _line_length_m
+
+                            total_for_idx = _line_length_m(anchor_shape_line)
+                        legal_pair = legal_anchor_runtime.select_legal_anchor_pair(
+                            ex_rows,
+                            rj_rows,
+                            blocked_start_m=float(impact.blocked.blocked_start_m),
+                            blocked_end_m=float(impact.blocked.blocked_end_m),
+                            total_shape_m=total_for_idx,
+                            policy=pol,
+                        )
+                        if legal_pair is not None:
+                            anchor_candidates.insert(0, legal_pair)
+            except Exception:
+                pass
         # A3: validate anchor reachability via /locate (drops unreachable anchor pairs).
         anchor_candidates = _validate_anchors_via_locate(anchor_candidates, pol)
 

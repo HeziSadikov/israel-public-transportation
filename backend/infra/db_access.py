@@ -23,7 +23,7 @@ import json
 import time
 
 import psycopg2
-from psycopg2.extras import DictCursor
+from psycopg2.extras import DictCursor, Json
 
 from backend.infra.logging_utils import log
 
@@ -4443,6 +4443,36 @@ def ensure_pattern_physical_layer_schema(conn=None) -> bool:
             conn.close()
 
 
+def ensure_pattern_legal_anchor_schema(conn=None) -> bool:
+    """
+    CREATE TABLE IF NOT EXISTS for pattern_legal_anchor_candidate (precomputed detour anchors).
+    Safe when table already exists.
+    """
+    if os.getenv("LEGAL_ANCHOR_SCHEMA_ENSURE", "1").strip().lower() in ("0", "false", "no"):
+        return True
+    path = os.path.normpath(
+        os.path.join(os.path.dirname(__file__), "..", "sql", "migrations", "ensure_pattern_legal_anchor.sql")
+    )
+    if not os.path.isfile(path):
+        return False
+    with open(path, encoding="utf-8") as f:
+        sql_text = f.read()
+    close = False
+    if conn is None:
+        conn = _get_conn()
+        close = True
+    try:
+        _execute_split_ddl(conn, sql_text)
+        conn.commit()
+        return True
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        if close:
+            conn.close()
+
+
 def get_pattern_edge_match_summary_for_stop_pair(
     pattern_id: str,
     from_stop_sequence: int,
@@ -5349,6 +5379,100 @@ def ensure_detour_v2_support_schema(conn=None) -> bool:
         return True
     except Exception:
         conn.rollback()
+        raise
+    finally:
+        if close:
+            conn.close()
+
+
+def fetch_pattern_legal_anchor_candidates(
+    feed_version: str,
+    pattern_id: str,
+    conn=None,
+) -> List[Dict[str, Any]]:
+    """Load precomputed legal anchor rows for a pattern (exit + rejoin roles)."""
+    if not feed_version or not pattern_id:
+        return []
+    close = False
+    if conn is None:
+        conn = _get_conn()
+        close = True
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT role, rank_in_role, shape_dist_m, lon, lat, osm_node_id,
+                       incoming_way_id, score, trace_meta, anchor_version
+                FROM pattern_legal_anchor_candidate
+                WHERE feed_version = %s AND pattern_id = %s
+                ORDER BY role, rank_in_role
+                """,
+                (feed_version, pattern_id),
+            )
+            return [dict(r) for r in cur.fetchall()]
+    finally:
+        if close:
+            conn.close()
+
+
+def replace_pattern_legal_anchor_candidates(
+    feed_version: str,
+    pattern_id: str,
+    rows: List[Dict[str, Any]],
+    *,
+    anchor_version: str = "1",
+    conn=None,
+) -> None:
+    """Replace all anchor candidates for a feed_version + pattern_id."""
+    close = False
+    if conn is None:
+        conn = _get_conn()
+        close = True
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                DELETE FROM pattern_legal_anchor_candidate
+                WHERE feed_version = %s AND pattern_id = %s
+                """,
+                (feed_version, pattern_id),
+            )
+            for r in rows:
+                tm = r.get("trace_meta")
+                tm_adapt: Any
+                if isinstance(tm, dict):
+                    tm_adapt = Json(tm)
+                elif tm is None:
+                    tm_adapt = Json({})
+                else:
+                    tm_adapt = Json({})
+                cur.execute(
+                    """
+                    INSERT INTO pattern_legal_anchor_candidate (
+                        feed_version, pattern_id, role, rank_in_role, shape_dist_m,
+                        lon, lat, osm_node_id, incoming_way_id, score, trace_meta, anchor_version
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        feed_version,
+                        pattern_id,
+                        str(r.get("role") or ""),
+                        int(r.get("rank_in_role") or 0),
+                        float(r.get("shape_dist_m") or 0.0),
+                        float(r.get("lon")),
+                        float(r.get("lat")),
+                        r.get("osm_node_id"),
+                        r.get("incoming_way_id"),
+                        r.get("score"),
+                        tm_adapt,
+                        str(r.get("anchor_version") or anchor_version),
+                    ),
+                )
+            conn.commit()
+    except Exception:
+        if close:
+            conn.rollback()
         raise
     finally:
         if close:

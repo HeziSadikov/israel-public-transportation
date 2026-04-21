@@ -62,6 +62,8 @@ def _anchors(a: AnchorPair) -> Dict[str, Any]:
         d["rejoin_forward_bearing_deg"] = a.rejoin_forward_bearing_deg
     if a.anchor_geometry_source:
         d["anchor_geometry_source"] = a.anchor_geometry_source
+    if a.anchor_source:
+        d["anchor_source"] = a.anchor_source
     if a.exit_osm_segment_id is not None:
         d["exit_osm_segment_id"] = a.exit_osm_segment_id
     if a.rejoin_osm_segment_id is not None:

@@ -683,6 +683,11 @@ def startup_detour_v2_schema():
         log("db/schema", "pattern physical layer tables ensured (if missing)")
     except Exception as e:
         log("db/schema", f"ensure pattern physical layer schema failed: {e}")
+    try:
+        db_access_module.ensure_pattern_legal_anchor_schema()
+        log("db/schema", "pattern legal anchor tables ensured (if missing)")
+    except Exception as e:
+        log("db/schema", f"ensure pattern legal anchor schema failed: {e}")
 
 
 @app.on_event("startup")

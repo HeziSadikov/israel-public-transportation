@@ -563,52 +563,106 @@ def route_avoiding_polygon_alternates_debug(
     return out, debug
 
 
+def _merge_trace_edge_payload(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """Merge nested `edge` object and dotted keys into a single dict for normalization."""
+    e = dict(raw)
+    inn = e.get("edge")
+    if isinstance(inn, dict):
+        for k, v in inn.items():
+            if e.get(k) is None and v is not None:
+                e[k] = v
+    for dotted, plain in (
+        ("edge.way_id", "way_id"),
+        ("edge.length", "length"),
+        ("edge.road_class", "road_class"),
+        ("edge.begin_heading", "begin_heading"),
+        ("edge.end_heading", "end_heading"),
+        ("edge.begin_osm_node_id", "begin_osm_node_id"),
+        ("edge.end_osm_node_id", "end_osm_node_id"),
+    ):
+        if e.get(plain) is None and dotted in e and e[dotted] is not None:
+            e[plain] = e[dotted]
+    en = e.get("end_node")
+    if not isinstance(en, dict) and isinstance(inn, dict):
+        en = inn.get("end_node")
+    if isinstance(en, dict):
+        e["end_node"] = en
+    return e
+
+
 def _normalize_trace_attributes_edge(edge: Dict[str, Any]) -> Dict[str, Any]:
     """
     Valhalla may return flat keys like way_id/length or dotted keys (edge.way_id) or nested edge{}.
     Downstream code expects way_id, length (km), road_class at top level.
+    Preserves end_node (intersecting_edges, traffic_signal, type) and headings/OSM node ids when present.
     """
-    e = dict(edge)
+    e = _merge_trace_edge_payload(edge)
     if e.get("way_id") is None:
-        for k in ("edge.way_id",):
-            if k in e and e[k] is not None:
-                try:
-                    e["way_id"] = int(e[k])
-                except (TypeError, ValueError):
-                    pass
-                break
-        if e.get("way_id") is None:
-            inner = e.get("edge")
-            if isinstance(inner, dict) and inner.get("way_id") is not None:
-                try:
-                    e["way_id"] = int(inner["way_id"])
-                except (TypeError, ValueError):
-                    pass
+        inner = e.get("edge")
+        if isinstance(inner, dict) and inner.get("way_id") is not None:
+            try:
+                e["way_id"] = int(inner["way_id"])
+            except (TypeError, ValueError):
+                pass
     if e.get("length") is None:
-        for k in ("edge.length",):
-            if k in e and e[k] is not None:
-                try:
-                    e["length"] = float(e[k])
-                except (TypeError, ValueError):
-                    pass
-                break
-        if e.get("length") is None:
-            inner = e.get("edge")
-            if isinstance(inner, dict) and inner.get("length") is not None:
-                try:
-                    e["length"] = float(inner["length"])
-                except (TypeError, ValueError):
-                    pass
+        inner = e.get("edge")
+        if isinstance(inner, dict) and inner.get("length") is not None:
+            try:
+                e["length"] = float(inner["length"])
+            except (TypeError, ValueError):
+                pass
     if e.get("road_class") is None:
-        for k in ("edge.road_class",):
-            if k in e and e[k] is not None:
-                e["road_class"] = e[k]
-                break
-        if e.get("road_class") is None:
+        inner = e.get("edge")
+        if isinstance(inner, dict) and inner.get("road_class") is not None:
+            e["road_class"] = inner["road_class"]
+    for key in ("begin_heading", "end_heading"):
+        if e.get(key) is None:
             inner = e.get("edge")
-            if isinstance(inner, dict) and inner.get("road_class") is not None:
-                e["road_class"] = inner["road_class"]
+            if isinstance(inner, dict) and inner.get(key) is not None:
+                try:
+                    e[key] = float(inner[key])
+                except (TypeError, ValueError):
+                    pass
+    for key in ("begin_osm_node_id", "end_osm_node_id"):
+        if e.get(key) is None:
+            inner = e.get("edge")
+            if isinstance(inner, dict) and inner.get(key) is not None:
+                try:
+                    e[key] = int(inner[key])
+                except (TypeError, ValueError):
+                    pass
     return e
+
+
+# Filters for /trace_attributes — edge + end-node intersecting topology (map-matching API reference).
+TRACE_ATTRIBUTES_INCLUDE_FILTERS: List[str] = [
+    "edge.way_id",
+    "edge.length",
+    "edge.speed",
+    "edge.road_class",
+    "edge.surface",
+    "edge.tunnel",
+    "edge.bridge",
+    "edge.toll",
+    "edge.access_restriction",
+    "edge.use",
+    "edge.begin_heading",
+    "edge.end_heading",
+    "edge.begin_osm_node_id",
+    "edge.end_osm_node_id",
+    "edge.begin_shape_index",
+    "edge.end_shape_index",
+    "node.intersecting_edge.begin_heading",
+    "node.intersecting_edge.driveability",
+    "node.intersecting_edge.use",
+    "node.intersecting_edge.road_class",
+    "node.intersecting_edge.to_edge_name_consistency",
+    "node.intersecting_edge.from_edge_name_consistency",
+    "node.type",
+    "node.traffic_signal",
+    "matched.type",
+    "shape",
+]
 
 
 def match_route_attributes(
@@ -630,30 +684,46 @@ def match_route_attributes(
     if len(coordinates_lonlat) < 2:
         return None
     # /trace_attributes expects lat,lon pairs
+    detail = match_route_attributes_detailed(
+        coordinates_lonlat, costing=costing, timeout_s=timeout_s, base_url=base_url
+    )
+    if not detail:
+        return None
+    return detail.get("edges")
+
+
+def match_route_attributes_detailed(
+    coordinates_lonlat: List[Tuple[float, float]],
+    costing: str = "bus",
+    timeout_s: float = 10.0,
+    *,
+    base_url: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Call Valhalla /trace_attributes; return normalized edges plus decoded matched shape points if present.
+    Keys: edges (list[dict]), shape_lonlat (list[(lon,lat)] | None).
+    If base_url is set, it overrides VALHALLA_URL for this request (CLI / scripts).
+    """
+    if not VALHALLA_TRACE_ATTRIBUTES_ENABLED:
+        return None
+    resolved = (base_url or VALHALLA_URL or "").strip()
+    if not resolved:
+        return None
+    if _breaker.is_open():
+        return None
+    if len(coordinates_lonlat) < 2:
+        return None
     shape_pts = [{"lat": lat, "lon": lon} for lon, lat in coordinates_lonlat]
     body: Dict[str, Any] = {
         "shape": shape_pts,
         "costing": costing,
         "shape_match": "map_snap",
         "filters": {
-            "attributes": [
-                "edge.way_id",
-                "edge.length",
-                "edge.speed",
-                "edge.road_class",
-                "edge.surface",
-                "edge.tunnel",
-                "edge.bridge",
-                "edge.toll",
-                "edge.access_restriction",
-                "edge.use",
-                "node.intersection_type",
-                "matched.type",
-            ],
+            "attributes": TRACE_ATTRIBUTES_INCLUDE_FILTERS,
             "action": "include",
         },
     }
-    url = f"{VALHALLA_URL.rstrip('/')}/trace_attributes"
+    url = f"{resolved.rstrip('/')}/trace_attributes"
     try:
         resp = httpx.post(url, json=body, timeout=timeout_s)
         if resp.status_code >= 400:
@@ -662,7 +732,15 @@ def match_route_attributes(
         edges = data.get("edges")
         if not isinstance(edges, list):
             return None
-        return [_normalize_trace_attributes_edge(x) for x in edges if isinstance(x, dict)]
+        norm_edges = [_normalize_trace_attributes_edge(x) for x in edges if isinstance(x, dict)]
+        shape_lonlat: Optional[List[Tuple[float, float]]] = None
+        enc = data.get("shape")
+        if isinstance(enc, str) and enc.strip():
+            try:
+                shape_lonlat = _decode_polyline(enc.strip(), precision=6)
+            except Exception:
+                shape_lonlat = None
+        return {"edges": norm_edges, "shape_lonlat": shape_lonlat, "units": data.get("units")}
     except Exception:
         return None
 

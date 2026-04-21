@@ -39,6 +39,7 @@ class AnchorPair:
     exit_forward_bearing_deg: Optional[float] = None
     rejoin_forward_bearing_deg: Optional[float] = None
     anchor_geometry_source: Optional[str] = None  # "gtfs_shape" | "matched_physical"
+    anchor_source: Optional[str] = None  # "legal_index" | "stop_window" | None
     exit_osm_segment_id: Optional[int] = None
     rejoin_osm_segment_id: Optional[int] = None
 

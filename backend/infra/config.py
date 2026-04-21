@@ -70,6 +70,8 @@ VALHALLA_HEADING_SNAP_RADIUS_M = max(0, parse_int_env("VALHALLA_HEADING_SNAP_RAD
 VALHALLA_HEADING_TOLERANCE_DEG = max(1, parse_int_env("VALHALLA_HEADING_TOLERANCE_DEG", 60))
 # Physical layer: GTFS pattern edges matched to OSM (PostGIS); when true, prefer matched geometry for impact/anchors if backfilled.
 USE_MATCHED_PHYSICAL_GEOMETRY = parse_bool_env("USE_MATCHED_PHYSICAL_GEOMETRY", False)
+# Prefer precomputed legal divergence/rejoin anchors from pattern_legal_anchor_candidate when rows exist.
+LEGAL_ANCHOR_INDEX_ENABLED = parse_bool_env("LEGAL_ANCHOR_INDEX_ENABLED", True)
 # Thresholds (mirrored in DetourPolicyConfig.physical_path; env wins at runtime via policy loader).
 PHYSICAL_PATH_MIN_TRIP_COVERAGE_RATIO = parse_float_env("PHYSICAL_PATH_MIN_TRIP_COVERAGE_RATIO", 0.72)
 PHYSICAL_PATH_MAX_AMBIGUOUS_STOP_PAIRS = max(0, parse_int_env("PHYSICAL_PATH_MAX_AMBIGUOUS_STOP_PAIRS", 2))
