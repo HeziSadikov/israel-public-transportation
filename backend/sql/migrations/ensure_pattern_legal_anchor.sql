@@ -16,11 +16,14 @@ CREATE TABLE IF NOT EXISTS pattern_legal_anchor_candidate (
     trace_meta          JSONB,
     anchor_version      TEXT NOT NULL DEFAULT '1',
     created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE (feed_version, pattern_id, role, rank_in_role)
+    UNIQUE (feed_version, pattern_id, anchor_version, role, rank_in_role)
 );
 
 CREATE INDEX IF NOT EXISTS idx_pattern_legal_anchor_lookup
     ON pattern_legal_anchor_candidate (feed_version, pattern_id);
+
+CREATE INDEX IF NOT EXISTS idx_pattern_legal_anchor_lookup_versioned
+    ON pattern_legal_anchor_candidate (feed_version, pattern_id, anchor_version);
 
 -- Skip/resume: terminal outcome per pattern + anchor_version (no_shape, trace_failed, ok, …).
 CREATE TABLE IF NOT EXISTS pattern_legal_anchor_pattern_status (
@@ -48,3 +51,23 @@ CREATE TABLE IF NOT EXISTS pattern_trace_valhalla_cache (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (feed_version, repr_shape_id, direction, trace_version)
 );
+
+-- Upgrade existing DBs: replace old uniqueness (without anchor_version) with versioned uniqueness.
+ALTER TABLE pattern_legal_anchor_candidate
+    DROP CONSTRAINT IF EXISTS pattern_legal_anchor_candidate_feed_version_pattern_id_role_rank_in_role_key;
+
+DO $legal_anchor_unique$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint c
+        JOIN pg_class t ON c.conrelid = t.oid
+        WHERE t.relname = 'pattern_legal_anchor_candidate'
+          AND c.conname = 'pattern_legal_anchor_candidate_feed_version_pattern_id_anchor_version_role_rank_in_role_key'
+    ) THEN
+        ALTER TABLE pattern_legal_anchor_candidate
+            ADD CONSTRAINT pattern_legal_anchor_candidate_feed_version_pattern_id_anchor_version_role_rank_in_role_key
+            UNIQUE (feed_version, pattern_id, anchor_version, role, rank_in_role);
+    END IF;
+END;
+$legal_anchor_unique$;

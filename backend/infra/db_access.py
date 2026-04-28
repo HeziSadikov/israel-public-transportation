@@ -25,6 +25,7 @@ import time
 import psycopg2
 from psycopg2.extras import DictCursor, Json
 
+from backend.infra.config import LEGAL_ANCHOR_INDEX_ANCHOR_VERSION
 from backend.infra.logging_utils import log
 
 
@@ -5389,10 +5390,13 @@ def fetch_pattern_legal_anchor_candidates(
     feed_version: str,
     pattern_id: str,
     conn=None,
+    *,
+    anchor_version: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Load precomputed legal anchor rows for a pattern (exit + rejoin roles)."""
     if not feed_version or not pattern_id:
         return []
+    ver = (anchor_version or LEGAL_ANCHOR_INDEX_ANCHOR_VERSION).strip() or LEGAL_ANCHOR_INDEX_ANCHOR_VERSION
     close = False
     if conn is None:
         conn = _get_conn()
@@ -5404,10 +5408,10 @@ def fetch_pattern_legal_anchor_candidates(
                 SELECT role, rank_in_role, shape_dist_m, lon, lat, osm_node_id,
                        incoming_way_id, score, trace_meta, anchor_version
                 FROM pattern_legal_anchor_candidate
-                WHERE feed_version = %s AND pattern_id = %s
+                WHERE feed_version = %s AND pattern_id = %s AND anchor_version = %s
                 ORDER BY role, rank_in_role
                 """,
-                (feed_version, pattern_id),
+                (feed_version, pattern_id, ver),
             )
             return [dict(r) for r in cur.fetchall()]
     finally:
@@ -5433,9 +5437,9 @@ def replace_pattern_legal_anchor_candidates(
             cur.execute(
                 """
                 DELETE FROM pattern_legal_anchor_candidate
-                WHERE feed_version = %s AND pattern_id = %s
+                WHERE feed_version = %s AND pattern_id = %s AND anchor_version = %s
                 """,
-                (feed_version, pattern_id),
+                (feed_version, pattern_id, anchor_version),
             )
             for r in rows:
                 tm = r.get("trace_meta")
@@ -5469,7 +5473,8 @@ def replace_pattern_legal_anchor_candidates(
                         str(r.get("anchor_version") or anchor_version),
                     ),
                 )
-            conn.commit()
+            if close:
+                conn.commit()
     except Exception:
         if close:
             conn.rollback()
@@ -5590,7 +5595,8 @@ def upsert_pattern_legal_anchor_pattern_status(
                 """,
                 (feed_version, pattern_id, anchor_version, outcome, int(row_count)),
             )
-            conn.commit()
+            if close:
+                conn.commit()
     except Exception:
         if close:
             conn.rollback()
@@ -5691,7 +5697,8 @@ def upsert_pattern_trace_valhalla_cache(
                 """,
                 (feed_version, repr_shape_id, direction, trace_version, ej, sj, float(total_m)),
             )
-            conn.commit()
+            if close:
+                conn.commit()
     except Exception:
         if close:
             conn.rollback()

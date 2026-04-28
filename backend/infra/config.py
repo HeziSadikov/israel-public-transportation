@@ -72,6 +72,8 @@ VALHALLA_HEADING_TOLERANCE_DEG = max(1, parse_int_env("VALHALLA_HEADING_TOLERANC
 USE_MATCHED_PHYSICAL_GEOMETRY = parse_bool_env("USE_MATCHED_PHYSICAL_GEOMETRY", False)
 # Prefer precomputed legal divergence/rejoin anchors from pattern_legal_anchor_candidate when rows exist.
 LEGAL_ANCHOR_INDEX_ENABLED = parse_bool_env("LEGAL_ANCHOR_INDEX_ENABLED", True)
+# Rows in pattern_legal_anchor_candidate / pattern_status are keyed by this version (must match precompute script).
+LEGAL_ANCHOR_INDEX_ANCHOR_VERSION = os.getenv("LEGAL_ANCHOR_INDEX_ANCHOR_VERSION", "legal_anchor_v1").strip() or "legal_anchor_v1"
 # Thresholds (mirrored in DetourPolicyConfig.physical_path; env wins at runtime via policy loader).
 PHYSICAL_PATH_MIN_TRIP_COVERAGE_RATIO = parse_float_env("PHYSICAL_PATH_MIN_TRIP_COVERAGE_RATIO", 0.72)
 PHYSICAL_PATH_MAX_AMBIGUOUS_STOP_PAIRS = max(0, parse_int_env("PHYSICAL_PATH_MAX_AMBIGUOUS_STOP_PAIRS", 2))

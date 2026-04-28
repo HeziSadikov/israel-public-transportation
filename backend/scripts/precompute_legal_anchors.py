@@ -29,9 +29,10 @@ from backend.domain.detour_physical.legal_anchor_index import (
     merge_and_rank_records,
 )
 from backend.infra import db_access as db
+from backend.infra.config import LEGAL_ANCHOR_INDEX_ANCHOR_VERSION
 from backend.infra.logging_utils import ensure_cli_action_logging, log
 
-ANCHOR_VERSION = "legal_anchor_v1"
+ANCHOR_VERSION = LEGAL_ANCHOR_INDEX_ANCHOR_VERSION
 TRACE_CACHE_VERSION = ANCHOR_VERSION
 
 # Shared across worker threads (Valhalla HTTP cap).
@@ -205,6 +206,65 @@ def _run_trace_attributes(
     return match_route_attributes_detailed(pts, costing="bus", timeout_s=timeout_s, base_url=valhalla_base_url)
 
 
+MemKey = Tuple[str, str, str, str]
+
+
+def _resolve_trace_detail(
+    *,
+    mem_key: MemKey,
+    conn: Any,
+    feed_version: str,
+    repr_shape_id: str,
+    direction: str,
+    pts: List[Tuple[float, float]],
+    trace_mem: Dict[MemKey, Dict[str, Any]],
+    trace_mem_lock: threading.Lock,
+    trace_flight_locks: Dict[MemKey, threading.Lock],
+    use_trace_db_cache: bool,
+    valhalla_base_url: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    """Return cached or freshly traced detail; single-flight per mem_key across worker threads."""
+    with trace_mem_lock:
+        cached = trace_mem.get(mem_key)
+        if cached is not None:
+            return cached
+        if mem_key not in trace_flight_locks:
+            trace_flight_locks[mem_key] = threading.Lock()
+        flight = trace_flight_locks[mem_key]
+    with flight:
+        with trace_mem_lock:
+            cached = trace_mem.get(mem_key)
+            if cached is not None:
+                return cached
+        if use_trace_db_cache:
+            detail = _load_trace_from_db_cache(conn, feed_version, str(repr_shape_id), direction)
+            if detail is not None:
+                with trace_mem_lock:
+                    trace_mem[mem_key] = detail
+                return detail
+        detail = _run_trace_attributes(pts, valhalla_base_url=valhalla_base_url)
+        if detail:
+            with trace_mem_lock:
+                trace_mem[mem_key] = detail
+            if use_trace_db_cache:
+                edges = detail.get("edges") or []
+                sl = detail.get("shape_lonlat")
+                tm = sum(float(e.get("length") or 0.0) for e in edges) * 1000.0
+                try:
+                    _save_trace_to_db_cache(
+                        conn,
+                        feed_version,
+                        str(repr_shape_id),
+                        direction,
+                        list(edges),
+                        list(sl) if sl else None,
+                        tm,
+                    )
+                except Exception:
+                    pass
+        return detail
+
+
 def _process_one_pattern(
     conn: Any,
     *,
@@ -214,8 +274,9 @@ def _process_one_pattern(
     repr_trip_id: str,
     repr_shape_id: Optional[str],
     shape_map: Dict[str, LineString],
-    trace_mem: Dict[Tuple[str, str, str, str], Dict[str, Any]],
+    trace_mem: Dict[MemKey, Dict[str, Any]],
     trace_mem_lock: threading.Lock,
+    trace_flight_locks: Dict[MemKey, threading.Lock],
     force: bool,
     valhalla_base_url: Optional[str],
     use_trace_db_cache: bool,
@@ -256,6 +317,7 @@ def _process_one_pattern(
             row_count=0,
             conn=conn,
         )
+        conn.commit()
         return "no_shape"
 
     line = shape_map.get(str(repr_shape_id))
@@ -268,6 +330,7 @@ def _process_one_pattern(
             row_count=0,
             conn=conn,
         )
+        conn.commit()
         return "no_shape"
     _mark("shape_lookup")
 
@@ -281,37 +344,25 @@ def _process_one_pattern(
             row_count=0,
             conn=conn,
         )
+        conn.commit()
         return "too_few_points"
 
     mem_key_f = _trace_mem_key(feed_version, str(repr_shape_id), "forward")
     mem_key_r = _trace_mem_key(feed_version, str(repr_shape_id), "reverse")
 
-    detail: Optional[Dict[str, Any]] = None
-    with trace_mem_lock:
-        detail = trace_mem.get(mem_key_f)
-    if detail is None and use_trace_db_cache:
-        detail = _load_trace_from_db_cache(conn, feed_version, str(repr_shape_id), "forward")
-    if detail is None:
-        detail = _run_trace_attributes(pts, valhalla_base_url=valhalla_base_url)
-        if detail:
-            with trace_mem_lock:
-                trace_mem[mem_key_f] = detail
-            if use_trace_db_cache:
-                edges = detail.get("edges") or []
-                sl = detail.get("shape_lonlat")
-                tm = sum(float(e.get("length") or 0.0) for e in edges) * 1000.0
-                try:
-                    _save_trace_to_db_cache(
-                        conn,
-                        feed_version,
-                        str(repr_shape_id),
-                        "forward",
-                        list(edges),
-                        list(sl) if sl else None,
-                        tm,
-                    )
-                except Exception:
-                    pass
+    detail = _resolve_trace_detail(
+        mem_key=mem_key_f,
+        conn=conn,
+        feed_version=feed_version,
+        repr_shape_id=str(repr_shape_id),
+        direction="forward",
+        pts=pts,
+        trace_mem=trace_mem,
+        trace_mem_lock=trace_mem_lock,
+        trace_flight_locks=trace_flight_locks,
+        use_trace_db_cache=use_trace_db_cache,
+        valhalla_base_url=valhalla_base_url,
+    )
     _mark("forward_trace")
 
     if not detail:
@@ -323,6 +374,7 @@ def _process_one_pattern(
             row_count=0,
             conn=conn,
         )
+        conn.commit()
         return "trace_failed"
     edges = detail.get("edges") or []
     shape_lonlat = detail.get("shape_lonlat")
@@ -330,33 +382,20 @@ def _process_one_pattern(
         shape_lonlat = pts
     total_m = sum(float(e.get("length") or 0.0) for e in edges) * 1000.0
 
-    detail_r: Optional[Dict[str, Any]] = None
     pts_rev = list(reversed(pts))
-    with trace_mem_lock:
-        detail_r = trace_mem.get(mem_key_r)
-    if detail_r is None and use_trace_db_cache:
-        detail_r = _load_trace_from_db_cache(conn, feed_version, str(repr_shape_id), "reverse")
-    if detail_r is None:
-        detail_r = _run_trace_attributes(pts_rev, valhalla_base_url=valhalla_base_url)
-        if detail_r:
-            with trace_mem_lock:
-                trace_mem[mem_key_r] = detail_r
-            if use_trace_db_cache:
-                edges_r0 = detail_r.get("edges") or []
-                sl_r0 = detail_r.get("shape_lonlat")
-                tm_r = sum(float(e.get("length") or 0.0) for e in edges_r0) * 1000.0
-                try:
-                    _save_trace_to_db_cache(
-                        conn,
-                        feed_version,
-                        str(repr_shape_id),
-                        "reverse",
-                        list(edges_r0),
-                        list(sl_r0) if sl_r0 else None,
-                        tm_r,
-                    )
-                except Exception:
-                    pass
+    detail_r = _resolve_trace_detail(
+        mem_key=mem_key_r,
+        conn=conn,
+        feed_version=feed_version,
+        repr_shape_id=str(repr_shape_id),
+        direction="reverse",
+        pts=pts_rev,
+        trace_mem=trace_mem,
+        trace_mem_lock=trace_mem_lock,
+        trace_flight_locks=trace_flight_locks,
+        use_trace_db_cache=use_trace_db_cache,
+        valhalla_base_url=valhalla_base_url,
+    )
     _mark("reverse_trace")
 
     edges_r: List[Dict[str, Any]] = []
@@ -390,6 +429,7 @@ def _process_one_pattern(
             row_count=0,
             conn=conn,
         )
+        conn.commit()
         return "no_candidates"
     db.replace_pattern_legal_anchor_candidates(
         feed_version, pattern_id, rows_db, anchor_version=ANCHOR_VERSION, conn=conn
@@ -403,6 +443,7 @@ def _process_one_pattern(
         conn=conn,
     )
     _mark("db_write")
+    conn.commit()
     if timings_out is not None:
         timings_out.clear()
         timings_out.update(acc)
@@ -460,8 +501,9 @@ def main() -> None:
 
     workers = max(1, int(args.workers))
 
-    trace_mem: Dict[Tuple[str, str, str, str], Dict[str, Any]] = {}
+    trace_mem: Dict[MemKey, Dict[str, Any]] = {}
     trace_mem_lock = threading.Lock()
+    trace_flight_locks: Dict[MemKey, threading.Lock] = {}
     use_trace_db = not bool(args.no_trace_db_cache)
     sql_prefilter = not bool(args.no_sql_prefilter)
 
@@ -491,6 +533,7 @@ def main() -> None:
                     shape_map=shape_map,
                     trace_mem=trace_mem,
                     trace_mem_lock=trace_mem_lock,
+                    trace_flight_locks=trace_flight_locks,
                     force=bool(args.force),
                     valhalla_base_url=args.valhalla_url,
                     use_trace_db_cache=use_trace_db,
@@ -540,6 +583,7 @@ def main() -> None:
             shape_map=shape_map,
             trace_mem=trace_mem,
             trace_mem_lock=trace_mem_lock,
+            trace_flight_locks=trace_flight_locks,
             force=bool(args.force),
             valhalla_base_url=args.valhalla_url,
             use_trace_db_cache=use_trace_db,

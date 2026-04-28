@@ -132,6 +132,8 @@ function mapPixelRatioForBasemap(kind: BasemapKind): number {
   return dpr;
 }
 
+const INTEGER_ZOOM_EPSILON = 0.01;
+
 /** MapboxDraw styles filter on this; polygon-phase synthetic LineStrings omit it (see mapbox-gl-draw draw_polygon). */
 const PROP_MANUAL_DETOUR_DRAFT = "manual_detour_draft";
 const VAL_MANUAL_DETOUR_DRAFT = "yes";
@@ -612,7 +614,7 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
     const eff0 = effectiveBasemap(basemap);
     initialBasemapRef.current = eff0;
     basemapRef.current = eff0;
-    const map = new maplibregl.Map({
+    const mapOptions = {
       container: containerRef.current,
       style: styleForBasemap(eff0),
       center: [lng, lat],
@@ -622,12 +624,27 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
       dragRotate: false,
       pitchWithRotate: false,
       pixelRatio: mapPixelRatioForBasemap(eff0),
-    });
+      // `zoomSnap` is available in newer MapLibre releases; unknown options are ignored on older builds.
+      zoomSnap: 1,
+    } as maplibregl.MapOptions & { zoomSnap?: number };
+    const map = new maplibregl.Map(mapOptions);
     // Make mouse-wheel zoom a bit faster/more responsive.
     map.scrollZoom.setWheelZoomRate(1 / 180);
     map.scrollZoom.setZoomRate(1.0);
     map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "top-right");
     mapRef.current = map;
+    (window as Window & { __osmComparisonSnapshot?: () => Record<string, unknown> }).__osmComparisonSnapshot = () => {
+      const centerNow = map.getCenter();
+      const intZoom = Math.round(map.getZoom());
+      return {
+        center: { lat: Number(centerNow.lat.toFixed(6)), lng: Number(centerNow.lng.toFixed(6)) },
+        mapZoom: Number(map.getZoom().toFixed(3)),
+        integerZoom: intZoom,
+        viewport: { width: window.innerWidth, height: window.innerHeight },
+        devicePixelRatio: window.devicePixelRatio || 1,
+        openStreetMapUrl: `https://www.openstreetmap.org/#map=${intZoom}/${centerNow.lat.toFixed(6)}/${centerNow.lng.toFixed(6)}`,
+      };
+    };
 
     const containerEl = containerRef.current;
     const scheduleResize = () => {
@@ -639,6 +656,43 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
             scheduleResize();
           })
         : null;
+    let pendingIntegerSnap = false;
+    let lastWheelAt = 0;
+    const markPendingIntegerSnap = () => {
+      pendingIntegerSnap = true;
+    };
+    const onMapWheel = () => {
+      lastWheelAt = Date.now();
+      pendingIntegerSnap = false;
+    };
+    const onMapZoomEnd = () => {
+      if (!pendingIntegerSnap) return;
+      pendingIntegerSnap = false;
+      if (Date.now() - lastWheelAt < 150) return;
+      const currentZoom = map.getZoom();
+      const targetZoom = Math.round(currentZoom);
+      if (Math.abs(currentZoom - targetZoom) <= INTEGER_ZOOM_EPSILON) return;
+      map.easeTo({ zoom: targetZoom, duration: 120 });
+    };
+    const onWindowKeyDown = (event: KeyboardEvent) => {
+      if (!containerEl || !document.activeElement || !containerEl.contains(document.activeElement)) return;
+      const isZoomKey =
+        event.key === "+" ||
+        event.key === "=" ||
+        event.key === "-" ||
+        event.key === "_" ||
+        event.key === "NumpadAdd" ||
+        event.key === "NumpadSubtract";
+      if (isZoomKey) markPendingIntegerSnap();
+    };
+    map.on("dblclick", markPendingIntegerSnap);
+    map.on("wheel", onMapWheel);
+    map.on("zoomend", onMapZoomEnd);
+    window.addEventListener("keydown", onWindowKeyDown, true);
+    const navControlButtons = containerEl?.querySelectorAll<HTMLButtonElement>(
+      ".maplibregl-ctrl-group button.maplibregl-ctrl-zoom-in, .maplibregl-ctrl-group button.maplibregl-ctrl-zoom-out"
+    );
+    navControlButtons?.forEach((btn) => btn.addEventListener("click", markPendingIntegerSnap, true));
     resizeObserver?.observe(containerEl);
     window.addEventListener("resize", scheduleResize);
     requestAnimationFrame(scheduleResize);
@@ -1231,6 +1285,13 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
       closeStopPopup();
       resizeObserver?.disconnect();
       window.removeEventListener("resize", scheduleResize);
+      window.removeEventListener("keydown", onWindowKeyDown, true);
+      map.off("dblclick", markPendingIntegerSnap);
+      map.off("wheel", onMapWheel);
+      map.off("zoomend", onMapZoomEnd);
+      navControlButtons?.forEach((btn) => btn.removeEventListener("click", markPendingIntegerSnap, true));
+      const win = window as Window & { __osmComparisonSnapshot?: () => Record<string, unknown> };
+      delete win.__osmComparisonSnapshot;
       map.off("load", onLoad);
       map.remove();
       mapRef.current = null;

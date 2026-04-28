@@ -16,6 +16,7 @@ from shapely.geometry import LineString, shape
 from backend.infra import db_access as db
 from backend.infra.config import (
     DETOUR_V2_TIMING_LOG,
+    LEGAL_ANCHOR_INDEX_ANCHOR_VERSION,
     LEGAL_ANCHOR_INDEX_ENABLED,
     USE_MATCHED_PHYSICAL_GEOMETRY,
     VALIDATE_DETOUR_CARRIAGEWAY,
@@ -474,7 +475,9 @@ def compute_detour_for_trip(
                 fv = db.get_active_feed_version_key()
                 pid = db.get_pattern_id_for_trip(trip_id)
                 if pid:
-                    idx_rows = db.fetch_pattern_legal_anchor_candidates(fv, pid)
+                    idx_rows = db.fetch_pattern_legal_anchor_candidates(
+                        fv, pid, anchor_version=LEGAL_ANCHOR_INDEX_ANCHOR_VERSION
+                    )
                     if idx_rows:
                         ex_rows, rj_rows = legal_anchor_runtime.load_index_rows(idx_rows)
                         total_for_idx = float(impact.blocked.shape_length_m or 0.0)
