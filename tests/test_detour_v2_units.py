@@ -113,7 +113,10 @@ def test_feasibility_local_share_hard_reject_only_when_policy_enabled():
         detour_time_s=100.0,
         banned_way_ids=set(),
     )
-    assert "local_fraction_exceeded" in feas2.hard_reject_reasons
+    # Local share is scored (penalty + warnings), not an absolute hard reject.
+    assert feas2.accepted
+    assert not feas2.hard_reject_reasons
+    assert any("local_fraction" in w or "high_local" in w for w in feas2.warnings)
 
 
 _MIN_POLY = {"type": "Polygon", "coordinates": [[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0], [0.0, 0.0]]]}
@@ -255,7 +258,8 @@ def test_feasibility_strict_rejects_way_without_gtfs_evidence():
         banned_way_ids=set(),
         gtfs_way_evidence={},
     )
-    assert any(r.startswith("not_in_gtfs_bus_corridor_123") for r in feas.hard_reject_reasons)
+    assert any(w.startswith("not_in_gtfs_bus_corridor_123") for w in feas.warnings)
+    assert feas.accepted
 
 
 def test_feasibility_strict_accepts_way_with_gtfs_evidence():
@@ -307,7 +311,8 @@ def test_feasibility_valhalla_uturn_maneuver_type_float_still_detected_when_hard
         bearing_delta_exit_deg=10.0,
         bearing_delta_rejoin_deg=10.0,
     )
-    assert "u_turn_maneuver" in feas.hard_reject_reasons
+    assert "u_turn_maneuver_detected" in feas.warnings
+    assert feas.turn_penalty_s > 0
 
 
 def test_feasibility_no_false_positive_uturn_substring_in_unrelated_instruction():
@@ -328,7 +333,7 @@ def test_feasibility_no_false_positive_uturn_substring_in_unrelated_instruction(
         bearing_delta_exit_deg=10.0,
         bearing_delta_rejoin_deg=10.0,
     )
-    assert "u_turn_maneuver" not in feas.hard_reject_reasons
+    assert "u_turn_maneuver_detected" not in feas.warnings
     assert feas.accepted
 
 
@@ -351,9 +356,9 @@ def test_feasibility_rejects_explicit_u_turn_and_backtrack_heading():
         bearing_delta_exit_deg=172.0,
         bearing_delta_rejoin_deg=20.0,
     )
-    assert "u_turn_maneuver" in feas.hard_reject_reasons
-    assert "anchor_backtrack_heading" in feas.hard_reject_reasons
-    assert feas.turn_penalty_s > 0
+    # Large bearing delta is an absolute hard reject (wrong-direction rejoin).
+    assert "wrong_direction_rejoin" in feas.hard_reject_reasons
+    assert not feas.accepted
 
 
 def test_enumerate_anchor_candidates_returns_multiple_pairs():

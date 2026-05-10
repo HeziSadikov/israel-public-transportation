@@ -6,7 +6,7 @@ All external I/O is stubbed:
 - httpx.post is patched to return fixture-based Valhalla responses.
 
 Tests the full compute_detour_for_trip() call end-to-end and asserts:
-- status='ok'
+- status is a non-error tier (auto_ok / review_recommended / low_confidence)
 - selected.geometry_geojson is present
 - chosen path does not have significant overlap with the blockage polygon
 - attempts[] field is populated
@@ -20,6 +20,7 @@ import math
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -134,6 +135,9 @@ def _make_db_stubs() -> Dict[str, Any]:
         "osm_segments_intersecting_polygon": [],
         "get_candidate_osm_segments_for_polyline": [],
         "get_gtfs_bus_way_evidence_bulk": {},
+        "osm_segment_nodes_intersecting_polygon": [],
+        "get_bus_edge_evidence_bulk": {},
+        "get_bus_turn_evidence_bulk": {},
     }
 
 
@@ -169,6 +173,15 @@ def db_stubs(monkeypatch):
     def _get_gtfs_bus_way_evidence_bulk(feed_id, way_ids):
         return stubs["get_gtfs_bus_way_evidence_bulk"]
 
+    def _osm_segment_nodes_intersecting_polygon(gj):
+        return stubs["osm_segment_nodes_intersecting_polygon"]
+
+    def _get_bus_edge_evidence_bulk(way_ids):
+        return stubs["get_bus_edge_evidence_bulk"]
+
+    def _get_bus_turn_evidence_bulk(triplets):
+        return stubs["get_bus_turn_evidence_bulk"]
+
     import backend.infra.db_access as db
     monkeypatch.setattr(db, "get_trip_route_shape", _get_trip_route_shape)
     monkeypatch.setattr(db, "get_shape_line", _get_shape_line)
@@ -178,6 +191,9 @@ def db_stubs(monkeypatch):
     monkeypatch.setattr(db, "osm_segments_intersecting_polygon", _osm_segments_intersecting)
     monkeypatch.setattr(db, "get_candidate_osm_segments_for_polyline", _get_candidate_osm_segments)
     monkeypatch.setattr(db, "get_gtfs_bus_way_evidence_bulk", _get_gtfs_bus_way_evidence_bulk)
+    monkeypatch.setattr(db, "osm_segment_nodes_intersecting_polygon", _osm_segment_nodes_intersecting_polygon)
+    monkeypatch.setattr(db, "get_bus_edge_evidence_bulk", _get_bus_edge_evidence_bulk)
+    monkeypatch.setattr(db, "get_bus_turn_evidence_bulk", _get_bus_turn_evidence_bulk)
     return stubs
 
 
@@ -194,7 +210,7 @@ def _make_httpx_mock(route_response: Optional[Dict[str, Any]] = None):
 
 
 def test_compute_detour_returns_ok_status(db_stubs, monkeypatch):
-    """Full pipeline: returns status=ok with geometry and attempts."""
+    """Full pipeline: returns a tiered success status with geometry and attempts."""
     from backend.domain.detour_v2.compute import compute_detour_for_trip
     from backend.domain.detour_v2.policy import DetourPolicyConfig
 
@@ -220,7 +236,11 @@ def test_compute_detour_returns_ok_status(db_stubs, monkeypatch):
             policy=pol,
         )
 
-    assert out.status == "ok", f"Expected ok, got {out.status}. debug={out.debug}"
+    assert out.status in {
+        "auto_ok",
+        "review_recommended",
+        "low_confidence",
+    }, f"Expected tiered success, got {out.status}. debug={out.debug}"
     assert out.selected is not None
     assert out.selected.decoded is not None
     assert out.selected.decoded.geometry_geojson is not None
@@ -280,8 +300,8 @@ def test_compute_detour_path_does_not_enter_blockage(db_stubs, monkeypatch):
             policy=pol,
         )
 
-    if out.status != "ok":
-        pytest.skip(f"No detour found ({out.status}); overlap check not applicable")
+    if out.status not in {"auto_ok", "review_recommended", "low_confidence"}:
+        pytest.skip(f"No tiered detour ({out.status}); overlap check not applicable")
 
     # Extract geometry coords from selected candidate.
     geom_fc = out.selected.decoded.geometry_geojson if out.selected and out.selected.decoded else None
@@ -322,8 +342,8 @@ def test_compute_detour_score_breakdown_complete(db_stubs, monkeypatch):
             policy=pol,
         )
 
-    if out.status != "ok":
-        pytest.skip(f"No detour found ({out.status})")
+    if out.status not in {"auto_ok", "review_recommended", "low_confidence"}:
+        pytest.skip(f"No tiered detour ({out.status})")
 
     d = detour_compute_output_to_dict(out)
     selected = d.get("selected") or {}
@@ -355,7 +375,7 @@ def test_compute_detour_no_impact_when_shape_misses_blockage(db_stubs, monkeypat
 
 
 def test_serialize_includes_attempts_field(db_stubs, monkeypatch):
-    """Serialized output must always include attempts[], even on no_safe_detour."""
+    """Serialized output must include attempts[] (or no_impact) even when Valhalla fails (emergency tier)."""
     from backend.domain.detour_v2.compute import compute_detour_for_trip
     from backend.domain.detour_v2.policy import DetourPolicyConfig
     from backend.domain.detour_v2.serialize import detour_compute_output_to_dict
@@ -374,6 +394,12 @@ def test_serialize_includes_attempts_field(db_stubs, monkeypatch):
         patch("backend.adapters.osm_detour.httpx.post", mock_post),
         patch("backend.adapters.osm_detour.VALHALLA_URL", "http://valhalla-test:8002"),
         patch("backend.adapters.osm_detour.VALHALLA_TRACE_ATTRIBUTES_ENABLED", False),
+        patch(
+            "backend.domain.detour_v2.compute.route_avoiding_polygon",
+            lambda *a, **kw: SimpleNamespace(
+                success=False, coordinates=[], time_s=0.0, distance_m=0.0, turn_by_turn=None
+            ),
+        ),
     ):
         monkeypatch.setattr("backend.domain.detour_v2.compute.valhalla_locate", lambda *a, **kw: None)
         out = compute_detour_for_trip(
@@ -384,5 +410,7 @@ def test_serialize_includes_attempts_field(db_stubs, monkeypatch):
         )
 
     d = detour_compute_output_to_dict(out)
+    assert out.status == "emergency_fallback"
+    assert out.selected is not None
     # attempts should be in the output (may be empty list if no routing happened).
     assert "attempts" in d or out.status == "no_impact"

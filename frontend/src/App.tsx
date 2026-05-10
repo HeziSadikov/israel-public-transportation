@@ -224,6 +224,7 @@ const App: React.FC = () => {
     rejoinLon?: number | null; rejoinLat?: number | null;
     exitStopId?: string | null; rejoinStopId?: string | null;
     skippedStopIds?: string[];
+    proximityStopIds?: string[];
   } | null>(null);
   const [detourV2DebugGeojson, setDetourV2DebugGeojson] = useState<GeoJSON.FeatureCollection | null>(null);
   const [message, setMessage] = useState<string | null>(null);
@@ -415,6 +416,8 @@ const App: React.FC = () => {
       setPatternId(preview.pattern_id);
       setRouteGeojson(preview.route_geojson);
       setStops(preview.stops || []);
+      setDetourV2Overlay(null);
+      setDetourV2DebugGeojson(null);
       // Include backend-timing headers when available.
       const backendMs = Number(previewRes.headers?.["x-elapsed-ms"] || 0);
       const previewHit = previewRes.headers?.["x-cache-hit"] ?? "n/a";
@@ -790,6 +793,13 @@ const App: React.FC = () => {
     // E4: build v2 overlay from anchors and stitching.
     const anchors = result.anchors;
     const skipped = result.stitching?.skipped_stop_ids ?? [];
+    const notes = result.stitching?.stitch_notes ?? [];
+    const proximityStopIds = notes
+      .map((n) => {
+        const m = /^served_via_detour_proximity:([^:\s]+)/.exec(String(n));
+        return m ? m[1] : null;
+      })
+      .filter((x): x is string => !!x);
     if (anchors) {
       setDetourV2Overlay({
         exitLon: anchors.exit_lon,
@@ -799,6 +809,7 @@ const App: React.FC = () => {
         exitStopId: anchors.exit_stop_id,
         rejoinStopId: anchors.rejoin_stop_id,
         skippedStopIds: skipped,
+        proximityStopIds,
       });
     } else {
       setDetourV2Overlay(null);

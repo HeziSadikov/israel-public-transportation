@@ -6,6 +6,18 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, Optional
 
 
+DetourTier = Literal["AUTO_OK", "REVIEW_RECOMMENDED", "LOW_CONFIDENCE", "EMERGENCY_FALLBACK"]
+
+DetourComputeStatus = Literal[
+    "auto_ok",
+    "review_recommended",
+    "low_confidence",
+    "emergency_fallback",
+    "no_impact",
+    "error",
+]
+
+
 @dataclass
 class BlockedShapeInterval:
     """Blocked portion of trip shape along cumulative distance (meters)."""
@@ -42,6 +54,8 @@ class AnchorPair:
     anchor_source: Optional[str] = None  # "legal_index" | "stop_window" | None
     exit_osm_segment_id: Optional[int] = None
     rejoin_osm_segment_id: Optional[int] = None
+    # Which widening radius (m) produced this pair (0 if unknown).
+    search_radius_m: float = 0.0
 
 
 @dataclass
@@ -119,6 +133,9 @@ class FeasibilityResult:
     evidence_bonus_s: float = 0.0
     notes: List[str] = field(default_factory=list)
     sharp_turn_count: int = 0
+    # Post-scorer: 0..1, lowered by soft warnings/penalties (hard rejects should leave at 0).
+    confidence_score: float = 1.0
+    warnings: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -131,6 +148,12 @@ class RankedCandidate:
     feasibility: Optional[FeasibilityResult] = None
     rejection_reasons: List[str] = field(default_factory=list)
     score_breakdown: Dict[str, float] = field(default_factory=dict)
+    tier: DetourTier = "REVIEW_RECOMMENDED"
+    confidence_score: float = 0.0
+    warnings: List[str] = field(default_factory=list)
+    hard_constraints_passed: List[str] = field(default_factory=list)
+    candidate_rank: int = 0
+    review_required: bool = False
 
 
 @dataclass
@@ -142,11 +165,13 @@ class StitchingResult:
     stitch_ok: bool
     skipped_reasons: Dict[str, str] = field(default_factory=dict)
     stitch_notes: List[str] = field(default_factory=list)
+    served_before_exit_ids: List[str] = field(default_factory=list)
+    served_after_rejoin_ids: List[str] = field(default_factory=list)
 
 
 @dataclass
 class DetourComputeOutput:
-    status: Literal["ok", "no_impact", "no_safe_detour", "error"]
+    status: DetourComputeStatus
     trip_id: str
     route_id: str
     anchors: Optional[AnchorPair] = None
@@ -159,3 +184,5 @@ class DetourComputeOutput:
     # Top-level attempt log (always present; contains per anchor/corridor routing outcome rows).
     attempts: List[Dict[str, Any]] = field(default_factory=list)
     debug: Optional[Dict[str, Any]] = None
+    # Hard-rejected candidates (absolute constraints only); for diagnostics / persistence.
+    discarded: List[RankedCandidate] = field(default_factory=list)

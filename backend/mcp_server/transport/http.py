@@ -57,6 +57,7 @@ from backend.infra.config import (
     DETOUR_V2_ENABLED,
     DETOUR_V2_AI_LOG,
     DETOUR_V2_DEBUG,
+    DETOUR_ENGINE,
 )
 from backend.mcp_server.schemas.api_models import (
     RouteSearchRequest,
@@ -2092,8 +2093,9 @@ def _compute_route_detour_by_area(
         res.reason_code = reason_code
         res.strategy_used = strategy_used
         res.confidence = confidence
-        if diagnostics:
-            res.diagnostics = diagnostics
+        diag = dict(diagnostics or {})
+        diag.setdefault("detour_engine", DETOUR_ENGINE)
+        res.diagnostics = diag
         return res
 
     # Respect time window: if the route has no active trips in the window,
@@ -3262,7 +3264,7 @@ def post_detours_compute_v2(req: DetourComputeV2Request):
                     payload_json=payload,
                 )
                 if out is not None:
-                    detour_memory_v2.save_candidates(rid, out.candidates)
+                    detour_memory_v2.save_candidates(rid, out.candidates, discarded=out.discarded)
                 detour_request_ids.append(rid)
                 log("detours/v2/compute", f"trip_id={trip_id} persist_ok=true request_id={rid}")
             except Exception as e:
@@ -3351,10 +3353,25 @@ def post_detour_approve_v2(detour_request_id: int, req: DetourApproveV2Request):
     req_row = full["request"]
     cands = full.get("candidates") or []
     chosen = None
-    for c in cands:
-        if c.get("accepted"):
-            chosen = c
-            break
+    want_rank = getattr(req, "candidate_rank", None)
+    if want_rank is not None:
+        try:
+            wr = int(want_rank)
+        except Exception:
+            wr = None
+        if wr is not None:
+            for c in cands:
+                try:
+                    if int(c.get("candidate_rank") or -1) == wr:
+                        chosen = c
+                        break
+                except Exception:
+                    continue
+    if chosen is None:
+        for c in cands:
+            if c.get("accepted"):
+                chosen = c
+                break
     if chosen is None and cands:
         chosen = min(cands, key=lambda x: float(x.get("score") or 1e30))
     if chosen is None:
@@ -3407,6 +3424,39 @@ def post_detour_approve_v2(detour_request_id: int, req: DetourApproveV2Request):
         if wid:
             try:
                 detour_memory_v2.bump_edge_evidence(int(wid), seg.get("direction"))
+            except Exception:
+                pass
+    turn_seq = chosen.get("turn_sequence_json") or []
+    if isinstance(turn_seq, str):
+        try:
+            turn_seq = _json.loads(turn_seq)
+        except Exception:
+            turn_seq = []
+    seg_way_by_id: Dict[int, int] = {}
+    for seg in road_seq:
+        if not isinstance(seg, dict):
+            continue
+        try:
+            sid = int(seg.get("segment_id") or 0)
+            wid = int(seg.get("osm_way_id") or 0)
+        except Exception:
+            continue
+        if sid and wid:
+            seg_way_by_id[sid] = wid
+    for tr in turn_seq:
+        if not isinstance(tr, dict):
+            continue
+        try:
+            vn = int(tr.get("via_node_id") or 0)
+            fs = int(tr.get("from_segment_id") or 0)
+            ts = int(tr.get("to_segment_id") or 0)
+        except Exception:
+            continue
+        fw_w = int(tr.get("from_way_id") or 0) or seg_way_by_id.get(fs, 0)
+        tw_w = int(tr.get("to_way_id") or 0) or seg_way_by_id.get(ts, 0)
+        if fw_w and vn and tw_w:
+            try:
+                db_access_module.bump_bus_turn_evidence(fw_w, vn, tw_w)
             except Exception:
                 pass
     log(

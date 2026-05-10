@@ -269,6 +269,8 @@ class DetourComputeV2Request(BaseModel):
 
 
 class DetourComputeV2Response(BaseModel):
+    """Each results[] row matches detour_compute_output_to_dict: status, trip_id, candidates[], selected{}, stitching{}, discarded[], attempts[]."""
+
     results: List[Dict[str, Any]]
     detour_request_ids: List[int] = Field(default_factory=list)
     policy_version: str
@@ -301,6 +303,10 @@ class ConstraintCreateResponse(BaseModel):
 
 class DetourApproveV2Request(BaseModel):
     approved_by: Optional[str] = None
+    candidate_rank: Optional[int] = Field(
+        default=None,
+        description="1-based rank matching persisted detour_candidates.candidate_rank (top alternatives are 1..3).",
+    )
 
 
 class DetourApproveV2Response(BaseModel):

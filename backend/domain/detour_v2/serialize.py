@@ -15,7 +15,7 @@ from .models import (
 
 
 def _feas(f: FeasibilityResult) -> Dict[str, Any]:
-    return {
+    d: Dict[str, Any] = {
         "accepted": f.accepted,
         "hard_reject_reasons": list(f.hard_reject_reasons),
         "segment_penalty_s": f.segment_penalty_s,
@@ -25,7 +25,10 @@ def _feas(f: FeasibilityResult) -> Dict[str, Any]:
         "evidence_bonus_s": f.evidence_bonus_s,
         "sharp_turn_count": f.sharp_turn_count,
         "notes": list(f.notes),
+        "confidence_score": f.confidence_score,
+        "warnings": list(f.warnings),
     }
+    return d
 
 
 def _ranked(c: RankedCandidate) -> Dict[str, Any]:
@@ -36,6 +39,12 @@ def _ranked(c: RankedCandidate) -> Dict[str, Any]:
         "distance_m": c.distance_m,
         "rejection_reasons": list(c.rejection_reasons),
         "score_breakdown": dict(c.score_breakdown),
+        "tier": c.tier,
+        "confidence_score": c.confidence_score,
+        "warnings": list(c.warnings),
+        "hard_constraints_passed": list(c.hard_constraints_passed),
+        "candidate_rank": c.candidate_rank,
+        "review_required": c.review_required,
     }
     if c.feasibility:
         out["feasibility"] = _feas(c.feasibility)
@@ -72,7 +81,7 @@ def _anchors(a: AnchorPair) -> Dict[str, Any]:
 
 
 def _stitch(s: StitchingResult) -> Dict[str, Any]:
-    return {
+    d: Dict[str, Any] = {
         "exit_stop_index": s.exit_stop_index,
         "rejoin_stop_index": s.rejoin_stop_index,
         "served_stop_ids": list(s.served_stop_ids),
@@ -80,7 +89,10 @@ def _stitch(s: StitchingResult) -> Dict[str, Any]:
         "skipped_reasons": dict(s.skipped_reasons),
         "stitch_ok": s.stitch_ok,
         "stitch_notes": list(s.stitch_notes),
+        "served_before_exit_ids": list(s.served_before_exit_ids),
+        "served_after_rejoin_ids": list(s.served_after_rejoin_ids),
     }
+    return d
 
 
 def _summary_en(selected: RankedCandidate, out: DetourComputeOutput) -> str:
@@ -138,6 +150,11 @@ def build_detour_ai_log_payload(out: DetourComputeOutput) -> Dict[str, Any]:
             "travel_time_s": c.travel_time_s,
             "distance_m": c.distance_m,
             "rejection_reasons": list(c.rejection_reasons)[:20],
+            "tier": c.tier,
+            "confidence_score": c.confidence_score,
+            "warnings": list(c.warnings)[:24],
+            "hard_constraints_passed": list(c.hard_constraints_passed)[:12],
+            "review_required": c.review_required,
         }
         if c.feasibility:
             row["feasibility"] = _feas(c.feasibility)
@@ -153,6 +170,11 @@ def build_detour_ai_log_payload(out: DetourComputeOutput) -> Dict[str, Any]:
             "distance_m": out.selected.distance_m,
             "rejection_reasons": list(out.selected.rejection_reasons)[:20],
             "summary_en": _summary_en(out.selected, out),
+            "tier": out.selected.tier,
+            "confidence_score": out.selected.confidence_score,
+            "warnings": list(out.selected.warnings)[:24],
+            "hard_constraints_passed": list(out.selected.hard_constraints_passed)[:12],
+            "review_required": out.selected.review_required,
         }
         if out.selected.feasibility:
             selected_brief["feasibility"] = _feas(out.selected.feasibility)
@@ -168,6 +190,17 @@ def build_detour_ai_log_payload(out: DetourComputeOutput) -> Dict[str, Any]:
             r2["valhalla_error_detail"] = str(ved)[:500] + "…"
         attempts_trim.append(r2)
 
+    discarded_brief: List[Dict[str, Any]] = []
+    for c in out.discarded or []:
+        discarded_brief.append(
+            {
+                "strategy": c.strategy,
+                "total_score": c.total_score,
+                "rejection_reasons": list(c.rejection_reasons)[:12],
+                "tier": c.tier,
+            }
+        )
+
     return {
         "trip_id": out.trip_id,
         "route_id": out.route_id,
@@ -182,6 +215,7 @@ def build_detour_ai_log_payload(out: DetourComputeOutput) -> Dict[str, Any]:
         "stitching": _stitch(out.stitching) if out.stitching else None,
         "attempts": attempts_trim,
         "candidates_ranked": candidates_brief,
+        "discarded_ranked": discarded_brief[:50],
         "selected": selected_brief,
     }
 
@@ -218,4 +252,6 @@ def detour_compute_output_to_dict(out: DetourComputeOutput) -> Dict[str, Any]:
         d["stitching"] = _stitch(out.stitching)
     if out.debug is not None:
         d["debug"] = dict(out.debug)
+    if out.discarded:
+        d["discarded"] = [_ranked(c) for c in out.discarded[:50]]
     return d

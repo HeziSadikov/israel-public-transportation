@@ -35,6 +35,7 @@ def save_candidates(
     candidates: List[RankedCandidate],
     *,
     selected_strategy: Optional[str] = None,
+    discarded: Optional[List[RankedCandidate]] = None,
 ) -> None:
     from backend.infra import db_access as db
 
@@ -42,6 +43,11 @@ def save_candidates(
     for c in candidates:
         rank += 1
         accepted = c.total_score < float("inf")
+        bd = dict(c.score_breakdown or {})
+        bd["tier"] = c.tier
+        bd["confidence_score"] = c.confidence_score
+        bd["warnings"] = list(c.warnings or [])
+        bd["hard_constraints_passed"] = list(c.hard_constraints_passed or [])
         db.insert_detour_candidate(
             detour_request_id=detour_request_id,
             candidate_rank=rank,
@@ -54,7 +60,28 @@ def save_candidates(
             score=c.total_score,
             accepted=accepted,
             rejection_reasons_json=c.rejection_reasons,
-            score_breakdown_json=c.score_breakdown,
+            score_breakdown_json=bd,
+        )
+    base = 1000
+    for i, c in enumerate(discarded or []):
+        bd = dict(c.score_breakdown or {})
+        bd["tier"] = c.tier
+        bd["discarded"] = True
+        bd["confidence_score"] = c.confidence_score
+        bd["warnings"] = list(c.warnings or [])
+        db.insert_detour_candidate(
+            detour_request_id=detour_request_id,
+            candidate_rank=base + i,
+            strategy=c.strategy,
+            geometry_json=c.decoded.geometry_geojson if c.decoded else None,
+            road_sequence_json=[s.__dict__ for s in (c.decoded.road_segments if c.decoded else [])],
+            turn_sequence_json=[t.__dict__ for t in (c.decoded.turns if c.decoded else [])],
+            travel_time_s=c.travel_time_s,
+            distance_m=c.distance_m,
+            score=c.total_score,
+            accepted=False,
+            rejection_reasons_json=c.rejection_reasons,
+            score_breakdown_json=bd,
         )
 
 

@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 import json
 import os
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 
 @dataclass
@@ -14,6 +14,8 @@ class AnchorPolicy:
     min_anchor_gap_m: float = 50.0
     search_before_window_m: float = 400.0
     search_after_window_m: float = 400.0
+    # Widening search: orchestrator uses each radius for before/after windows (meters).
+    search_radii_m: List[float] = field(default_factory=lambda: [400.0, 800.0, 1500.0, 3000.0, 5000.0])
     anchor_shift_step_m: float = 200.0
     max_anchor_shift_m: float = 1500.0
     # Evaluate several exit/rejoin stop pairs and keep the best-scoring detour.
@@ -129,7 +131,9 @@ class SearchPolicy:
     valhalla_concurrency: int = 4
     # Early-accept: if best total_score <= this value, cancel remaining anchor/corridor combos.
     early_accept_score: float = 200.0
-    # Per-trip soft deadline (ms). Returns best-so-far or no_safe_detour on expiry.
+    # Early-accept when tier is AUTO_OK (stops widening search).
+    early_accept_tier_auto_ok: bool = True
+    # Per-trip soft deadline (ms). Returns best-so-far tiered result on expiry.
     per_trip_deadline_ms: int = 12000
 
 
@@ -193,8 +197,15 @@ def _policy_from_flat_dict(raw: dict[str, Any]) -> DetourPolicyConfig:
         blob = raw.get(name)
         if isinstance(blob, dict):
             for k, v in blob.items():
-                if hasattr(sub, k):
-                    setattr(sub, k, type(getattr(sub, k))(v) if getattr(sub, k) is not None else v)
+                if not hasattr(sub, k):
+                    continue
+                cur = getattr(sub, k)
+                if k == "search_radii_m" and isinstance(v, list):
+                    setattr(sub, k, [float(x) for x in v])
+                elif cur is not None and type(cur) is not type(v) and not isinstance(v, (list, dict)):
+                    setattr(sub, k, type(cur)(v))
+                else:
+                    setattr(sub, k, v)
     return cfg
 
 

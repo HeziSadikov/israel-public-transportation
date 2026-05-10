@@ -1,6 +1,6 @@
 import React, { useState } from "react";
-import { postDetourComputeV2, postIncident } from "./api/detourV2";
-import type { DetourV2ComputeResult, DetourV2Attempt } from "./api/detourV2";
+import { postDetourApproveV2, postDetourComputeV2, postIncident } from "./api/detourV2";
+import type { DetourV2ComputeCandidate, DetourV2ComputeResult, DetourV2Attempt } from "./api/detourV2";
 import type { RouteInfo } from "./ExplorerWindow";
 import { SidebarInfo } from "./SidebarInfo";
 
@@ -50,6 +50,24 @@ const thStyle: React.CSSProperties = {
 };
 const tdStyle: React.CSSProperties = { padding: "2px 4px" };
 
+function tierLabelHe(tier: string | null | undefined): string {
+  const t = (tier || "").toUpperCase();
+  if (t === "AUTO_OK") return "מסלול עוקף אושר אוטומטית";
+  if (t === "REVIEW_RECOMMENDED") return "נמצא מסלול עוקף, נדרשת בדיקה תפעולית";
+  if (t === "LOW_CONFIDENCE") return "מסלול עוקף ברמת ודאות נמוכה";
+  if (t === "EMERGENCY_FALLBACK") return "מסלול חירום מוצע, יש לוודא התאמה לאוטובוסים";
+  return tier || "—";
+}
+
+function tierBadgeColor(tier: string | null | undefined): string {
+  const t = (tier || "").toUpperCase();
+  if (t === "AUTO_OK") return "#15803d";
+  if (t === "REVIEW_RECOMMENDED") return "#1d4ed8";
+  if (t === "LOW_CONFIDENCE") return "#b45309";
+  if (t === "EMERGENCY_FALLBACK") return "#b91c1c";
+  return "#64748b";
+}
+
 /**
  * Detour v2: create incident preview (affected routes + OSM edge bans) and compute road-level detours
  * for the selected route (representative trip) or an optional explicit trip id override.
@@ -63,6 +81,8 @@ export function IncidentDetourV2Panel(props: Props) {
   const [showDiag, setShowDiag] = useState(false);
   const [debugDetour, setDebugDetour] = useState(false);
   const [useMatchedPhysical, setUseMatchedPhysical] = useState(false);
+  const [lastDetourRequestId, setLastDetourRequestId] = useState<number | null>(null);
+  const [approveBusyRank, setApproveBusyRank] = useState<number | null>(null);
 
   const hasRouteOrTrip =
     !!props.selectedRoute?.route_id || tripId.trim().length > 0;
@@ -131,6 +151,8 @@ export function IncidentDetourV2Panel(props: Props) {
       const first = (r.results?.[0] ?? null) as DetourV2ComputeResult | null;
       props.onV2Computed?.(first);
       setLastResult(first);
+      const rid = r.detour_request_ids?.[0];
+      setLastDetourRequestId(typeof rid === "number" && Number.isFinite(rid) ? rid : null);
       const routeEcho =
         first?.route_id != null ? ` route_id=${first.route_id}.` : "";
       const statusNote = first?.selected?.summary_en
@@ -150,6 +172,26 @@ export function IncidentDetourV2Panel(props: Props) {
   const skipped = lastResult?.stitching?.skipped_stop_ids ?? [];
   const served = lastResult?.stitching?.served_stop_ids ?? [];
   const breakdown = lastResult?.selected?.score_breakdown;
+  const topCandidates: DetourV2ComputeCandidate[] =
+    (lastResult?.candidates?.length ? lastResult.candidates : lastResult?.selected ? [lastResult.selected] : []) ??
+    [];
+
+  const handleApprove = async (candidateRank: number) => {
+    if (!lastDetourRequestId) {
+      setMessage("No detour_request_id (persist may be off or save failed).");
+      return;
+    }
+    setApproveBusyRank(candidateRank);
+    setMessage(null);
+    try {
+      await postDetourApproveV2(lastDetourRequestId, { candidate_rank: candidateRank, approved_by: "ui" });
+      setMessage(`Approved candidate_rank=${candidateRank} for request ${lastDetourRequestId}.`);
+    } catch (e: unknown) {
+      setMessage(e instanceof Error ? e.message : String(e));
+    } finally {
+      setApproveBusyRank(null);
+    }
+  };
 
   return (
     <section className="rail-section time-window-section">
@@ -201,6 +243,69 @@ export function IncidentDetourV2Panel(props: Props) {
       </div>
       {message && <div className="rail-status">{message}</div>}
 
+      {lastResult && topCandidates.length > 0 && (
+        <div style={{ marginTop: 8, fontSize: 11 }}>
+          <div style={{ fontWeight: 700, marginBottom: 4 }}>מועמדים (עד 3)</div>
+          <table style={{ width: "100%", borderCollapse: "collapse", border: "1px solid var(--color-border, #ccc)" }}>
+            <thead>
+              <tr style={{ background: "var(--color-bg-alt, #f5f5f5)" }}>
+                <th style={thStyle}>#</th>
+                <th style={thStyle}>רמת אמון</th>
+                <th style={thStyle}>ציון</th>
+                <th style={thStyle}>דילוגים</th>
+                <th style={thStyle}>אזהרות</th>
+                <th style={thStyle} />
+              </tr>
+            </thead>
+            <tbody>
+              {topCandidates.map((c, i) => {
+                const rank = typeof c.candidate_rank === "number" ? c.candidate_rank : i + 1;
+                const skippedN = c.score_breakdown?.skipped_stops ?? null;
+                const warnN = (c.warnings || c.feasibility?.warnings || []).length;
+                const tier = (c.tier as string) || "";
+                return (
+                  <tr key={`${c.strategy}-${rank}`} style={{ borderBottom: "1px solid var(--color-border, #ddd)" }}>
+                    <td style={tdStyle}>{rank}</td>
+                    <td style={tdStyle}>
+                      <span
+                        style={{
+                          display: "inline-block",
+                          padding: "1px 6px",
+                          borderRadius: 4,
+                          color: "#fff",
+                          background: tierBadgeColor(tier),
+                          fontSize: 10,
+                          fontWeight: 600,
+                        }}
+                      >
+                        {tierLabelHe(tier)}
+                      </span>
+                    </td>
+                    <td style={tdStyle}>
+                      {typeof c.total_score === "number" && Number.isFinite(c.total_score)
+                        ? c.total_score.toFixed(0)
+                        : "—"}
+                    </td>
+                    <td style={tdStyle}>{skippedN != null ? String(skippedN) : "—"}</td>
+                    <td style={tdStyle}>{warnN}</td>
+                    <td style={tdStyle}>
+                      <button
+                        type="button"
+                        disabled={approveBusyRank !== null || !lastDetourRequestId}
+                        style={{ fontSize: 10, padding: "2px 6px" }}
+                        onClick={() => handleApprove(rank)}
+                      >
+                        {approveBusyRank === rank ? "…" : "אשר"}
+                      </button>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+
       {lastResult && (
         <div style={{ marginTop: 6 }}>
           <button
@@ -218,7 +323,7 @@ export function IncidentDetourV2Panel(props: Props) {
               </div>
               {lastResult.selected?.summary_en && (
                 <div style={{ marginBottom: 4, color: "var(--color-success, #2a8a2a)" }}>
-                  <strong>Winner:</strong> {lastResult.selected.summary_en}
+                  <strong>נבחר:</strong> {lastResult.selected.summary_en}
                 </div>
               )}
               {breakdown && (

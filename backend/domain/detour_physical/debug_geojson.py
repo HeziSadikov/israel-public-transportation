@@ -6,8 +6,22 @@ from typing import Any, Dict, List, Optional, Tuple
 
 
 def coords_from_geojson_linestring(geometry_geojson: Optional[Dict[str, Any]]) -> Optional[List[Tuple[float, float]]]:
-    """Extract (lon, lat) pairs from a GeoJSON Feature or LineString dict."""
+    """Extract (lon, lat) pairs from a GeoJSON Feature, LineString, or first LineString in a FeatureCollection."""
     if not geometry_geojson:
+        return None
+    if geometry_geojson.get("type") == "FeatureCollection":
+        for feat in geometry_geojson.get("features") or []:
+            if not isinstance(feat, dict):
+                continue
+            g = feat.get("geometry") if feat.get("type") == "Feature" else feat
+            if isinstance(g, dict) and g.get("type") == "LineString":
+                coords = g.get("coordinates") or []
+                out: List[Tuple[float, float]] = []
+                for c in coords:
+                    if len(c) >= 2:
+                        out.append((float(c[0]), float(c[1])))
+                if len(out) >= 2:
+                    return out
         return None
     g = geometry_geojson.get("geometry") if geometry_geojson.get("type") == "Feature" else geometry_geojson
     if not isinstance(g, dict) or g.get("type") != "LineString":

@@ -1,0 +1,18 @@
+{
+  "id": "parallel_polygon_near_not_on_route",
+  "description": "Narrow blockage parallel to but offset from the polyline — should not intersect; no_impact.",
+  "trip_id": "test_trip_parallel",
+  "service_date": "20260419",
+  "route_coords_lonlat": [
+    [34.7, 31.2], [34.705, 31.2], [34.71, 31.2], [34.715, 31.2], [34.72, 31.2]
+  ],
+  "blockage_geojson": {
+    "type": "Polygon",
+    "coordinates": [[[34.7, 31.21], [34.72, 31.21], [34.72, 31.212], [34.7, 31.212], [34.7, 31.21]]]
+  },
+  "stop_shape_dist_step_m": 400,
+  "mock_valhalla": "none",
+  "expect": {
+    "status": "no_impact"
+  }
+}

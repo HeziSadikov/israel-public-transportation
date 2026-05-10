@@ -22,7 +22,15 @@ export type DetourV2Feasibility = {
   hard_reject_reasons?: string[];
   notes?: string[];
   sharp_turn_count?: number;
+  confidence_score?: number | null;
+  warnings?: string[];
 };
+
+export type DetourTier =
+  | "AUTO_OK"
+  | "REVIEW_RECOMMENDED"
+  | "LOW_CONFIDENCE"
+  | "EMERGENCY_FALLBACK";
 
 export type DetourV2ComputeCandidate = {
   strategy?: string;
@@ -34,6 +42,12 @@ export type DetourV2ComputeCandidate = {
   feasibility?: DetourV2Feasibility | null;
   geometry_geojson?: GeoJSON.FeatureCollection | GeoJSON.Feature | null;
   summary_en?: string | null;
+  tier?: DetourTier | string | null;
+  confidence_score?: number | null;
+  warnings?: string[];
+  hard_constraints_passed?: string[];
+  candidate_rank?: number | null;
+  review_required?: boolean | null;
 };
 
 export type DetourV2Attempt = {
@@ -66,11 +80,13 @@ export type DetourV2ComputeResult = {
   corridor_stage?: string | null;
   selected?: DetourV2ComputeCandidate | null;
   candidates?: DetourV2ComputeCandidate[] | null;
+  discarded?: DetourV2ComputeCandidate[] | null;
   attempts?: DetourV2Attempt[] | null;
   stitching?: {
     skipped_stop_ids?: string[];
     served_stop_ids?: string[];
     stitch_ok?: boolean;
+    stitch_notes?: string[];
   } | null;
   /** Present when debug_detour=true: layers for QGIS / inspection */
   debug?: { geojson?: GeoJSON.FeatureCollection; candidate_generation?: unknown } | null;
@@ -113,5 +129,13 @@ export async function postIncident(body: {
 
 export async function getDetourPolicy(): Promise<Record<string, unknown>> {
   const res = await axios.get(`${API_BASE}/detours/policy`);
+  return res.data;
+}
+
+export async function postDetourApproveV2(
+  detourRequestId: number,
+  body?: { approved_by?: string | null; candidate_rank?: number | null }
+): Promise<{ approved_detour_id: number }> {
+  const res = await axios.post(`${API_BASE}/detours/${detourRequestId}/approve`, body ?? {});
   return res.data;
 }

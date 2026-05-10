@@ -485,6 +485,8 @@ export type MapLibreMapProps = {
     exitStopId?: string | null;
     rejoinStopId?: string | null;
     skippedStopIds?: string[];
+    /** Stops marked served_via_detour_proximity in stitching notes. */
+    proximityStopIds?: string[];
   } | null;
   /** Optional debug lines from detour v2 `debug.geojson` (merged into same overlay source). */
   detourV2DebugGeojson?: GeoJSON.FeatureCollection | null;
@@ -899,8 +901,20 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
           filter: ["==", ["get", "role"], "skipped"],
           paint: {
             "circle-radius": 7,
-            "circle-color": "#9ca3af",
-            "circle-stroke-color": "#6b7280",
+            "circle-color": "#ef4444",
+            "circle-stroke-color": "#991b1b",
+            "circle-stroke-width": 1.5,
+          },
+        });
+        map.addLayer({
+          id: "detour-v2-proximity-stops",
+          type: "circle",
+          source: SOURCE_V2_OVERLAY,
+          filter: ["==", ["get", "role"], "proximity_rescue"],
+          paint: {
+            "circle-radius": 8,
+            "circle-color": "#facc15",
+            "circle-stroke-color": "#a16207",
             "circle-stroke-width": 1.5,
           },
         });
@@ -910,9 +924,9 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
           source: SOURCE_V2_OVERLAY,
           filter: ["==", ["get", "role"], "exit"],
           paint: {
-            "circle-radius": 9,
-            "circle-color": "#f59e0b",
-            "circle-stroke-color": "#92400e",
+            "circle-radius": 10,
+            "circle-color": "#fbbf24",
+            "circle-stroke-color": "#b45309",
             "circle-stroke-width": 2,
           },
         });
@@ -922,9 +936,9 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
           source: SOURCE_V2_OVERLAY,
           filter: ["==", ["get", "role"], "rejoin"],
           paint: {
-            "circle-radius": 9,
+            "circle-radius": 10,
             "circle-color": "#3b82f6",
-            "circle-stroke-color": "#1e40af",
+            "circle-stroke-color": "#1e3a8a",
             "circle-stroke-width": 2,
           },
         });
@@ -1526,13 +1540,18 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
     source.setData(data as any);
   }, [mapReady, routeGeojson]);
 
-  // Detour source data
+  // Detour source data (always distinct from base route blue #2563eb).
   useEffect(() => {
     const map = mapRef.current;
     if (!map || !mapReady) return;
     const source = map.getSource(SOURCE_DETOUR) as maplibregl.GeoJSONSource | undefined;
     if (!source) return;
     source.setData(normalizeToFeatureCollection(detour?.path_geojson ?? null) as any);
+    const isV2 = (detour as { diagnostics?: { source?: string } } | null)?.diagnostics?.source === "detour_v2";
+    if (map.getLayer("detour-line")) {
+      map.setPaintProperty("detour-line", "line-color", "#16a34a");
+      map.setPaintProperty("detour-line", "line-width", isV2 ? 5 : 6);
+    }
   }, [mapReady, detour]);
 
   // E4: Update v2 overlay (anchor pins + skipped stops + optional debug lines).
@@ -1565,12 +1584,19 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
       }
       // Skipped stops: find their lon/lat from the route stops list.
       const skippedSet = new Set(ov.skippedStopIds ?? []);
+      const proxSet = new Set(ov.proximityStopIds ?? []);
       for (const stop of stops) {
         if (skippedSet.has(stop.stop_id)) {
           features.push({
             type: "Feature",
             geometry: { type: "Point", coordinates: [stop.lon, stop.lat] },
             properties: { role: "skipped", stop_id: stop.stop_id, name: stop.name },
+          });
+        } else if (proxSet.has(stop.stop_id)) {
+          features.push({
+            type: "Feature",
+            geometry: { type: "Point", coordinates: [stop.lon, stop.lat] },
+            properties: { role: "proximity_rescue", stop_id: stop.stop_id, name: stop.name },
           });
         }
       }

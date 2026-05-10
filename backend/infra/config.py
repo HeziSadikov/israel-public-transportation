@@ -156,4 +156,8 @@ GOVMAP_TILE_UPSTREAM_TEMPLATE = os.getenv("GOVMAP_TILE_UPSTREAM_TEMPLATE", "").s
 
 # Detour v2 API and pipeline (road-graph-first).
 DETOUR_V2_ENABLED = parse_bool_env("DETOUR_V2_ENABLED", True)
+# Engine for legacy area-detour flows: "v2" tags diagnostics and prefers OSM/Valhalla hybrid when available;
+# "v1" keeps previous hybrid gating (use_osm_detour flag only). Per-trip bus detours use POST /api/v1/detours/compute.
+_DETOUR_ENGINE_RAW = (os.getenv("DETOUR_ENGINE", "v2") or "v2").strip().lower()
+DETOUR_ENGINE: str = _DETOUR_ENGINE_RAW if _DETOUR_ENGINE_RAW in ("v1", "v2") else "v2"
 

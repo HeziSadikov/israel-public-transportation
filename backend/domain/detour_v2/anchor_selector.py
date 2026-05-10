@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple
 
-from shapely.geometry import LineString, Point
+from shapely.geometry import LineString, Point, shape as shp_shape
 
 from backend.infra.config import ANCHOR_STOP_MAX_PROJECTION_M
 
@@ -127,6 +127,9 @@ def enumerate_anchor_candidates(
     stop_lonlat: Dict[str, Tuple[float, float]],
     policy: DetourPolicyConfig,
     max_pairs: Optional[int] = None,
+    search_before_window_m: Optional[float] = None,
+    search_after_window_m: Optional[float] = None,
+    blockage_geojson: Optional[Dict[str, Any]] = None,
 ) -> List[AnchorPair]:
     """Generate bounded exit/rejoin candidates ordered by service-preserving heuristics."""
     ap = policy.anchor
@@ -137,10 +140,22 @@ def enumerate_anchor_candidates(
     bs, be = blocked.blocked_start_m, blocked.blocked_end_m
     gap = ap.min_anchor_gap_m
 
-    exit_lo = max(0.0, bs - ap.search_before_window_m)
+    before_w = float(search_before_window_m if search_before_window_m is not None else ap.search_before_window_m)
+    after_w = float(search_after_window_m if search_after_window_m is not None else ap.search_after_window_m)
+
+    exit_lo = max(0.0, bs - before_w)
     exit_hi = max(0.0, bs - gap)
     rejoin_lo = min(total_m, be + gap)
-    rejoin_hi = min(total_m, be + ap.search_after_window_m)
+    rejoin_hi = min(total_m, be + after_w)
+
+    poly = None
+    if blockage_geojson:
+        try:
+            poly = shp_shape(blockage_geojson)
+            if poly.is_empty:
+                poly = None
+        except Exception:
+            poly = None
 
     max_side = max(1, int(ap.candidate_stops_per_side))
     k = max(1, int(max_pairs if max_pairs is not None else ap.candidate_pairs_k))
@@ -181,6 +196,14 @@ def enumerate_anchor_candidates(
                 rejoin_shape_dist_m=r_d,
                 anchor_quality_note=note,
             )
+            if poly is not None:
+                try:
+                    if poly.contains(Point(cand.exit_lon, cand.exit_lat)) or poly.contains(
+                        Point(cand.rejoin_lon, cand.rejoin_lat)
+                    ):
+                        continue
+                except Exception:
+                    pass
             scored.append(((interp_pen, float(skipped_est), shoulder_m, span_m), cand))
 
     if not scored:

@@ -4754,6 +4754,157 @@ def insert_approved_detour(
             conn.close()
 
 
+def osm_segment_nodes_intersecting_polygon(polygon_geojson: Dict[str, Any], conn=None) -> List[int]:
+    """Collect from_node_id / to_node_id from osm_road_segments intersecting the polygon (for turn bans)."""
+    close = False
+    if conn is None:
+        conn = _get_conn()
+        close = True
+    try:
+        gj = json.dumps(polygon_geojson)
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT DISTINCT n FROM (
+                    SELECT from_node_id AS n
+                    FROM osm_road_segments
+                    WHERE ST_Intersects(
+                        geom::geometry,
+                        ST_SetSRID(ST_GeomFromGeoJSON(%s), 4326)::geometry
+                    )
+                    UNION
+                    SELECT to_node_id AS n
+                    FROM osm_road_segments
+                    WHERE ST_Intersects(
+                        geom::geometry,
+                        ST_SetSRID(ST_GeomFromGeoJSON(%s), 4326)::geometry
+                    )
+                ) q
+                WHERE n IS NOT NULL
+                """,
+                (gj, gj),
+            )
+            return [int(r["n"]) for r in cur.fetchall()]
+    except Exception:
+        return []
+    finally:
+        if close:
+            conn.close()
+
+
+def get_bus_edge_evidence_bulk(
+    osm_way_ids: List[int],
+    conn=None,
+) -> Dict[int, Dict[str, Any]]:
+    """Return bus_edge_evidence rows keyed by osm_way_id (best row per way if multiple directions)."""
+    if not osm_way_ids:
+        return {}
+    close = False
+    if conn is None:
+        conn = _get_conn()
+        close = True
+    try:
+        out: Dict[int, Dict[str, Any]] = {}
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT osm_way_id, direction, approved_detour_count, successful_trace_count,
+                       manual_reject_count, confidence_score, last_seen_at
+                FROM bus_edge_evidence
+                WHERE osm_way_id = ANY(%s)
+                """,
+                (osm_way_ids,),
+            )
+            for row in cur.fetchall():
+                wid = int(row["osm_way_id"])
+                appr = int(row["approved_detour_count"] or 0)
+                prev = out.get(wid)
+                if prev is None or appr > int(prev.get("approved_detour_count") or 0):
+                    out[wid] = {
+                        "osm_way_id": wid,
+                        "direction": row.get("direction"),
+                        "approved_detour_count": appr,
+                        "successful_trace_count": int(row["successful_trace_count"] or 0),
+                        "manual_reject_count": int(row["manual_reject_count"] or 0),
+                        "confidence_score": float(row["confidence_score"] or 0.0),
+                    }
+        return out
+    except Exception:
+        return {}
+    finally:
+        if close:
+            conn.close()
+
+
+def get_bus_turn_evidence_bulk(
+    triplets: List[tuple[int, int, int]],
+    conn=None,
+) -> Dict[tuple[int, int, int], Dict[str, Any]]:
+    """Keyed by (from_way_id, via_node_id, to_way_id)."""
+    if not triplets:
+        return {}
+    close = False
+    if conn is None:
+        conn = _get_conn()
+        close = True
+    try:
+        out: Dict[tuple[int, int, int], Dict[str, Any]] = {}
+        with conn.cursor() as cur:
+            # Chunk to avoid huge queries
+            chunk_size = 50
+            for i in range(0, len(triplets), chunk_size):
+                chunk = triplets[i : i + chunk_size]
+                parts = []
+                flat: List[Any] = []
+                for j, (fw, vn, tw) in enumerate(chunk):
+                    parts.append(f"(%s::bigint, %s::bigint, %s::bigint)")
+                    flat.extend([fw, vn, tw])
+                sql = f"""
+                    SELECT t.from_way_id, t.via_node_id, t.to_way_id, t.approved_detour_count, t.confidence_score
+                    FROM bus_turn_evidence t
+                    JOIN (VALUES {", ".join(parts)}) AS v(fw, vn, tw)
+                      ON t.from_way_id = v.fw AND t.via_node_id = v.vn AND t.to_way_id = v.tw
+                """
+                cur.execute(sql, flat)
+                for row in cur.fetchall():
+                    key = (int(row["from_way_id"]), int(row["via_node_id"]), int(row["to_way_id"]))
+                    out[key] = {
+                        "approved_detour_count": int(row["approved_detour_count"] or 0),
+                        "confidence_score": float(row["confidence_score"] or 0.0),
+                    }
+        return out
+    except Exception:
+        return {}
+    finally:
+        if close:
+            conn.close()
+
+
+def bump_bus_turn_evidence(from_way_id: int, via_node_id: int, to_way_id: int, conn=None) -> None:
+    close = False
+    if conn is None:
+        conn = _get_conn()
+        close = True
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO bus_turn_evidence (from_way_id, via_node_id, to_way_id, approved_detour_count, last_seen_at)
+                VALUES (%s, %s, %s, 1, NOW())
+                ON CONFLICT (from_way_id, via_node_id, to_way_id) DO UPDATE SET
+                    approved_detour_count = bus_turn_evidence.approved_detour_count + 1,
+                    last_seen_at = NOW()
+                """,
+                (from_way_id, via_node_id, to_way_id),
+            )
+            conn.commit()
+    except Exception:
+        pass
+    finally:
+        if close:
+            conn.close()
+
+
 def bump_bus_edge_evidence(osm_way_id: int, direction: Optional[str], conn=None) -> None:
     close = False
     if conn is None:

@@ -9,7 +9,7 @@ import time
 import traceback
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, cast
 
 from shapely.geometry import LineString, shape
 
@@ -22,7 +22,7 @@ from backend.infra.config import (
     VALIDATE_DETOUR_CARRIAGEWAY,
 )
 from backend.infra.logging_utils import log
-from backend.adapters.osm_detour import route_waypoints_avoiding_polygon, valhalla_locate
+from backend.adapters.osm_detour import route_avoiding_polygon, route_waypoints_avoiding_polygon, valhalla_locate
 
 from backend.domain.detour_physical.debug_geojson import (
     build_detour_debug_feature_collection,
@@ -39,7 +39,8 @@ from .candidate_decoder import decode_valhalla_candidate
 from .corridor_builder import affected_shape_subline, incident_exclusion_polygon_for_stage, corridor_stages_order
 from .detour_ranker import rank_candidates
 from .incident_projector import edge_ban_way_ids, project_incident_polygon
-from .models import AnchorPair, DetourComputeOutput, RankedCandidate
+from .models import AnchorPair, DetourComputeOutput, DetourComputeStatus, FeasibilityResult, RankedCandidate
+from .tier_classifier import classify_tier
 from .policy import DetourPolicyConfig, get_default_policy
 from .road_candidate_generator import generate_candidates_with_debug
 from .service_stitching import compute_stitching
@@ -373,6 +374,163 @@ def _try_via_stop_route(
     )
 
 
+def _gtfs_evidence_distance_fraction(decoded: Any, gtfs_ev: Dict[int, Dict[str, Any]]) -> float:
+    total = sum(s.length_m for s in decoded.road_segments) or 1.0
+    ok_m = 0.0
+    for s in decoded.road_segments:
+        if s.synthetic:
+            continue
+        w = int(s.osm_way_id or 0)
+        if w and w in gtfs_ev and float((gtfs_ev[w] or {}).get("confidence_score") or 0.0) > 0.05:
+            ok_m += s.length_m
+    return ok_m / total
+
+
+def _tier_status(tier: str) -> str:
+    return str(tier or "REVIEW_RECOMMENDED").lower()
+
+
+def _build_emergency_fallback(
+    *,
+    anchors: AnchorPair,
+    blockage_geojson: Dict[str, Any],
+    projection: Any,
+    pol: DetourPolicyConfig,
+    feed_id: int,
+    anchor_shape_line: LineString,
+    total_m: float,
+    stop_rows: List[Dict[str, Any]],
+    stop_lonlat: Dict[str, Tuple[float, float]],
+) -> RankedCandidate:
+    """Last-resort path: Valhalla auto costing, else straight-line synthetic geometry."""
+    stitch_pre = compute_stitching(
+        line=anchor_shape_line,
+        total_m=total_m,
+        stop_rows=stop_rows,
+        stop_lonlat=stop_lonlat,
+        exit_dist_m=anchors.exit_shape_dist_m,
+        rejoin_dist_m=anchors.rejoin_shape_dist_m,
+        policy=pol,
+        detour_line=None,
+    )
+    baseline_d = max(0.0, anchors.rejoin_shape_dist_m - anchors.exit_shape_dist_m)
+    baseline_t = baseline_d / max(5.0, 8.0)
+    r = route_avoiding_polygon(
+        anchors.exit_lon,
+        anchors.exit_lat,
+        anchors.rejoin_lon,
+        anchors.rejoin_lat,
+        blockage_geojson,
+        costing="auto",
+        timeout_s=25.0,
+        exit_heading_deg=anchors.exit_forward_bearing_deg,
+        rejoin_heading_deg=anchors.rejoin_forward_bearing_deg,
+    )
+    if r.success and len(r.coordinates) >= 2:
+        coords = list(r.coordinates)
+        t_s = float(r.time_s)
+        d_m = float(r.distance_m)
+        decoded = decode_valhalla_candidate(coords, t_s, match_osm_segments=True, feed_id=feed_id)
+        turn_bt = r.turn_by_turn
+    else:
+        coords = [(anchors.exit_lon, anchors.exit_lat), (anchors.rejoin_lon, anchors.rejoin_lat)]
+        from shapely.geometry import LineString as _LS
+
+        d_m = float(_LS(coords).length * 111_320.0)
+        t_s = max(30.0, d_m / 8.0)
+        decoded = decode_valhalla_candidate(coords, t_s, match_osm_segments=False, feed_id=feed_id)
+        turn_bt = None
+    try:
+        detour_line = LineString(coords)
+    except Exception:
+        detour_line = LineString([(anchors.exit_lon, anchors.exit_lat), (anchors.rejoin_lon, anchors.rejoin_lat)])
+    stitch_full = compute_stitching(
+        line=anchor_shape_line,
+        total_m=total_m,
+        stop_rows=stop_rows,
+        stop_lonlat=stop_lonlat,
+        exit_dist_m=anchors.exit_shape_dist_m,
+        rejoin_dist_m=anchors.rejoin_shape_dist_m,
+        policy=pol,
+        detour_line=detour_line,
+    )
+    way_ids = sorted({int(s.osm_way_id) for s in decoded.road_segments if int(s.osm_way_id or 0) > 0})
+    gtfs_ev = db.get_gtfs_bus_way_evidence_bulk(feed_id, way_ids) if way_ids else {}
+    bus_ev = db.get_bus_edge_evidence_bulk(way_ids) if way_ids else {}
+    olap = _line_fraction_inside_blockage(coords, blockage_geojson)
+    cap = float(pol.service.max_incident_overlap_fraction)
+    path_bad = olap > cap + _INCIDENT_OVERLAP_FRAC_EPS
+    feas = evaluate_candidate(
+        decoded=decoded,
+        projection=projection,
+        policy=pol,
+        baseline_blocked_distance_m=baseline_d,
+        baseline_blocked_time_s=baseline_t,
+        detour_distance_m=d_m,
+        detour_time_s=t_s,
+        banned_way_ids=edge_ban_way_ids(projection),
+        gtfs_way_evidence=gtfs_ev,
+        bus_edge_evidence=bus_ev,
+        turn_by_turn=turn_bt,
+        bearing_delta_exit_deg=None,
+        bearing_delta_rejoin_deg=None,
+        path_intersects_blockage=path_bad,
+        stitch_ok=stitch_pre.stitch_ok,
+        invalid_geometry=len(coords) < 2,
+        carriageway_reasons=None,
+    )
+    if not feas.accepted:
+        feas = FeasibilityResult(
+            accepted=True,
+            hard_reject_reasons=[],
+            segment_penalty_s=feas.segment_penalty_s + 800.0,
+            turn_penalty_s=feas.turn_penalty_s,
+            uncertainty_penalty_s=feas.uncertainty_penalty_s + 400.0,
+            service_penalty_s=feas.service_penalty_s,
+            evidence_bonus_s=feas.evidence_bonus_s,
+            notes=list(feas.notes) + ["emergency_force_accept_geometry"],
+            sharp_turn_count=feas.sharp_turn_count,
+            confidence_score=max(0.08, feas.confidence_score * 0.5),
+            warnings=list(feas.warnings) + ["emergency_fallback_unverified"],
+        )
+    total = (
+        t_s
+        + feas.segment_penalty_s
+        + feas.turn_penalty_s
+        + feas.uncertainty_penalty_s
+        + feas.service_penalty_s
+        + feas.evidence_bonus_s
+    )
+    passed = ["emergency_geometry"]
+    if stitch_pre.stitch_ok:
+        passed.append("rejoins_downstream")
+    if not path_bad:
+        passed.append("avoids_blockage")
+    return RankedCandidate(
+        strategy="emergency_fallback",
+        total_score=total,
+        travel_time_s=t_s,
+        distance_m=d_m,
+        decoded=decoded,
+        feasibility=feas,
+        rejection_reasons=[],
+        score_breakdown={
+            "travel_time_s": t_s,
+            "corridor": "emergency",
+            "anchor_index": -1.0,
+            "skipped_stops": float(len(stitch_full.skipped_stop_ids)),
+            "exit_shape_dist_m": float(anchors.exit_shape_dist_m),
+            "rejoin_shape_dist_m": float(anchors.rejoin_shape_dist_m),
+            "total_score": total,
+        },
+        tier="EMERGENCY_FALLBACK",
+        confidence_score=0.12,
+        warnings=["emergency_fallback_unverified_for_buses"],
+        hard_constraints_passed=passed,
+        review_required=True,
+    )
+
+
 def compute_detour_for_trip(
     *,
     trip_id: str,
@@ -457,15 +615,46 @@ def compute_detour_for_trip(
         stop_lonlat = db.get_stop_lonlat_bulk(sids)
         _log_stage(trip_id, stage, stop_count=len(stop_rows))
 
-        stage = "anchor_selection"
-        anchor_candidates = enumerate_anchor_candidates(
-            line=anchor_shape_line,
-            blocked=impact.blocked,
-            stop_rows=stop_rows,
-            stop_lonlat=stop_lonlat,
-            policy=pol,
-            max_pairs=pol.anchor.candidate_pairs_k,
+        total_m = float(impact.blocked.shape_length_m or 0.0) if impact.blocked else 0.0
+        if total_m <= 0:
+            from .trip_impact_analyzer import _line_length_m
+
+            total_m = _line_length_m(anchor_shape_line)
+
+        feed_id = db.get_active_feed_id()
+        stage = "incident_projection"
+        projection = project_incident_polygon(
+            blockage_geojson=blockage_geojson,
+            feed_id=feed_id,
+            db_osm_available=True,
+            narrow_buffer_m=float(pol.corridor.narrow_buffer_m),
         )
+        banned = edge_ban_way_ids(projection)
+        _log_stage(trip_id, stage, edge_bans=len(banned), feed_id=feed_id)
+
+        stage = "anchor_selection"
+        radii = list(getattr(pol.anchor, "search_radii_m", None) or [400.0, 800.0, 1500.0, 3000.0, 5000.0])
+        anchor_seen: set[Tuple[int, int]] = set()
+        anchor_candidates: List[AnchorPair] = []
+        for rad in radii:
+            batch = enumerate_anchor_candidates(
+                line=anchor_shape_line,
+                blocked=impact.blocked,
+                stop_rows=stop_rows,
+                stop_lonlat=stop_lonlat,
+                policy=pol,
+                max_pairs=pol.anchor.candidate_pairs_k,
+                search_before_window_m=float(rad),
+                search_after_window_m=float(rad),
+                blockage_geojson=blockage_geojson,
+            )
+            for anc in batch:
+                key = (int(round(anc.exit_shape_dist_m)), int(round(anc.rejoin_shape_dist_m)))
+                if key in anchor_seen:
+                    continue
+                anchor_seen.add(key)
+                anc.search_radius_m = float(rad)
+                anchor_candidates.append(anc)
         if (
             LEGAL_ANCHOR_INDEX_ENABLED
             and physical_path_used
@@ -494,17 +683,21 @@ def compute_detour_for_trip(
                             policy=pol,
                         )
                         if legal_pair is not None:
+                            legal_pair.search_radius_m = float(radii[0]) if radii else 400.0
                             anchor_candidates.insert(0, legal_pair)
             except Exception:
                 pass
-        # A3: validate anchor reachability via /locate (drops unreachable anchor pairs).
         anchor_candidates = _validate_anchors_via_locate(anchor_candidates, pol)
-
-        total_m = float(impact.blocked.shape_length_m or 0.0) if impact.blocked else 0.0
-        if total_m <= 0:
-            from .trip_impact_analyzer import _line_length_m
-
-            total_m = _line_length_m(anchor_shape_line)
+        if not anchor_candidates:
+            anchor_candidates = enumerate_anchor_candidates(
+                line=anchor_shape_line,
+                blocked=impact.blocked,
+                stop_rows=stop_rows,
+                stop_lonlat=stop_lonlat,
+                policy=pol,
+                max_pairs=1,
+                blockage_geojson=blockage_geojson,
+            )
         for ap in anchor_candidates:
             exb = _line_forward_bearing(anchor_shape_line, ap.exit_shape_dist_m, total_m)
             rjb = _line_forward_bearing(anchor_shape_line, ap.rejoin_shape_dist_m, total_m)
@@ -524,19 +717,11 @@ def compute_detour_for_trip(
             rejoin_stop_id=anchors.rejoin_stop_id,
         )
 
-        stage = "incident_projection"
-        feed_id = db.get_active_feed_id()
-        projection = project_incident_polygon(
-            blockage_geojson=blockage_geojson,
-            feed_id=feed_id,
-            db_osm_available=True,
-        )
-        banned = edge_ban_way_ids(projection)
-        _log_stage(trip_id, stage, edge_bans=len(banned), feed_id=feed_id)
-
         corridor_debug: list[Dict[str, Any]] = []
-        best: Optional[tuple[float, str, Any, Any, Any]] = None
-        best_row: Optional[Dict[str, Any]] = None
+        all_rank_inputs: List[
+            Tuple[str, float, float, Any, Dict[str, Any], Any]
+        ] = []
+        all_metas: List[Dict[str, Any]] = []
         best_gtfs_ev: Dict[int, Dict[str, Any]] = {}
 
         val_blocked_seg: set[int] = set()
@@ -552,8 +737,8 @@ def compute_detour_for_trip(
 
         concurrency = int(getattr(pol.search, "valhalla_concurrency", 4))
         early_score = float(getattr(pol.search, "early_accept_score", 200.0))
+        early_tier_ok = bool(getattr(pol.search, "early_accept_tier_auto_ok", True))
 
-        # Build all (anchor_idx, corridor_stage) work items.
         work_items: List[Tuple[int, AnchorPair, str, Dict[str, Any]]] = []
         for anchor_idx, anc in enumerate(anchor_candidates):
             for corridor_stage in corridor_stages_order():
@@ -601,7 +786,7 @@ def compute_detour_for_trip(
             for future in as_completed(futures):
                 # C4: per-trip deadline check.
                 elapsed_ms = (time.monotonic() - t_start) * 1000.0
-                if elapsed_ms > deadline_ms and best is not None:
+                if elapsed_ms > deadline_ms and len(all_rank_inputs) > 0:
                     _log_stage(trip_id, "deadline", elapsed_ms=round(elapsed_ms), outcome="returning_best_so_far")
                     break
 
@@ -611,8 +796,7 @@ def compute_detour_for_trip(
                     log("detours/v2/compute", f"trip_id={trip_id} stage=candidate_generation future_error={fe!s}")
                     continue
 
-                # Compute stitching for this anchor pair.
-                stitch = compute_stitching(
+                stitch_pre = compute_stitching(
                     line=anchor_shape_line,
                     total_m=total_m,
                     stop_rows=stop_rows,
@@ -620,6 +804,7 @@ def compute_detour_for_trip(
                     exit_dist_m=anchors.exit_shape_dist_m,
                     rejoin_dist_m=anchors.rejoin_shape_dist_m,
                     policy=pol,
+                    detour_line=None,
                 )
                 err_detail = ""
                 if isinstance(cdebug.get("valhalla_error_json"), dict):
@@ -630,8 +815,9 @@ def compute_detour_for_trip(
                     "anchor_index": anchor_idx,
                     "exit_stop_id": anchors.exit_stop_id,
                     "rejoin_stop_id": anchors.rejoin_stop_id,
-                    "stitch_ok": stitch.stitch_ok,
-                    "skipped_stops": len(stitch.skipped_stop_ids),
+                    "stitch_ok": stitch_pre.stitch_ok,
+                    "skipped_stops": len(stitch_pre.skipped_stop_ids),
+                    "search_radius_m": anchors.search_radius_m,
                     "corridor": corridor_stage,
                     "candidate_count": len(cands),
                     "candidate_generation_reason": cdebug.get("candidate_generation_reason"),
@@ -664,15 +850,19 @@ def compute_detour_for_trip(
                     continue
                 baseline_d = max(0.0, anchors.rejoin_shape_dist_m - anchors.exit_shape_dist_m)
                 baseline_t = baseline_d / max(5.0, 8.0)
-                rank_inputs = []
                 for rc in cands:
                     decode_stage = "candidate_decode"
                     _log_stage(trip_id, decode_stage, anchor_index=anchor_idx, strategy=rc.strategy)
+                    coords = rc.osm_result_coordinates
+                    invalid_geom = len(coords) < 2
                     decoded = decode_valhalla_candidate(
-                        rc.osm_result_coordinates, rc.time_s, match_osm_segments=True, feed_id=feed_id,
+                        coords, rc.time_s, match_osm_segments=True, feed_id=feed_id,
                     )
                     way_ids = sorted({int(s.osm_way_id) for s in decoded.road_segments if int(s.osm_way_id or 0) > 0})
                     gtfs_ev = db.get_gtfs_bus_way_evidence_bulk(feed_id, way_ids) if way_ids else {}
+                    bus_ev = db.get_bus_edge_evidence_bulk(way_ids) if way_ids else {}
+                    if way_ids:
+                        best_gtfs_ev.update(gtfs_ev)
                     _log_stage(
                         trip_id, decode_stage, anchor_index=anchor_idx, strategy=rc.strategy,
                         ways_total=len(way_ids), ways_with_gtfs_evidence=len(gtfs_ev),
@@ -682,38 +872,19 @@ def compute_detour_for_trip(
                         total_m=total_m,
                         exit_dist_m=anchors.exit_shape_dist_m,
                         rejoin_dist_m=anchors.rejoin_shape_dist_m,
-                        route_coords=rc.osm_result_coordinates,
+                        route_coords=coords,
                     )
-                    feas = evaluate_candidate(
-                        decoded=decoded, projection=projection, policy=pol,
-                        baseline_blocked_distance_m=baseline_d, baseline_blocked_time_s=baseline_t,
-                        detour_distance_m=rc.distance_m, detour_time_s=rc.time_s,
-                        banned_way_ids=banned, gtfs_way_evidence=gtfs_ev,
-                        turn_by_turn=rc.turn_by_turn,
-                        bearing_delta_exit_deg=d_exit, bearing_delta_rejoin_deg=d_rejoin,
-                    )
-                    _log_stage(
-                        trip_id, decode_stage, anchor_index=anchor_idx, strategy=rc.strategy,
-                        bearing_delta_exit_deg=round(float(d_exit or 0.0), 2),
-                        bearing_delta_rejoin_deg=round(float(d_rejoin or 0.0), 2),
-                    )
-                    olap = _line_fraction_inside_blockage(rc.osm_result_coordinates, blockage_geojson)
+                    olap = _line_fraction_inside_blockage(coords, blockage_geojson)
                     cap = float(pol.service.max_incident_overlap_fraction)
+                    path_bad = olap > cap + _INCIDENT_OVERLAP_FRAC_EPS
                     _log_stage(
                         trip_id, decode_stage, anchor_index=anchor_idx, strategy=rc.strategy,
                         blockage_overlap_fraction=round(olap, 6), max_incident_overlap_fraction=cap,
                     )
-                    if olap > cap + _INCIDENT_OVERLAP_FRAC_EPS:
-                        feas.hard_reject_reasons.append("detour_path_intersects_incident")
-                        feas.accepted = False
-                        _log_stage(
-                            trip_id, decode_stage, anchor_index=anchor_idx, strategy=rc.strategy,
-                            status="overlap_reject",
-                            blockage_overlap_fraction=round(olap, 6), max_incident_overlap_fraction=cap,
-                        )
+                    cv_reasons: List[str] = []
                     if VALIDATE_DETOUR_CARRIAGEWAY:
                         ok_cv, cv_reasons = validate_detour_carriageway(
-                            route_coords_lonlat=rc.osm_result_coordinates,
+                            route_coords_lonlat=coords,
                             decoded=decoded,
                             expected_exit_bearing_deg=anchors.exit_forward_bearing_deg,
                             expected_rejoin_bearing_deg=anchors.rejoin_forward_bearing_deg,
@@ -722,219 +893,160 @@ def compute_detour_for_trip(
                             blocked_segment_ids=val_blocked_seg if val_blocked_seg else None,
                             hard_reject_wrong_entry_exit_segment=pol.physical_path.hard_reject_wrong_entry_exit_segment,
                         )
-                        if not ok_cv:
-                            for cr in cv_reasons:
-                                feas.hard_reject_reasons.append(f"carriageway:{cr}")
-                            feas.accepted = False
-                            if debug_detour:
-                                try:
-                                    db.insert_detour_audit_row(
-                                        detour_id=str(uuid.uuid4()),
-                                        trip_id=trip_id,
-                                        route_id=route_id,
-                                        validation_status="rejected",
-                                        validation_reason=",".join(cv_reasons[:12]),
-                                        debug_json={
-                                            "trip_id": trip_id,
-                                            "reasons": cv_reasons,
-                                            "physical_path_used": physical_path_used,
-                                        },
-                                    )
-                                except Exception:
-                                    pass
-                    if not stitch.stitch_ok:
-                        feas.hard_reject_reasons.append("cannot-stitch-service")
-                        feas.accepted = False
-                    skipped_n = len(stitch.skipped_stop_ids)
+                        if not ok_cv and debug_detour:
+                            try:
+                                db.insert_detour_audit_row(
+                                    detour_id=str(uuid.uuid4()),
+                                    trip_id=trip_id,
+                                    route_id=route_id,
+                                    validation_status="rejected",
+                                    validation_reason=",".join(cv_reasons[:12]),
+                                    debug_json={
+                                        "trip_id": trip_id,
+                                        "reasons": cv_reasons,
+                                        "physical_path_used": physical_path_used,
+                                    },
+                                )
+                            except Exception:
+                                pass
+                    try:
+                        detour_line = LineString(coords)
+                    except Exception:
+                        detour_line = None
+                    stitch_full = compute_stitching(
+                        line=anchor_shape_line,
+                        total_m=total_m,
+                        stop_rows=stop_rows,
+                        stop_lonlat=stop_lonlat,
+                        exit_dist_m=anchors.exit_shape_dist_m,
+                        rejoin_dist_m=anchors.rejoin_shape_dist_m,
+                        policy=pol,
+                        detour_line=detour_line,
+                    )
+                    skipped_n = len(stitch_full.skipped_stop_ids)
+                    feas = evaluate_candidate(
+                        decoded=decoded,
+                        projection=projection,
+                        policy=pol,
+                        baseline_blocked_distance_m=baseline_d,
+                        baseline_blocked_time_s=baseline_t,
+                        detour_distance_m=rc.distance_m,
+                        detour_time_s=rc.time_s,
+                        banned_way_ids=banned,
+                        gtfs_way_evidence=gtfs_ev,
+                        bus_edge_evidence=bus_ev,
+                        turn_by_turn=rc.turn_by_turn,
+                        bearing_delta_exit_deg=d_exit,
+                        bearing_delta_rejoin_deg=d_rejoin,
+                        path_intersects_blockage=path_bad,
+                        stitch_ok=stitch_pre.stitch_ok,
+                        invalid_geometry=invalid_geom,
+                        carriageway_reasons=cv_reasons if cv_reasons else None,
+                    )
+                    _log_stage(
+                        trip_id, decode_stage, anchor_index=anchor_idx, strategy=rc.strategy,
+                        bearing_delta_exit_deg=round(float(d_exit or 0.0), 2),
+                        bearing_delta_rejoin_deg=round(float(d_rejoin or 0.0), 2),
+                    )
                     if skipped_n > 0:
-                        # D2: ridership-weighted skipped-stop penalty.
                         weight = _ridership_weight_for_stop(
                             anchors.exit_stop_id or "", stop_lonlat, gtfs_ev
                         )
                         feas.service_penalty_s += skipped_n * float(pol.service.skipped_stop_penalty_s) * weight
                         feas.notes.append(f"skipped_stops={skipped_n}")
-                    rank_inputs.append(
-                        (
-                            rc.strategy,
-                            rc.time_s,
-                            rc.distance_m,
-                            feas,
-                            {
-                                "corridor": corridor_stage,
-                                "anchor_index": float(anchor_idx),
-                                "skipped_stops": float(skipped_n),
-                            },
-                            decoded,
-                        )
-                    )
-
+                    extra = {
+                        "corridor": corridor_stage,
+                        "anchor_index": float(anchor_idx),
+                        "skipped_stops": float(skipped_n),
+                        "exit_shape_dist_m": float(anchors.exit_shape_dist_m),
+                        "rejoin_shape_dist_m": float(anchors.rejoin_shape_dist_m),
+                        "search_radius_m": float(anchors.search_radius_m),
+                    }
+                    all_rank_inputs.append((rc.strategy, rc.time_s, rc.distance_m, feas, extra, decoded))
+                    all_metas.append({"anchors": anchors, "stitch_full": stitch_full, "gtfs_ev": gtfs_ev})
                 rank_stage = "ranking"
-                ranked = rank_candidates(rank_inputs, pol)
-                winners = [x for x in ranked if x.total_score < float("inf")]
-                if (
-                    not winners and rank_inputs
-                    and all("detour_path_intersects_incident" in f.hard_reject_reasons for _, _, _, f, _, _ in rank_inputs)
-                ):
-                    corridor_debug[-1]["corridor_outcome"] = "all_rejected_incident_overlap"
-                elif (
-                    not winners and rank_inputs
-                    and all(
-                        ("anchor_backtrack_heading" in f.hard_reject_reasons or "u_turn_maneuver" in f.hard_reject_reasons)
-                        for _, _, _, f, _, _ in rank_inputs
-                    )
-                ):
-                    corridor_debug[-1]["corridor_outcome"] = "all_rejected_backtrack_or_uturn"
-                log_kwargs: Dict[str, Any] = dict(
+                _log_stage(
+                    trip_id, rank_stage,
                     anchor_index=anchor_idx, corridor=corridor_stage,
-                    ranked_count=len(ranked), winner_count=len(winners),
+                    accumulated=len(all_rank_inputs),
                 )
-                if not winners and rank_inputs:
-                    fr0 = rank_inputs[0][3].hard_reject_reasons
-                    log_kwargs["sample_hard_rejects"] = ",".join(fr0[:12]) if fr0 else "(none)"
-                _log_stage(trip_id, rank_stage, **log_kwargs)
-                if winners:
-                    top = winners[0]
-                    if best is None or top.total_score < best[0]:
-                        best = (top.total_score, corridor_stage, anchors, ranked, top)
-                        best_row = cdebug_row
-                        best_gtfs_ev = gtfs_ev
-                    # B2: early accept — stop processing remaining futures if score is good enough.
-                    if top.total_score <= early_score and corridor_stage == "narrow":
-                        _log_stage(trip_id, "early_accept", score=round(top.total_score, 2), corridor=corridor_stage)
-                        break
         finally:
             executor.shutdown(wait=False)
 
-        # C3: Anchor rescue — if no winners, widen search window and retry once.
-        if best is None and len(anchor_candidates) > 0:
-            rescue_k = int(getattr(pol.anchor, "rescue_stops_per_side", 8))
-            if rescue_k > pol.anchor.candidate_stops_per_side:
-                _log_stage(trip_id, "anchor_rescue", attempt="rescue", rescue_k=rescue_k)
-                import dataclasses as _dc
-                rescue_pol = _dc.replace(pol, anchor=_dc.replace(pol.anchor, candidate_stops_per_side=rescue_k))
-                rescue_candidates = enumerate_anchor_candidates(
-                    line=anchor_shape_line,
-                    blocked=impact.blocked,
-                    stop_rows=stop_rows,
-                    stop_lonlat=stop_lonlat,
-                    policy=rescue_pol,
-                    max_pairs=min(rescue_pol.anchor.candidate_pairs_k, 3),
-                )
-                rescue_candidates = _validate_anchors_via_locate(rescue_candidates, rescue_pol)
-                for ap in rescue_candidates:
-                    ap.exit_forward_bearing_deg = _line_forward_bearing(
-                        anchor_shape_line, ap.exit_shape_dist_m, total_m
-                    )
-                    ap.rejoin_forward_bearing_deg = _line_forward_bearing(
-                        anchor_shape_line, ap.rejoin_shape_dist_m, total_m
-                    )
-                    ap.anchor_geometry_source = (
-                        "matched_physical" if physical_path_used else "gtfs_shape"
-                    )
-                for rescue_anc in rescue_candidates:
-                    for corridor_stage in corridor_stages_order():
-                        excl = incident_exclusion_polygon_for_stage(
-                            blockage_geojson,
-                            corridor_stage,
-                            pol,
-                            line=anchor_shape_line,
-                            anchors=rescue_anc,
-                            shape_length_m=total_m,
-                        )
-                        cands, cdebug = generate_candidates_with_debug(
-                            rescue_anc.exit_lon,
-                            rescue_anc.exit_lat,
-                            rescue_anc.rejoin_lon,
-                            rescue_anc.rejoin_lat,
-                            excl,
-                            alternate_count=2,
-                            exit_heading_deg=rescue_anc.exit_forward_bearing_deg,
-                            rejoin_heading_deg=rescue_anc.rejoin_forward_bearing_deg,
-                        )
-                        corridor_debug.append({
-                            "anchor_index": "rescue",
-                            "corridor": corridor_stage,
-                            "candidate_count": len(cands),
-                            "candidate_generation_reason": cdebug.get("candidate_generation_reason"),
-                            "elapsed_ms": round((time.monotonic() - t_start) * 1000.0),
-                        })
-                        if not cands:
-                            continue
-                        stitch = compute_stitching(
-                            line=anchor_shape_line,
-                            total_m=total_m,
-                            stop_rows=stop_rows,
-                            stop_lonlat=stop_lonlat,
-                            exit_dist_m=rescue_anc.exit_shape_dist_m,
-                            rejoin_dist_m=rescue_anc.rejoin_shape_dist_m,
-                            policy=pol,
-                        )
-                        baseline_d = max(0.0, rescue_anc.rejoin_shape_dist_m - rescue_anc.exit_shape_dist_m)
-                        baseline_t = baseline_d / max(5.0, 8.0)
-                        rank_inputs = []
-                        for rc in cands:
-                            decoded = decode_valhalla_candidate(
-                                rc.osm_result_coordinates, rc.time_s, match_osm_segments=True, feed_id=feed_id,
-                            )
-                            way_ids = sorted({int(s.osm_way_id) for s in decoded.road_segments if int(s.osm_way_id or 0) > 0})
-                            gtfs_ev = db.get_gtfs_bus_way_evidence_bulk(feed_id, way_ids) if way_ids else {}
-                            d_exit, d_rejoin = _backtrack_heading_deltas(
-                                line=anchor_shape_line,
-                                total_m=total_m,
-                                exit_dist_m=rescue_anc.exit_shape_dist_m,
-                                rejoin_dist_m=rescue_anc.rejoin_shape_dist_m,
-                                route_coords=rc.osm_result_coordinates,
-                            )
-                            feas = evaluate_candidate(
-                                decoded=decoded, projection=projection, policy=pol,
-                                baseline_blocked_distance_m=baseline_d, baseline_blocked_time_s=baseline_t,
-                                detour_distance_m=rc.distance_m, detour_time_s=rc.time_s,
-                                banned_way_ids=banned, gtfs_way_evidence=gtfs_ev,
-                                turn_by_turn=rc.turn_by_turn,
-                                bearing_delta_exit_deg=d_exit, bearing_delta_rejoin_deg=d_rejoin,
-                            )
-                            olap = _line_fraction_inside_blockage(rc.osm_result_coordinates, blockage_geojson)
-                            cap = float(pol.service.max_incident_overlap_fraction)
-                            if olap > cap + _INCIDENT_OVERLAP_FRAC_EPS:
-                                feas.hard_reject_reasons.append("detour_path_intersects_incident")
-                                feas.accepted = False
-                            if VALIDATE_DETOUR_CARRIAGEWAY:
-                                ok_cv, cv_reasons = validate_detour_carriageway(
-                                    route_coords_lonlat=rc.osm_result_coordinates,
-                                    decoded=decoded,
-                                    expected_exit_bearing_deg=rescue_anc.exit_forward_bearing_deg,
-                                    expected_rejoin_bearing_deg=rescue_anc.rejoin_forward_bearing_deg,
-                                    expected_exit_segment_ids=val_exit_seg if val_exit_seg else None,
-                                    expected_rejoin_segment_ids=val_rejoin_seg if val_rejoin_seg else None,
-                                    blocked_segment_ids=val_blocked_seg if val_blocked_seg else None,
-                                    hard_reject_wrong_entry_exit_segment=pol.physical_path.hard_reject_wrong_entry_exit_segment,
-                                )
-                                if not ok_cv:
-                                    for cr in cv_reasons:
-                                        feas.hard_reject_reasons.append(f"carriageway:{cr}")
-                                    feas.accepted = False
-                            if not stitch.stitch_ok:
-                                feas.hard_reject_reasons.append("cannot-stitch-service")
-                                feas.accepted = False
-                            skipped_n = len(stitch.skipped_stop_ids)
-                            if skipped_n > 0:
-                                weight = _ridership_weight_for_stop("", stop_lonlat, gtfs_ev)
-                                feas.service_penalty_s += skipped_n * float(pol.service.skipped_stop_penalty_s) * weight
-                            rank_inputs.append((rc.strategy, rc.time_s, rc.distance_m, feas, {"corridor": corridor_stage, "anchor_index": "rescue", "skipped_stops": float(skipped_n)}, decoded))
-                        ranked = rank_candidates(rank_inputs, pol)
-                        winners = [x for x in ranked if x.total_score < float("inf")]
-                        if winners:
-                            top = winners[0]
-                            if best is None or top.total_score < best[0]:
-                                best = (top.total_score, corridor_stage, rescue_anc, ranked, top)
-                                best_row = corridor_debug[-1]
-                                best_gtfs_ev = gtfs_ev
-                            break
-                    if best is not None:
-                        break
+        def _meta_for_ranked(
+            r: RankedCandidate,
+            inputs: List[Tuple[str, float, float, Any, Dict[str, Any], Any]],
+            metas: List[Dict[str, Any]],
+        ) -> Dict[str, Any]:
+            for i, tup in enumerate(inputs):
+                strat, ts, dm = tup[0], tup[1], tup[2]
+                if (
+                    strat == r.strategy
+                    and abs(float(ts) - float(r.travel_time_s)) < 2.0
+                    and abs(float(dm) - float(r.distance_m)) < 15.0
+                ):
+                    return metas[i] if i < len(metas) else {}
+            return {}
 
-        if best is not None:
-            _, best_corridor, best_anchors, best_ranked, best_selected = best
+        ranked_all = rank_candidates(all_rank_inputs, pol)
+        discarded: List[RankedCandidate] = [x for x in ranked_all if x.total_score >= float("inf")]
+        winners_raw = [x for x in ranked_all if x.total_score < float("inf")]
+
+        if not winners_raw:
+            fb = _build_emergency_fallback(
+                anchors=anchors,
+                blockage_geojson=blockage_geojson,
+                projection=projection,
+                pol=pol,
+                feed_id=feed_id,
+                anchor_shape_line=anchor_shape_line,
+                total_m=total_m,
+                stop_rows=stop_rows,
+                stop_lonlat=stop_lonlat,
+            )
+            winners_enriched: List[RankedCandidate] = [fb]
+            best_corridor = "emergency"
+            best_anchors = anchors
+        else:
+            winners_enriched = []
+            for r in winners_raw:
+                meta = _meta_for_ranked(r, all_rank_inputs, all_metas)
+                stitch_f = meta.get("stitch_full")
+                gtfs_ev_local = meta.get("gtfs_ev") or {}
+                gtfs_frac = _gtfs_evidence_distance_fraction(r.decoded, gtfs_ev_local) if r.decoded else 0.0
+                feas = r.feasibility or FeasibilityResult(accepted=True, hard_reject_reasons=[])
+                tier, conf, warns, passed, review = classify_tier(
+                    feasibility=feas,
+                    decoded=r.decoded,
+                    stitch=stitch_f,
+                    is_emergency_fallback=False,
+                    gtfs_evidence_way_fraction=gtfs_frac,
+                )
+                r.tier = tier
+                r.confidence_score = conf
+                r.warnings = warns
+                r.hard_constraints_passed = passed
+                r.review_required = review
+                winners_enriched.append(r)
+            tier_order = {"AUTO_OK": 0, "REVIEW_RECOMMENDED": 1, "LOW_CONFIDENCE": 2, "EMERGENCY_FALLBACK": 3}
+            winners_enriched.sort(key=lambda x: (tier_order.get(str(x.tier), 9), x.total_score, x.distance_m))
+            best_corridor = str(winners_enriched[0].score_breakdown.get("corridor") or "")
+            best_anchors = (
+                _meta_for_ranked(winners_enriched[0], all_rank_inputs, all_metas).get("anchors") or anchors
+            )
+
+        top3 = winners_enriched[:3]
+        for ri, c in enumerate(top3, start=1):
+            c.candidate_rank = ri
+        best_selected = top3[0]
+        best_ranked = top3
+        meta0 = _meta_for_ranked(best_selected, all_rank_inputs, all_metas)
+        best_stitch = meta0.get("stitch_full")
+        if best_stitch is None:
+            dc = coords_from_geojson_linestring(
+                best_selected.decoded.geometry_geojson if best_selected.decoded else None
+            )
+            dl = LineString(dc) if len(dc) >= 2 else None
             best_stitch = compute_stitching(
                 line=anchor_shape_line,
                 total_m=total_m,
@@ -943,108 +1055,26 @@ def compute_detour_for_trip(
                 exit_dist_m=best_anchors.exit_shape_dist_m,
                 rejoin_dist_m=best_anchors.rejoin_shape_dist_m,
                 policy=pol,
+                detour_line=dl,
             )
-            # D1: try inserting skipped stops as via points.
-            via_candidate = _try_via_stop_route(
-                best_selected, best_anchors, best_stitch, blockage_geojson, stop_lonlat, pol, trip_id
-            )
-            if via_candidate is not None and via_candidate.total_score < best_selected.total_score:
-                best_selected = via_candidate
-                best_ranked = [via_candidate] + best_ranked
-            _log_stage(
-                trip_id, "select_best",
-                strategy=best_selected.strategy,
-                total_score=round(best_selected.total_score, 3),
-                corridor=best_corridor,
-                anchor_index=best_row.get("anchor_index") if isinstance(best_row, dict) else None,
-            )
-            dbg_ok: Dict[str, Any] = {
-                "candidate_generation": corridor_debug,
-                "physical_path_used": physical_path_used,
-                "physical_fallback_reason": physical_fallback_reason,
-                "matched_trip_metadata": {
-                    "coverage_ratio": matched_physical.coverage_ratio,
-                    "ambiguous_stop_pairs": matched_physical.ambiguous_stop_pairs,
-                    "weak_stop_pairs": matched_physical.weak_stop_pairs,
-                    "fallback_reason": matched_physical.fallback_reason,
-                },
-            }
-            if debug_detour:
-                gtfs_coords = [(float(x), float(y)) for x, y in line.coords]
-                matched_coords = None
-                if matched_physical.line is not None and not matched_physical.line.is_empty:
-                    matched_coords = [(float(x), float(y)) for x, y in matched_physical.line.coords]
-                blocked_matched: Optional[List[tuple[float, float]]] = None
-                if physical_line is not None and impact.blocked is not None:
-                    try:
-                        slm = float(impact.blocked.shape_length_m or total_m)
-                        sub = affected_shape_subline(
-                            physical_line,
-                            impact.blocked.blocked_start_m,
-                            impact.blocked.blocked_end_m,
-                            slm,
-                        )
-                        blocked_matched = [(float(x), float(y)) for x, y in sub.coords]
-                    except Exception:
-                        blocked_matched = None
-                dec_coords = coords_from_geojson_linestring(
-                    best_selected.decoded.geometry_geojson if best_selected.decoded else None
-                )
-                dbg_ok["geojson"] = build_detour_debug_feature_collection(
-                    gtfs_shape_coords_lonlat=gtfs_coords,
-                    matched_physical_coords_lonlat=matched_coords,
-                    blocked_span_on_matched_coords_lonlat=blocked_matched,
-                    raw_valhalla_coords_lonlat=dec_coords,
-                    decoded_detour_coords_lonlat=dec_coords,
-                    exit_lon=best_anchors.exit_lon,
-                    exit_lat=best_anchors.exit_lat,
-                    rejoin_lon=best_anchors.rejoin_lon,
-                    rejoin_lat=best_anchors.rejoin_lat,
-                    blockage_geojson=blockage_geojson,
-                    extra={"trip_id": trip_id, "debug_detour": True},
-                )
-            if DETOUR_V2_TIMING_LOG:
-                log(
-                    "detours/v2/compute",
-                    f"trip_id={trip_id} timing_ms={round((time.monotonic()-t_start)*1000.0)} status=ok",
-                )
-            return DetourComputeOutput(
-                status="ok",
-                trip_id=trip_id,
-                route_id=route_id,
-                anchors=best_anchors,
-                corridor_stage=best_corridor,
-                candidates=best_ranked,
-                selected=best_selected,
-                policy_version=pol.version,
-                stitching=best_stitch,
-                attempts=corridor_debug,
-                debug=dbg_ok,
-            )
-
-        # C4: check if deadline expired with no result.
-        elapsed_ms = (time.monotonic() - t_start) * 1000.0
-        final_debug = corridor_debug[-1] if corridor_debug else {}
-        aggregate_reason = _no_safe_detour_aggregate_reason(corridor_debug)
-        if elapsed_ms > deadline_ms:
-            aggregate_reason = "deadline_exceeded"
-        gtfs_reject_count = 0
-        for row in corridor_debug:
-            if row.get("candidate_count") == 0 and row.get("candidate_generation_reason"):
-                gtfs_reject_count += 1
-        _log_stage(
-            trip_id, "result",
-            status="no_safe_detour",
-            reason=aggregate_reason,
-            error_type=final_debug.get("error_type"),
-            http_status=final_debug.get("http_status"),
-            ways_rejected_no_gtfs=gtfs_reject_count,
-            elapsed_ms=round(elapsed_ms),
+        best_row: Dict[str, Any] = {"anchor_index": 0, "corridor": best_corridor}
+        via_candidate = _try_via_stop_route(
+            best_selected, best_anchors, best_stitch, blockage_geojson, stop_lonlat, pol, trip_id
         )
-        dbg_ns: Dict[str, Any] = {
-            "candidate_generation_reason": aggregate_reason,
-            "valhalla_http_status": final_debug.get("http_status"),
-            "ways_rejected_no_gtfs": gtfs_reject_count,
+        if via_candidate is not None and via_candidate.total_score < best_selected.total_score:
+            best_selected = via_candidate
+            best_ranked = [via_candidate] + [x for x in best_ranked if x is not via_candidate][:2]
+            best_ranked[0].candidate_rank = 1
+        out_status = _tier_status(str(best_selected.tier))
+        _log_stage(
+            trip_id, "select_best",
+            strategy=best_selected.strategy,
+            total_score=round(best_selected.total_score, 3),
+            corridor=best_corridor,
+            tier=best_selected.tier,
+            anchor_index=best_row.get("anchor_index") if isinstance(best_row, dict) else None,
+        )
+        dbg_ok: Dict[str, Any] = {
             "candidate_generation": corridor_debug,
             "physical_path_used": physical_path_used,
             "physical_fallback_reason": physical_fallback_reason,
@@ -1054,32 +1084,60 @@ def compute_detour_for_trip(
                 "weak_stop_pairs": matched_physical.weak_stop_pairs,
                 "fallback_reason": matched_physical.fallback_reason,
             },
+            "discarded_count": len(discarded),
         }
         if debug_detour:
             gtfs_coords = [(float(x), float(y)) for x, y in line.coords]
             matched_coords = None
             if matched_physical.line is not None and not matched_physical.line.is_empty:
                 matched_coords = [(float(x), float(y)) for x, y in matched_physical.line.coords]
-            dbg_ns["geojson"] = build_detour_debug_feature_collection(
+            blocked_matched: Optional[List[tuple[float, float]]] = None
+            if physical_line is not None and impact.blocked is not None:
+                try:
+                    slm = float(impact.blocked.shape_length_m or total_m)
+                    sub = affected_shape_subline(
+                        physical_line,
+                        impact.blocked.blocked_start_m,
+                        impact.blocked.blocked_end_m,
+                        slm,
+                    )
+                    blocked_matched = [(float(x), float(y)) for x, y in sub.coords]
+                except Exception:
+                    blocked_matched = None
+            dec_coords = coords_from_geojson_linestring(
+                best_selected.decoded.geometry_geojson if best_selected.decoded else None
+            )
+            dbg_ok["geojson"] = build_detour_debug_feature_collection(
                 gtfs_shape_coords_lonlat=gtfs_coords,
                 matched_physical_coords_lonlat=matched_coords,
-                exit_lon=anchors.exit_lon,
-                exit_lat=anchors.exit_lat,
-                rejoin_lon=anchors.rejoin_lon,
-                rejoin_lat=anchors.rejoin_lat,
+                blocked_span_on_matched_coords_lonlat=blocked_matched,
+                raw_valhalla_coords_lonlat=dec_coords,
+                decoded_detour_coords_lonlat=dec_coords,
+                exit_lon=best_anchors.exit_lon,
+                exit_lat=best_anchors.exit_lat,
+                rejoin_lon=best_anchors.rejoin_lon,
+                rejoin_lat=best_anchors.rejoin_lat,
                 blockage_geojson=blockage_geojson,
-                extra={"trip_id": trip_id, "reason": aggregate_reason},
+                extra={"trip_id": trip_id, "debug_detour": True},
+            )
+        if DETOUR_V2_TIMING_LOG:
+            log(
+                "detours/v2/compute",
+                f"trip_id={trip_id} timing_ms={round((time.monotonic()-t_start)*1000.0)} status={out_status}",
             )
         return DetourComputeOutput(
-            status="no_safe_detour",
+            status=cast(DetourComputeStatus, out_status),
             trip_id=trip_id,
             route_id=route_id,
-            anchors=anchors,
-            candidates=[],
+            anchors=best_anchors,
+            corridor_stage=best_corridor,
+            candidates=best_ranked,
+            selected=best_selected,
             policy_version=pol.version,
-            stitching=None,
+            stitching=best_stitch,
             attempts=corridor_debug,
-            debug=dbg_ns,
+            debug=dbg_ok,
+            discarded=discarded,
         )
     except Exception as e:
         log(
