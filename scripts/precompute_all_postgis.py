@@ -1,8 +1,11 @@
 """
 Run the full PostGIS data pipeline in one go:
 
-  1. (Optional) GTFS ingest — same defaults as backend.scripts.ingest_gtfs_postgis
+  1. (Optional) GTFS ingest — same defaults as backend.scripts.ingest_gtfs_postgis.
+     Ingest builds shapes_lines and populates gtfs_bus_way_evidence (GTFS shapes → OSM ways,
+     used by detour v2); skipping ingest leaves that table unchanged unless you add step 2b.
   2. Build route patterns + ride network — same defaults as build_patterns_postgis (auto date)
+  2b. (Optional) Rebuild gtfs_bus_way_evidence — see --rebuild-gtfs-bus-way-evidence
   3. Precompute route graphs + route previews — same as scripts.precompute_graphs_postgis
 
 From the repository root:
@@ -10,6 +13,7 @@ From the repository root:
     python -m scripts.precompute_all_postgis
     python -m scripts.precompute_all_postgis --with-ingest --workers 4
     python -m scripts.precompute_all_postgis --with-ingest --ingest-fetch-always --workers 4
+    python -m scripts.precompute_all_postgis --rebuild-gtfs-bus-way-evidence --workers 4
 """
 
 from __future__ import annotations
@@ -58,7 +62,8 @@ def main() -> None:
 
     ap = argparse.ArgumentParser(
         description=(
-            "One command: optional ingest, build_patterns_postgis, precompute_graphs_postgis."
+            "One command: optional ingest, build_patterns_postgis, optional gtfs_bus_way_evidence "
+            "rebuild, precompute_graphs_postgis."
         ),
     )
     ap.add_argument(
@@ -70,7 +75,10 @@ def main() -> None:
     ap.add_argument(
         "--with-ingest",
         action="store_true",
-        help="Run ingest_gtfs_postgis first (default zip + MOT source URL from ingest script).",
+        help=(
+            "Run ingest_gtfs_postgis first (default zip + MOT source URL from ingest script). "
+            "Also builds gtfs_bus_way_evidence for detour v2."
+        ),
     )
     ap.add_argument(
         "--ingest-force",
@@ -151,6 +159,15 @@ def main() -> None:
         action="store_true",
         help="Forward to graph precompute: run OSRM map-match and pretty_osm cache rows (slow).",
     )
+    ap.add_argument(
+        "--rebuild-gtfs-bus-way-evidence",
+        action="store_true",
+        help=(
+            "After patterns: run backend.scripts.build_gtfs_bus_way_evidence (refreshes shapes_lines "
+            "then rebuilds gtfs_bus_way_evidence). Use when you did not pass --with-ingest but need "
+            "detour v2 GTFS way evidence. Idempotent if ingest already ran in the same invocation."
+        ),
+    )
     args = ap.parse_args()
     db = args.database_url
 
@@ -194,6 +211,11 @@ def main() -> None:
             pat_extra.extend(["--route-batch-size", str(args.route_batch_size)])
         _run_py_module("backend.scripts.build_patterns_postgis", pat_extra, db)
         log("precompute-all", "phase=patterns_pipeline done")
+
+    if args.rebuild_gtfs_bus_way_evidence:
+        log("precompute-all", "phase=gtfs_bus_way_evidence start")
+        _run_py_module("backend.scripts.build_gtfs_bus_way_evidence", [], db)
+        log("precompute-all", "phase=gtfs_bus_way_evidence done")
 
     if not args.skip_graphs:
         log("precompute-all", "phase=graphs_pipeline start")

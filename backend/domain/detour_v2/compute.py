@@ -622,6 +622,12 @@ def compute_detour_for_trip(
             total_m = _line_length_m(anchor_shape_line)
 
         feed_id = db.get_active_feed_id()
+        evidence_diag_stats: Dict[str, Any] = {}
+        if feed_id is not None:
+            try:
+                evidence_diag_stats = db.get_detour_evidence_diag_stats(int(feed_id))
+            except Exception as _diag_ex:
+                evidence_diag_stats = {"evidence_diag_error": str(_diag_ex)[:200]}
         stage = "incident_projection"
         projection = project_incident_polygon(
             blockage_geojson=blockage_geojson,
@@ -630,7 +636,7 @@ def compute_detour_for_trip(
             narrow_buffer_m=float(pol.corridor.narrow_buffer_m),
         )
         banned = edge_ban_way_ids(projection)
-        _log_stage(trip_id, stage, edge_bans=len(banned), feed_id=feed_id)
+        _log_stage(trip_id, stage, edge_bans=len(banned), feed_id=feed_id, **evidence_diag_stats)
 
         stage = "anchor_selection"
         radii = list(getattr(pol.anchor, "search_radii_m", None) or [400.0, 800.0, 1500.0, 3000.0, 5000.0])
@@ -863,9 +869,16 @@ def compute_detour_for_trip(
                     bus_ev = db.get_bus_edge_evidence_bulk(way_ids) if way_ids else {}
                     if way_ids:
                         best_gtfs_ev.update(gtfs_ev)
+                    hit_ids = list(gtfs_ev.keys())
                     _log_stage(
-                        trip_id, decode_stage, anchor_index=anchor_idx, strategy=rc.strategy,
-                        ways_total=len(way_ids), ways_with_gtfs_evidence=len(gtfs_ev),
+                        trip_id,
+                        decode_stage,
+                        anchor_index=anchor_idx,
+                        strategy=rc.strategy,
+                        ways_total=len(way_ids),
+                        ways_with_gtfs_evidence_table_hit=len(gtfs_ev),
+                        decoded_osm_way_ids_sample=",".join(str(w) for w in way_ids[:12]),
+                        gtfs_evidence_hit_way_ids_sample=",".join(str(w) for w in sorted(hit_ids)[:12]),
                     )
                     d_exit, d_rejoin = _backtrack_heading_deltas(
                         line=anchor_shape_line,

@@ -50,6 +50,8 @@ Road-graph-first detour computation for Israeli buses (`standard_plus_bus`).
 | `VALHALLA_CIRCUIT_FAIL_THRESHOLD` | `5` | Open circuit breaker after N consecutive failures. |
 | `VALHALLA_CIRCUIT_COOLDOWN_S` | `30` | Seconds to keep circuit breaker open. |
 
+**GTFS bus-way evidence:** `gtfs_bus_way_evidence` is populated during GTFS ingest (`ingest_gtfs_postgis.py`, shape-buffer proximity to `osm_road_segments`). Detour logs use `ways_with_gtfs_evidence_table_hit` = count of decoded OSM way IDs that return a row for the active `feed_id`. Zeros usually mean the table is empty for that feed, not that buses avoid those roads. Physical matching lives in `pattern_edge_match` (separate counts in `incident_projection` stage logs).
+
 Policy sub-section overrides (via `DETOUR_POLICY_JSON`):
 - `anchor.candidate_pairs_k` — how many exit/rejoin pairs to evaluate.
 - `anchor.rescue_stops_per_side` — wider search when first sweep fails.

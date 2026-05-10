@@ -123,7 +123,10 @@ docker compose run --rm backend python -m scripts.precompute_all_postgis --with-
 For host-based/manual runs, with `DATABASE_URL` set (or pass `--database-url`):
 
 ```bash
-# All-in-one: patterns (auto date) + graph/preview precompute. Add --with-ingest to run GTFS ingest first.
+# All-in-one: patterns (auto date) + graph/preview precompute. Add --with-ingest to run GTFS ingest first
+# (ingest also builds gtfs_bus_way_evidence for detour v2). Without ingest, add --rebuild-gtfs-bus-way-evidence
+# after patterns to rebuild that table from shapes + osm_road_segments, or run:
+#   python -m backend.scripts.build_gtfs_bus_way_evidence
 # Ingest / patterns / graphs each skip their own work when unchanged (--ingest-force / --force-patterns override patterns+ingest).
 # Add --ingest-fetch to download only if missing, --ingest-fetch-if-newer to refresh only when remote changed,
 # or --ingest-fetch-always to always re-download.
@@ -131,6 +134,7 @@ python -m scripts.precompute_all_postgis --workers 4
 python -m scripts.precompute_all_postgis --with-ingest --workers 4
 python -m scripts.precompute_all_postgis --with-ingest --ingest-fetch-if-newer --workers 4
 python -m scripts.precompute_all_postgis --with-ingest --ingest-fetch-always --workers 4
+python -m scripts.precompute_all_postgis --rebuild-gtfs-bus-way-evidence --workers 4
 ```
 
 ```bash
@@ -175,6 +179,7 @@ Warmup behavior:
   - `POST /graph/cache/warmup?profiles=weekday,friday` — add `include_previews=false` to warm graphs only
 
 Detour v2 endpoints:
+- **GTFS bus-way evidence:** detour scoring reads `gtfs_bus_way_evidence` (built from GTFS shape lines near `osm_road_segments`, not from `pattern_edge_match`). Populate via ingest or `python -m backend.scripts.build_gtfs_bus_way_evidence`.
 - `POST /incidents` creates an incident from a blockage polygon and derives edge bans.
 - `POST /detours/compute` computes candidate road detours for a selected route/trip.
 - `GET /detours/policy` returns the active detour policy profile and thresholds.

@@ -4937,8 +4937,11 @@ def get_gtfs_bus_way_evidence_bulk(
     conn=None,
 ) -> Dict[int, Dict[str, Any]]:
     """
-    Return feed-scoped GTFS evidence rows keyed by osm_way_id.
-    If multiple direction rows exist, keep the highest confidence row per way.
+    Return feed-scoped GTFS evidence rows keyed by osm_way_id (exact rows in gtfs_bus_way_evidence).
+
+    This is an exact table lookup on (feed_id, osm_way_id); it does not infer bus usage from
+    geometry or pattern_edge_match. Empty results usually mean the table is unpopulated for
+    this feed, not that buses never use those ways.
     """
     if not osm_way_ids:
         return {}
@@ -4975,6 +4978,170 @@ def get_gtfs_bus_way_evidence_bulk(
     finally:
         if close:
             conn.close()
+
+
+def get_detour_evidence_diag_stats(feed_id: int, conn=None) -> Dict[str, Any]:
+    """
+    Lightweight counts for detour v2 structured logs (not request-time geometry checks).
+
+    - gtfs_evidence_rows_for_feed / gtfs_evidence_rows_all_feeds: rows in gtfs_bus_way_evidence
+      (exact osm_way_id + feed_id table used by get_gtfs_bus_way_evidence_bulk).
+    - pattern_edge_match_rows_for_feed_version: rows in pattern_edge_match joined to pattern_edge
+      for the active feed_version key (physical matcher output; independent of gtfs_bus_way_evidence).
+    """
+    close = False
+    if conn is None:
+        conn = _get_conn()
+        close = True
+    out: Dict[str, Any] = {
+        "gtfs_evidence_rows_for_feed": 0,
+        "gtfs_evidence_rows_all_feeds": 0,
+        "pattern_edge_match_rows_for_feed_version": 0,
+    }
+    try:
+        fv = get_active_feed_version_key(conn)
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    (SELECT COUNT(*)::bigint FROM gtfs_bus_way_evidence WHERE feed_id = %s) AS for_feed,
+                    (SELECT COUNT(*)::bigint FROM gtfs_bus_way_evidence) AS all_feeds
+                """,
+                (feed_id,),
+            )
+            row = cur.fetchone()
+            if row:
+                out["gtfs_evidence_rows_for_feed"] = int(row["for_feed"] or 0)
+                out["gtfs_evidence_rows_all_feeds"] = int(row["all_feeds"] or 0)
+            try:
+                cur.execute(
+                    """
+                    SELECT COUNT(*)::bigint AS n
+                    FROM pattern_edge_match pem
+                    INNER JOIN pattern_edge pe ON pe.pattern_edge_id = pem.pattern_edge_id
+                    WHERE pe.feed_version = %s
+                    """,
+                    (fv,),
+                )
+                r2 = cur.fetchone()
+                if r2:
+                    out["pattern_edge_match_rows_for_feed_version"] = int(r2["n"] or 0)
+            except Exception:
+                pass
+        return out
+    finally:
+        if close:
+            conn.close()
+
+
+def rebuild_shapes_lines_for_feed(cur: Any, feed_id: int) -> None:
+    """
+    Recompute shapes_lines from the shapes point table for one feed.
+    Same INSERT ... ON CONFLICT DO NOTHING as ingest_gtfs_postgis.
+    """
+    cur.execute(
+        """
+        INSERT INTO shapes_lines(feed_id, shape_id, geom)
+        SELECT
+            s.feed_id,
+            s.shape_id,
+            ST_SetSRID(
+                ST_MakeLine(ST_MakePoint(s.lon, s.lat) ORDER BY s.seq),
+                4326
+            )::geometry(LineString, 4326)
+        FROM shapes s
+        WHERE s.feed_id = %s
+        GROUP BY s.feed_id, s.shape_id
+        ON CONFLICT (feed_id, shape_id) DO NOTHING
+        """,
+        (feed_id,),
+    )
+
+
+def rebuild_gtfs_bus_way_evidence_for_feed(cur: Any, feed_id: int) -> None:
+    """
+    Replace gtfs_bus_way_evidence for feed_id from trips, shapes_lines, and osm_road_segments
+    using a 30 m geography buffer along shape lines. Caller owns the transaction (commit).
+
+    Long GTFS shapes get ST_Subdivide (128 vertices) so bbox + GiST joins to osm_road_segments
+    stay selective; otherwise whole-country shape envelopes match almost every segment.
+    """
+    cur.execute(
+        """
+        DELETE FROM gtfs_bus_way_evidence
+        WHERE feed_id = %s
+        """,
+        (feed_id,),
+    )
+    cur.execute(
+        """
+        WITH shape_fragments AS (
+            SELECT sl.feed_id, sl.shape_id, frag.geom AS geom
+            FROM shapes_lines sl
+            CROSS JOIN LATERAL ST_Subdivide(sl.geom, 128) AS frag(geom)
+            WHERE sl.feed_id = %s
+        ),
+        shapes_near_osm AS (
+            SELECT DISTINCT sf.feed_id, sf.shape_id, ors.osm_way_id
+            FROM shape_fragments sf
+            JOIN osm_road_segments ors
+              ON ors.geom && ST_Expand(sf.geom, 0.00035)
+             AND ST_DWithin(sf.geom::geography, ors.geom::geography, 30.0)
+        ),
+        trip_shape_hits AS (
+            SELECT
+                t.feed_id,
+                t.trip_id,
+                t.route_id,
+                COALESCE(t.direction_id::text, '') AS direction,
+                sno.osm_way_id
+            FROM trips t
+            JOIN shapes_near_osm sno
+              ON sno.feed_id = t.feed_id
+             AND sno.shape_id = t.shape_id
+            WHERE t.feed_id = %s
+              AND t.shape_id IS NOT NULL
+        ),
+        agg AS (
+            SELECT
+                feed_id,
+                osm_way_id,
+                direction,
+                COUNT(DISTINCT trip_id)::int AS trip_count,
+                COUNT(DISTINCT route_id)::int AS route_count,
+                TO_JSONB((ARRAY_AGG(DISTINCT trip_id ORDER BY trip_id))[1:8]) AS sample_trip_ids_json
+            FROM trip_shape_hits
+            GROUP BY feed_id, osm_way_id, direction
+        )
+        INSERT INTO gtfs_bus_way_evidence (
+            feed_id,
+            osm_way_id,
+            direction,
+            trip_count,
+            route_count,
+            sample_trip_ids_json,
+            confidence_score,
+            last_computed_at
+        )
+        SELECT
+            a.feed_id,
+            a.osm_way_id,
+            a.direction,
+            a.trip_count,
+            a.route_count,
+            a.sample_trip_ids_json,
+            LEAST(1.0, GREATEST(0.05, LN(1 + a.trip_count) / LN(1 + 25)))::double precision AS confidence_score,
+            NOW()
+        FROM agg a
+        ON CONFLICT (feed_id, osm_way_id, direction) DO UPDATE SET
+            trip_count = EXCLUDED.trip_count,
+            route_count = EXCLUDED.route_count,
+            sample_trip_ids_json = EXCLUDED.sample_trip_ids_json,
+            confidence_score = EXCLUDED.confidence_score,
+            last_computed_at = NOW()
+        """,
+        (feed_id, feed_id),
+    )
 
 
 def get_candidate_osm_segments_for_polyline(

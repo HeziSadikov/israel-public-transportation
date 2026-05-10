@@ -44,7 +44,11 @@ from psycopg2 import errors as pg_errors
 from psycopg2.extras import execute_values
 
 from backend.infra.config import GTFS_REMOTE_BASE, GTFS_REMOTE_FILENAME, LOCAL_GTFS_ZIP
-from backend.infra.db_access import DB_URL
+from backend.infra.db_access import (
+    DB_URL,
+    rebuild_gtfs_bus_way_evidence_for_feed,
+    rebuild_shapes_lines_for_feed,
+)
 from backend.infra.gtfs_download import download_gtfs_zip, get_remote_gtfs_metadata
 from backend.infra.logging_utils import ensure_cli_action_logging, log
 
@@ -562,23 +566,7 @@ def ingest_gtfs(
                 print("[ingest] Building shapes_lines (this can take a while) ...", flush=True)
                 log("ingest", "phase=build_shapes_lines start")
                 t_shapes_lines = time.perf_counter()
-                cur.execute(
-                    """
-                    INSERT INTO shapes_lines(feed_id, shape_id, geom)
-                    SELECT
-                        s.feed_id,
-                        s.shape_id,
-                        ST_SetSRID(
-                            ST_MakeLine(ST_MakePoint(s.lon, s.lat) ORDER BY s.seq),
-                            4326
-                        )::geometry(LineString, 4326)
-                    FROM shapes s
-                    WHERE s.feed_id = %s
-                    GROUP BY s.feed_id, s.shape_id
-                    ON CONFLICT (feed_id, shape_id) DO NOTHING
-                    """,
-                    (feed_id,),
-                )
+                rebuild_shapes_lines_for_feed(cur, feed_id)
                 log(
                     "ingest",
                     f"phase=build_shapes_lines done elapsed_s={time.perf_counter() - t_shapes_lines:.2f}",
@@ -590,71 +578,7 @@ def ingest_gtfs(
                 print("[ingest] Building gtfs_bus_way_evidence ...", flush=True)
                 log("ingest", "phase=build_gtfs_bus_way_evidence start")
                 t_gtfs_way_ev = time.perf_counter()
-                cur.execute(
-                    """
-                    DELETE FROM gtfs_bus_way_evidence
-                    WHERE feed_id = %s
-                    """,
-                    (feed_id,),
-                )
-                cur.execute(
-                    """
-                    WITH trip_shape_hits AS (
-                        SELECT
-                            t.feed_id,
-                            t.trip_id,
-                            t.route_id,
-                            COALESCE(t.direction_id::text, '') AS direction,
-                            ors.osm_way_id
-                        FROM trips t
-                        JOIN shapes_lines sl
-                          ON sl.feed_id = t.feed_id
-                         AND sl.shape_id = t.shape_id
-                        JOIN osm_road_segments ors
-                          ON ST_DWithin(sl.geom::geography, ors.geom::geography, 30.0)
-                        WHERE t.feed_id = %s
-                          AND t.shape_id IS NOT NULL
-                    ),
-                    agg AS (
-                        SELECT
-                            feed_id,
-                            osm_way_id,
-                            direction,
-                            COUNT(DISTINCT trip_id)::int AS trip_count,
-                            COUNT(DISTINCT route_id)::int AS route_count,
-                            TO_JSONB((ARRAY_AGG(DISTINCT trip_id ORDER BY trip_id))[1:8]) AS sample_trip_ids_json
-                        FROM trip_shape_hits
-                        GROUP BY feed_id, osm_way_id, direction
-                    )
-                    INSERT INTO gtfs_bus_way_evidence (
-                        feed_id,
-                        osm_way_id,
-                        direction,
-                        trip_count,
-                        route_count,
-                        sample_trip_ids_json,
-                        confidence_score,
-                        last_computed_at
-                    )
-                    SELECT
-                        a.feed_id,
-                        a.osm_way_id,
-                        a.direction,
-                        a.trip_count,
-                        a.route_count,
-                        a.sample_trip_ids_json,
-                        LEAST(1.0, GREATEST(0.05, LN(1 + a.trip_count) / LN(1 + 25)))::double precision AS confidence_score,
-                        NOW()
-                    FROM agg a
-                    ON CONFLICT (feed_id, osm_way_id, direction) DO UPDATE SET
-                        trip_count = EXCLUDED.trip_count,
-                        route_count = EXCLUDED.route_count,
-                        sample_trip_ids_json = EXCLUDED.sample_trip_ids_json,
-                        confidence_score = EXCLUDED.confidence_score,
-                        last_computed_at = NOW()
-                    """,
-                    (feed_id,),
-                )
+                rebuild_gtfs_bus_way_evidence_for_feed(cur, feed_id)
                 log(
                     "ingest",
                     f"phase=build_gtfs_bus_way_evidence done elapsed_s={time.perf_counter() - t_gtfs_way_ev:.2f}",

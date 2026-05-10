@@ -43,7 +43,8 @@ def classify_tier(
     """
     Returns (tier, confidence_score 0..1, merged_warnings, hard_constraints_passed, review_required).
 
-    gtfs_evidence_way_fraction: share of decoded distance on ways with gtfs_bus_way_evidence.
+    gtfs_evidence_way_fraction: share of decoded distance on ways with rows in gtfs_bus_way_evidence
+        (exact feed_id + osm_way_id hits from ingest / upsert; not geometry-derived).
     """
     ok_downstream = stitch.stitch_ok if stitch is not None else bool(stitch_ok)
     skipped_n_eff = len(stitch.skipped_stop_ids) if stitch is not None else int(skipped_stop_count or 0)
