@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from typing import Optional, List, Dict, Any, Literal
-from enum import Enum
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -16,6 +15,29 @@ class DetourTurnStep(BaseModel):
     intersection_with: Optional[str] = None
     turn: Optional[str] = None  # e.g. left, right, straight, uturn
     distance_m: Optional[float] = None
+
+
+class DetourResponse(BaseModel):
+    blocked_edges_count: int
+    stop_path: List[str]
+    path_geojson: Dict[str, Any]
+    blocked_edges_geojson: Dict[str, Any]
+    total_travel_time_s: Optional[float] = None
+    total_distance_m: Optional[float] = None
+    baseline_travel_time_s: Optional[float] = None
+    baseline_distance_m: Optional[float] = None
+    detour_delay_s: Optional[float] = None
+    detour_extra_distance_m: Optional[float] = None
+    used_shape: bool
+    used_osm_snapping: bool
+    feed_version: str
+    turn_by_turn: Optional[List[DetourTurnStep]] = None
+    from_override: bool = False
+    instructions_only: bool = False
+    reason_code: Optional[str] = None
+    strategy_used: Optional[str] = None
+    confidence: Optional[float] = None
+    diagnostics: Optional[Dict[str, Any]] = None
 
 
 class RouteSearchRequest(BaseModel):
@@ -88,51 +110,6 @@ class GraphStopsResponse(BaseModel):
     stops: List[GraphStopsResponseStop]
 
 
-class DetourRequest(BaseModel):
-    route_id: str
-    direction_id: Optional[str] = None
-    pattern_id: Optional[str] = None
-    date: Optional[str] = None
-    start_stop_id: str
-    end_stop_id: str
-    blockage_geojson: Dict[str, Any]
-    # Optional service window for candidate-route selection (HH:MM or HH:MM:SS).
-    # Omit both for full extended service day (same as historical /detour behavior).
-    start_time: Optional[str] = None
-    end_time: Optional[str] = None
-    # Manual street detour (after auto failure or to replace); LineString/MultiLineString geometry.
-    detour_road_geojson: Optional[Dict[str, Any]] = None
-    turn_by_turn: Optional[List[DetourTurnStep]] = None
-    # Single narrative; split server-side into steps if turn_by_turn omitted.
-    instructions_text_he: Optional[str] = None
-    remember_override: bool = False
-    # GTFS graph routing: A* (default) or DFS with optional fallback to A*.
-    routing_engine: Literal["astar", "dfs", "dijkstra"] = "astar"
-
-
-class DetourResponse(BaseModel):
-    blocked_edges_count: int
-    stop_path: List[str]
-    path_geojson: Dict[str, Any]
-    blocked_edges_geojson: Dict[str, Any]
-    total_travel_time_s: Optional[float] = None
-    total_distance_m: Optional[float] = None
-    baseline_travel_time_s: Optional[float] = None
-    baseline_distance_m: Optional[float] = None
-    detour_delay_s: Optional[float] = None
-    detour_extra_distance_m: Optional[float] = None
-    used_shape: bool
-    used_osm_snapping: bool
-    feed_version: str
-    turn_by_turn: Optional[List[DetourTurnStep]] = None
-    from_override: bool = False
-    instructions_only: bool = False
-    reason_code: Optional[str] = None
-    strategy_used: Optional[str] = None
-    confidence: Optional[float] = None
-    diagnostics: Optional[Dict[str, Any]] = None
-
-
 class AreaRoutesQuery(BaseModel):
     start_date: str  # YYYYMMDD
     start_time: str  # HH:MM or HH:MM:SS
@@ -140,6 +117,11 @@ class AreaRoutesQuery(BaseModel):
     end_time: str  # HH:MM or HH:MM:SS
     polygon_geojson: Dict[str, Any]
     max_results: int = Field(default=100, ge=1)
+    time_semantics_mode: Literal[
+        "legacy_trip_overlap",
+        "pass_through_precise",
+        "pass_through_stop_proxy",
+    ] = "legacy_trip_overlap"
 
 
 class AreaRouteResult(BaseModel):
@@ -153,40 +135,13 @@ class AreaRouteResult(BaseModel):
     last_time: Optional[str] = None
     trip_count: Optional[int] = None
     last_stop_name: Optional[str] = None
+    time_match_confidence: Optional[Literal["high", "approx", "unknown"]] = None
+    time_match_note: Optional[str] = None
 
 
 class AreaRoutesResponse(BaseModel):
     routes: List[AreaRouteResult]
     calendar_hint: Optional[str] = None
-
-
-class DetourByAreaMode(str, Enum):
-    route = "route"
-    all = "all"
-
-
-class DetourByAreaRequest(BaseModel):
-    mode: DetourByAreaMode
-    route_id: Optional[str] = None  # required when mode=route
-    direction_id: Optional[str] = None
-    start_date: str  # YYYYMMDD
-    start_time: str  # HH:MM or HH:MM:SS
-    end_date: str  # YYYYMMDD
-    end_time: str  # HH:MM or HH:MM:SS
-    blockage_geojson: Dict[str, Any]
-    max_routes: int = Field(default=20, ge=1)
-    transfer_radius_m: float = Field(default=280.0, ge=10.0, le=1000.0)
-    use_osm_detour: bool = False
-    # When True, run Valhalla hybrid before GTFS multi-route A* (legacy order).
-    prefer_osm_detour: bool = False
-    detour_road_geojson: Optional[Dict[str, Any]] = None
-    turn_by_turn: Optional[List[DetourTurnStep]] = None
-    remember_override: bool = False
-    # When applying a manual override for a specific route, pass entry/exit from last failed result.
-    stop_before: Optional[str] = None
-    stop_after: Optional[str] = None
-    instructions_text_he: Optional[str] = None
-    routing_engine: Literal["astar", "dfs", "dijkstra"] = "astar"
 
 
 class DetourByAreaRouteResult(BaseModel):
@@ -208,13 +163,6 @@ class DetourByAreaRouteResult(BaseModel):
     strategy_used: Optional[str] = None
     confidence: Optional[float] = None
     diagnostics: Optional[Dict[str, Any]] = None
-
-
-class DetourByAreaResponse(BaseModel):
-    mode: DetourByAreaMode
-    result: Optional[DetourByAreaRouteResult] = None
-    results: Optional[List[DetourByAreaRouteResult]] = None
-    feed_version: Optional[str] = None
 
 
 class StopInBounds(BaseModel):

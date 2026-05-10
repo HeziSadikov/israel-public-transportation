@@ -191,6 +191,7 @@ def find_routes_in_polygon(
   start_sec: int,
   end_date_ymd: str,
   end_sec: int,
+  time_semantics_mode: str = "legacy_trip_overlap",
 ) -> List[Dict[str, Any]]:
   """
   Returns a list of routes whose shapes intersect the given polygon and have
@@ -233,6 +234,7 @@ def find_routes_in_polygon(
     start_sec=start_sec,
     end_date_ymd=end_date_ymd,
     end_sec=end_sec,
+    time_semantics_mode=time_semantics_mode,
   )
   elapsed_ms = int((time.perf_counter() - t0) * 1000)
   log(
@@ -251,6 +253,8 @@ def find_routes_in_polygon(
       "last_time_s": r.last_time_s,
       "trip_count": r.trip_count,
       "last_stop_name": r.last_stop_name,
+      "time_match_confidence": r.time_match_confidence,
+      "time_match_note": r.time_match_note,
     }
     for r in rows
   ]

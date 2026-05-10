@@ -123,6 +123,26 @@ class TestAreaSearch(unittest.TestCase):
         self.assertEqual(results[0]["first_time_s"], 8 * 3600)
         self.assertEqual(results[0]["last_time_s"], 9 * 3600)
 
+    def test_find_routes_in_polygon_accepts_time_semantics_mode(self):
+        """Non-legacy mode flag is accepted in compatibility/in-memory path."""
+        path = Path("/fake/test/area_search/feed_mode")
+        feed = _make_test_feed(path)
+        polygon_geojson = {
+            "type": "Polygon",
+            "coordinates": [[[35.0, 32.0], [35.01, 32.0], [35.01, 32.01], [35.0, 32.01], [35.0, 32.0]]],
+        }
+        results = find_routes_in_polygon(
+            feed=feed,
+            polygon_geojson=polygon_geojson,
+            start_date_ymd="20250303",
+            start_sec=7 * 3600,
+            end_date_ymd="20250303",
+            end_sec=10 * 3600,
+            time_semantics_mode="pass_through_precise",
+        )
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["route_id"], "R1")
+
     def test_find_routes_in_polygon_empty_when_shape_outside(self):
         """When no shape intersects the polygon, result is empty."""
         path = Path("/fake/test/area_search/feed4")

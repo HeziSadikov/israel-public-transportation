@@ -24,6 +24,8 @@ export type AreaRouteResult = {
   last_time?: string | null;
   trip_count?: number | null;
   last_stop_name?: string | null;
+  time_match_confidence?: "high" | "approx" | "unknown" | null;
+  time_match_note?: string | null;
 };
 
 export type ExplorerSortBy = "line_asc" | "line_desc" | "agency_asc" | "agency_desc" | "trips_desc" | "destination_asc";
@@ -354,7 +356,18 @@ export const ExplorerWindow: React.FC<ExplorerWindowProps> = (props) => {
                           <td className="col-index">{i + 1}</td>
                           <td className="col-num">{r.route_short_name ?? r.route_id}</td>
                           <td className="col-operator" title={r.agency_name ?? ""}>{r.agency_name ?? "—"}</td>
-                          <td className="col-trips" title={r.first_time && r.last_time ? `${r.first_time}-${r.last_time}` : "Trip count in selected time window"}>
+                          <td
+                            className="col-trips"
+                            title={
+                              [
+                                r.first_time && r.last_time ? `${r.first_time}-${r.last_time}` : "Trip count in selected time window",
+                                r.time_match_confidence ? `match: ${r.time_match_confidence}` : "",
+                                r.time_match_note ?? "",
+                              ]
+                                .filter(Boolean)
+                                .join(" | ")
+                            }
+                          >
                             {r.trip_count ?? 0}
                           </td>
                           <td className="col-dest" title={destinationLabel(r)}>{destinationLabel(r)}</td>

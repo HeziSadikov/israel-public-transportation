@@ -1,0 +1,15 @@
+{
+  "_comment": "Copy to area_routes_golden_local.json (gitignored) or point AREA_GOLDEN_TRIPS_FILE at your file. trip_id values must exist in your loaded GTFS feed.",
+  "cases": [
+    {
+      "description": "Example: trip that crosses polygon between 08:00-09:00; narrow window should include route",
+      "trip_id": "REPLACE_WITH_REAL_TRIP_ID",
+      "date_ymd": "20260405",
+      "polygon_wkt": "POLYGON ((34.78 32.06, 34.82 32.06, 34.82 32.09, 34.78 32.09, 34.78 32.06))",
+      "start_sec": 25200,
+      "end_sec": 36000,
+      "time_semantics_mode": "pass_through_precise",
+      "expect": "include_route"
+    }
+  ]
+}

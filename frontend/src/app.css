@@ -19,6 +19,8 @@ html, body, #root {
   width: 220px;
   min-width: 220px;
   max-width: 250px;
+  position: relative;
+  z-index: 20;
   background: linear-gradient(180deg, #1e293b 0%, #0f172a 100%);
   padding: 12px 14px;
   box-shadow: 2px 0 8px rgba(0, 0, 0, 0.4);
@@ -52,6 +54,43 @@ html, body, #root {
   letter-spacing: 0.04em;
   color: #94a3b8;
   margin: 0 0 6px 0;
+}
+
+.sidebar-info {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  vertical-align: middle;
+}
+
+.sidebar-info-trigger {
+  width: 16px;
+  height: 16px;
+  border-radius: 999px;
+  border: 1px solid rgba(148, 163, 184, 0.45);
+  background: rgba(30, 41, 59, 0.9);
+  color: #cbd5e1;
+  font-size: 10px;
+  line-height: 1;
+  padding: 0;
+  margin-left: 6px;
+  box-shadow: none;
+}
+
+.sidebar-info-bubble {
+  position: fixed;
+  z-index: 3000;
+  width: max-content;
+  max-width: min(220px, calc(100vw - 24px));
+  box-sizing: border-box;
+  padding: 8px;
+  border-radius: 8px;
+  border: 1px solid rgba(148, 163, 184, 0.4);
+  background: rgba(15, 23, 42, 0.98);
+  color: #cbd5e1;
+  font-size: 0.72rem;
+  text-transform: none;
+  letter-spacing: normal;
 }
 
 .rail-buttons {
@@ -301,7 +340,7 @@ html, body, #root {
   margin: 0;
 }
 
-button {
+.app button {
   background: linear-gradient(to right, #0ea5e9, #22c55e);
   border: none;
   border-radius: 8px;
@@ -314,7 +353,7 @@ button {
   white-space: nowrap;
 }
 
-button:disabled {
+.app button:disabled {
   opacity: 0.5;
   cursor: not-allowed;
   box-shadow: none;
@@ -326,6 +365,7 @@ button:disabled {
   min-height: 0;
   height: 100%;
   position: relative;
+  z-index: 0;
   min-width: 0;
   font-family: Arial, sans-serif;
 }

@@ -1,4 +1,7 @@
 import "./app.css";
+import "./rail.css";
+import "./explorer.css";
+import "./map.css";
 
 import axios from "axios";
 import React, { useEffect, useMemo, useRef, useState } from "react";
@@ -19,7 +22,12 @@ import MapLibreMap, {
 } from "./MapLibreMap";
 import { isGovmapBasemapConfigured } from "./govmapBasemapEnv";
 import { IncidentDetourV2Panel } from "./IncidentDetourV2Panel";
+import { SidebarInfo } from "./SidebarInfo";
 import type { DetourV2ComputeResult } from "./api/detourV2";
+import {
+  coordinatesOutsideIsraelHint,
+  parseLonLatPolygonFromText,
+} from "./parseBlockageCoordinateText";
 
 type StopInfo = {
   stop_id: string;
@@ -68,6 +76,10 @@ type DetourResponse = {
 };
 
 type DetourByAreaMode = "route" | "all";
+type AreaTimeSemanticsMode =
+  | "legacy_trip_overlap"
+  | "pass_through_precise"
+  | "pass_through_stop_proxy";
 
 type DetourByAreaRouteResult = {
   route_id: string;
@@ -180,6 +192,8 @@ const formatYmdInt = (n: number): string => {
 
 const App: React.FC = () => {
   const [blockageGeojson, setBlockageGeojson] = useState<GeoJSON.Geometry | null>(null);
+  /** Paste lon/lat pairs (comma or newline between pairs); applied via «Apply coordinates». */
+  const [blockageCoordinateText, setBlockageCoordinateText] = useState("");
   const [areaStartDate, setAreaStartDate] = useState(() => {
     const d = new Date();
     return `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, "0")}${String(d.getDate()).padStart(2, "0")}`;
@@ -190,6 +204,8 @@ const App: React.FC = () => {
   });
   const [areaStartTime, setAreaStartTime] = useState("04:00");
   const [areaEndTime, setAreaEndTime] = useState("23:59");
+  const [areaTimeSemanticsMode, setAreaTimeSemanticsMode] =
+    useState<AreaTimeSemanticsMode>("legacy_trip_overlap");
   const [areaRoutes, setAreaRoutes] = useState<AreaRouteResult[] | null>(null);
   const [areaLoading, setAreaLoading] = useState(false);
   const [selectedRoute, setSelectedRoute] = useState<RouteInfo | null>(null);
@@ -229,6 +245,7 @@ const App: React.FC = () => {
   const [manualStopBefore, setManualStopBefore] = useState("");
   const [manualStopAfter, setManualStopAfter] = useState("");
   const [showDiagnostics, setShowDiagnostics] = useState(false);
+  const [showAllTurnSteps, setShowAllTurnSteps] = useState(false);
 
   const [explorerOpen, setExplorerOpen] = useState(true);
   const [explorerTab, setExplorerTab] = useState<ExplorerTab>("area");
@@ -278,6 +295,25 @@ const App: React.FC = () => {
       setManualRoadGeoJsonText("");
     }
   };
+
+  const applyBlockageCoordinatesFromText = () => {
+    const parsed = parseLonLatPolygonFromText(blockageCoordinateText);
+    if (!parsed.ok) {
+      setMessage(parsed.error);
+      return;
+    }
+    const ring = parsed.geometry.coordinates[0];
+    const closed =
+      ring.length >= 2 &&
+      ring[0][0] === ring[ring.length - 1][0] &&
+      ring[0][1] === ring[ring.length - 1][1];
+    const vertsForHint = closed ? ring.slice(0, -1) : ring;
+    const hint = coordinatesOutsideIsraelHint(vertsForHint as [number, number][]);
+    mapRef.current?.applyBlockagePolygonToDraw(parsed.geometry);
+    mapRef.current?.fitToBlockage();
+    setMessage(hint ?? null);
+  };
+
   const latestRouteLoadIdRef = useRef(0);
   const stopLinesAbortRef = useRef<AbortController | null>(null);
   const stopLinesRequestIdRef = useRef(0);
@@ -452,6 +488,7 @@ const App: React.FC = () => {
         end_date: areaEndDate.trim(),
         end_time: normalizeHtmlTimeValue(areaEndTime) || "23:59",
         max_results: 200,
+        time_semantics_mode: areaTimeSemanticsMode,
       }, { timeout: 600000, headers: { "Content-Type": "application/json" } });
       setAreaRoutes(res.data.routes);
       if (res.data.routes.length === 0) {
@@ -808,7 +845,7 @@ const App: React.FC = () => {
         body.route_id = selectedRoute.route_id;
         body.direction_id = selectedDirectionId ?? undefined;
       }
-      const res = await axios.post<DetourByAreaResponse>(`${API_BASE}/detours/by-area`, body, {
+      const res = await axios.post<DetourByAreaResponse>(`${API_BASE}/detours/compute`, body, {
         timeout: 120000,
         headers: { "Content-Type": "application/json" },
       });
@@ -944,7 +981,7 @@ const App: React.FC = () => {
       if (turn_by_turn.length) body.turn_by_turn = turn_by_turn;
       if (manualStopBefore.trim()) body.stop_before = manualStopBefore.trim();
       if (manualStopAfter.trim()) body.stop_after = manualStopAfter.trim();
-      const res = await axios.post<DetourByAreaResponse>(`${API_BASE}/detours/by-area`, body, {
+      const res = await axios.post<DetourByAreaResponse>(`${API_BASE}/detours/compute`, body, {
         timeout: 120000,
         headers: { "Content-Type": "application/json" },
       });
@@ -1060,21 +1097,35 @@ const App: React.FC = () => {
         <h1 className="rail-title">Detour Router</h1>
 
         <section className="rail-section time-window-section">
-          <h2 className="rail-heading">Blockage</h2>
-          <div className="rail-buttons">
-            <button type="button" onClick={() => mapRef.current?.startPolygon()} title="Draw polygon blockage">
-              Draw polygon
+          <h2 className="rail-heading">
+            Blockage{" "}
+            <SidebarInfo text="Draw a polygon or paste lon/lat coordinates, then apply them to the map." />
+          </h2>
+          <div className="rail-buttons rail-buttons-iconized">
+            <button
+              type="button"
+              onClick={() => mapRef.current?.startPolygon()}
+              title="Draw polygon blockage"
+              aria-label="Draw polygon blockage"
+            >
+              Draw
             </button>
             <button
               type="button"
               onClick={() => mapRef.current?.editBlockagePolygon()}
               disabled={!blockageGeojson}
               title="Drag vertices to reshape; use Done editing when the Cancel button shows that label."
+              aria-label="Edit blockage polygon"
             >
-              Edit polygon
+              Edit
             </button>
-            <button type="button" onClick={() => mapRef.current?.clearBlockage()} title="Clear blockage">
-              Clear
+            <button
+              type="button"
+              onClick={() => mapRef.current?.clearBlockage()}
+              title="Clear blockage"
+              aria-label="Clear blockage polygon"
+            >
+              CLR
             </button>
             <button
               type="button"
@@ -1086,11 +1137,41 @@ const App: React.FC = () => {
                     ? "Stop drawing (discards in-progress polygon)."
                     : "Cancel drawing or return to map view."
               }
+              aria-label={drawMode === "direct_select" ? "Done editing polygon" : "Cancel drawing"}
             >
-              {drawMode === "direct_select" ? "Done editing" : "Cancel"}
+              {drawMode === "direct_select" ? "Done" : "Esc"}
             </button>
-            <button type="button" onClick={() => mapRef.current?.undoLastPoint()}>Undo</button>
+            <button type="button" onClick={() => mapRef.current?.undoLastPoint()} title="Undo last point" aria-label="Undo last point">
+              Undo
+            </button>
           </div>
+          <details className="rail-advanced">
+            <summary>
+              Coordinates
+              <SidebarInfo text="Paste lon lat pairs and apply with Ctrl+Enter or the button." />
+            </summary>
+            <textarea
+              value={blockageCoordinateText}
+              onChange={(e) => setBlockageCoordinateText(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key !== "Enter") return;
+                if (!e.ctrlKey && !e.metaKey) return;
+                e.preventDefault();
+                applyBlockageCoordinatesFromText();
+              }}
+              placeholder="34.85 32.07, 34.86 32.06, …"
+              rows={3}
+              style={{ width: "100%", marginTop: 6, fontFamily: "monospace", fontSize: 12 }}
+            />
+            <button
+              type="button"
+              style={{ marginTop: 6, width: "100%" }}
+              className="btn-time-preset"
+              onClick={() => applyBlockageCoordinatesFromText()}
+            >
+              Apply coordinates
+            </button>
+          </details>
         </section>
 
         <section className="rail-section time-window-section">
@@ -1153,27 +1234,40 @@ const App: React.FC = () => {
               }}
             />
           </div>
-          <div className="time-window-presets">
-            {timePresets.map((preset) => (
-              <button
-                key={preset.label}
-                type="button"
-                className="btn-time-preset"
-                onClick={() => {
-                  setAreaStartTime(preset.start);
-                  setAreaEndTime(preset.end);
-                }}
-              >
-                {preset.label}
+          <details className="rail-advanced">
+            <summary>Presets</summary>
+            <div className="time-window-presets">
+              {timePresets.map((preset) => (
+                <button
+                  key={preset.label}
+                  type="button"
+                  className="btn-time-preset"
+                  onClick={() => {
+                    setAreaStartTime(preset.start);
+                    setAreaEndTime(preset.end);
+                  }}
+                >
+                  {preset.label}
+                </button>
+              ))}
+              <button type="button" className="btn-time-preset" onClick={() => applyRelativePreset(1)}>
+                +1h
               </button>
-            ))}
-            <button type="button" className="btn-time-preset" onClick={() => applyRelativePreset(1)}>
-              +1h
-            </button>
-            <button type="button" className="btn-time-preset" onClick={() => applyRelativePreset(2)}>
-              +2h
-            </button>
-          </div>
+              <button type="button" className="btn-time-preset" onClick={() => applyRelativePreset(2)}>
+                +2h
+              </button>
+            </div>
+          </details>
+          <label style={{ marginTop: 8 }}>Area-time matching mode</label>
+          <select
+            className="rail-select"
+            value={areaTimeSemanticsMode}
+            onChange={(e) => setAreaTimeSemanticsMode(e.target.value as AreaTimeSemanticsMode)}
+          >
+            <option value="legacy_trip_overlap">Legacy (trip overlaps window)</option>
+            <option value="pass_through_precise">Pass-through (precise interpolation)</option>
+            <option value="pass_through_stop_proxy">Pass-through (stop-time proxy)</option>
+          </select>
           {timeWindowError ? (
             <p className="time-window-validation error">{timeWindowError}</p>
           ) : (
@@ -1182,56 +1276,10 @@ const App: React.FC = () => {
         </section>
 
         <section className="rail-section">
-          <h2 className="rail-heading">Detour</h2>
-          <div className="radio-group">
-            <label>
-              <input type="radio" checked={detourMode === "route"} onChange={() => setDetourMode("route")} />
-              One route
-            </label>
-            <label>
-              <input type="radio" checked={detourMode === "all"} onChange={() => setDetourMode("all")} />
-              All
-            </label>
-          </div>
-          <label style={{ display: "block", marginTop: 8 }}>
-            <input
-              type="checkbox"
-              checked={useOSMDetour}
-              onChange={(e) => setUseOSMDetour(e.target.checked)}
-            />{" "}
-            Use road-network detour (Valhalla)
-          </label>
-          <div className="radio-group" style={{ marginTop: 8 }}>
-            <span className="rail-label-small" style={{ display: "block", marginBottom: 4 }}>
-              GTFS graph routing
-            </span>
-            <label>
-              <input
-                type="radio"
-                name="detour-routing-engine"
-                checked={detourRoutingEngine === "astar"}
-                onChange={() => setDetourRoutingEngine("astar")}
-              />{" "}
-              A* (default)
-            </label>
-            <label>
-              <input
-                type="radio"
-                name="detour-routing-engine"
-                checked={detourRoutingEngine === "dijkstra"}
-                onChange={() => setDetourRoutingEngine("dijkstra")}
-              />{" "}
-              Dijkstra
-            </label>
-          </div>
-          <button
-            type="button"
-            className="btn-compute"
-            onClick={handleComputeDetour}
-            disabled={detourLoading || !blockageGeojson || !isTimeWindowValid}
-          >
-            {detourLoading ? "Computing…" : "Compute detour"}
-          </button>
+          <h2 className="rail-heading">
+            Detour{" "}
+            <SidebarInfo text="Detour compute now runs through v2 incident + compute flow only." />
+          </h2>
           <IncidentDetourV2Panel
             blockageGeojson={blockageGeojson}
             startDateYmd={areaStartDate.trim()}
@@ -1241,179 +1289,24 @@ const App: React.FC = () => {
             selectedRoute={selectedRoute}
             onV2Computed={handleV2Computed}
           />
-          <button
-            type="button"
-            className="btn-time-preset"
-            style={{ marginTop: 8, width: "100%" }}
-            onClick={() => setManualDetourOpen((o) => !o)}
-          >
-            {manualDetourOpen ? "Hide manual street detour" : "Manual street detour (after compute)"}
-          </button>
-          {manualDetourOpen && (
-            <div className="manual-detour-panel" style={{ marginTop: 10 }}>
-              <label className="rail-label-small">Turn-by-turn (Hebrew — separate steps with commas)</label>
-              <textarea
-                value={instructionsTextHe}
-                onChange={(e) => setInstructionsTextHe(e.target.value)}
-                dir="rtl"
-                placeholder="תמשיך ישר בבלפור, שמאלה בישראל בן ציון, …"
-                rows={5}
-                style={{ width: "100%", fontSize: 14 }}
-              />
-              <p className="hint" style={{ marginTop: 4 }}>
-                Hebrew text is for passenger instructions only — it does not draw a line. Under Advanced, use
-                &quot;Draw detour path on map&quot; (or paste GeoJSON) to show the detour on the map and enable
-                Remember with blockage checks.
-              </p>
-              <label className="rail-label-small">Entry / exit stop IDs (optional, must match failed compute)</label>
-              <input
-                type="text"
-                placeholder="stop_before"
-                value={manualStopBefore}
-                onChange={(e) => setManualStopBefore(e.target.value)}
-                style={{ width: "100%", marginBottom: 4 }}
-              />
-              <input
-                type="text"
-                placeholder="stop_after"
-                value={manualStopAfter}
-                onChange={(e) => setManualStopAfter(e.target.value)}
-                style={{ width: "100%", marginBottom: 8 }}
-              />
-              <button
-                type="button"
-                className="btn-time-preset"
-                style={{ marginBottom: 8 }}
-                onClick={() => setManualGeoAdvancedOpen((o) => !o)}
-              >
-                {manualGeoAdvancedOpen ? "Hide advanced (GeoJSON / per-step)" : "Advanced: road GeoJSON or per-step rows"}
-              </button>
-              {manualGeoAdvancedOpen && (
-                <>
-                  <div className="rail-buttons" style={{ marginBottom: 8, flexWrap: "wrap" }}>
-                    <button
-                      type="button"
-                      onClick={() => mapRef.current?.startDrawDetourLine()}
-                      title="Click the map to add vertices; double-click or Enter to finish"
-                    >
-                      Draw detour path on map
-                    </button>
-                    <button type="button" onClick={() => mapRef.current?.clearManualDetourLine()}>
-                      Clear drawn path
-                    </button>
-                  </div>
-                  <label className="rail-label-small">Road geometry (GeoJSON LineString, lon/lat) — optional paste</label>
-                  <textarea
-                    value={manualRoadGeoJsonText}
-                    onChange={(e) => {
-                      const v = e.target.value;
-                      setManualRoadGeoJsonText(v);
-                      const t = v.trim();
-                      if (!t) {
-                        setManualDetourDraftLine(null);
-                        mapRef.current?.applyManualDetourLineToDraw(null);
-                        return;
-                      }
-                      try {
-                        const parsed = JSON.parse(t) as unknown;
-                        if (
-                          parsed &&
-                          typeof parsed === "object" &&
-                          (parsed as GeoJSON.LineString).type === "LineString"
-                        ) {
-                          const ls = parsed as GeoJSON.LineString;
-                          if (ls.coordinates && ls.coordinates.length >= 2) {
-                            setManualDetourDraftLine(ls);
-                            mapRef.current?.applyManualDetourLineToDraw(ls);
-                          }
-                        }
-                      } catch {
-                        /* invalid while typing */
-                      }
-                    }}
-                    placeholder='{"type":"LineString","coordinates":[[34.8,32.0],[34.81,32.01]]}'
-                    rows={4}
-                    style={{ width: "100%", fontFamily: "monospace", fontSize: 12 }}
-                  />
-                  <div style={{ marginTop: 8 }}>
-                    <span className="rail-label-small">Optional per-step rows (Hebrew / English)</span>
-                    {manualTurnRows.map((row, i) => (
-                      <div key={i} style={{ display: "flex", gap: 6, marginTop: 4, flexDirection: "column" }}>
-                        <input
-                          type="text"
-                          dir="rtl"
-                          placeholder="הוראה בעברית"
-                          value={row.instruction_he}
-                          onChange={(e) => {
-                            const next = [...manualTurnRows];
-                            next[i] = { ...next[i], instruction_he: e.target.value };
-                            setManualTurnRows(next);
-                          }}
-                        />
-                        <input
-                          type="text"
-                          placeholder="English instruction"
-                          value={row.instruction_en}
-                          onChange={(e) => {
-                            const next = [...manualTurnRows];
-                            next[i] = { ...next[i], instruction_en: e.target.value };
-                            setManualTurnRows(next);
-                          }}
-                        />
-                      </div>
-                    ))}
-                    <button
-                      type="button"
-                      className="btn-time-preset"
-                      style={{ marginTop: 6 }}
-                      onClick={() =>
-                        setManualTurnRows([...manualTurnRows, { instruction_he: "", instruction_en: "" }])
-                      }
-                    >
-                      + Step
-                    </button>
-                  </div>
-                </>
-              )}
-              <label style={{ display: "block", marginTop: 8 }}>
-                <input
-                  type="checkbox"
-                  checked={rememberStreetOverride}
-                  onChange={(e) => setRememberStreetOverride(e.target.checked)}
-                />{" "}
-                Remember for this blockage (server)
-              </label>
-              <button
-                type="button"
-                className="btn-compute"
-                style={{ marginTop: 10, width: "100%" }}
-                onClick={handleApplyManualStreetDetour}
-                disabled={detourLoading || !blockageGeojson || !isTimeWindowValid || !selectedRoute}
-              >
-                Apply manual detour
-              </button>
-              <p className="hint" style={{ marginTop: 6 }}>
-                Use “One route” mode. Text-only saves narrative for replay; drawn road (Advanced) is used for map fit and
-                blockage-safe Remember.
-              </p>
-            </div>
-          )}
         </section>
 
         <section className="rail-section">
-          <h2 className="rail-heading">Sort by</h2>
-          <select
-            value={sortBy}
-            onChange={(e) => setSortBy(e.target.value as ExplorerSortBy)}
-            className="rail-select"
-          >
-            <option value="line_asc">Line number (small to big)</option>
-            <option value="line_desc">Line number (big to small)</option>
-            <option value="agency_asc">Agency (A to Z)</option>
-            <option value="agency_desc">Agency (Z to A)</option>
-            <option value="trips_desc">Trips count (high to low)</option>
-            <option value="destination_asc">Destination (A to Z)</option>
-          </select>
+          <details className="rail-advanced">
+            <summary>List sorting</summary>
+            <select
+              value={sortBy}
+              onChange={(e) => setSortBy(e.target.value as ExplorerSortBy)}
+              className="rail-select"
+            >
+              <option value="line_asc">Line number (small to big)</option>
+              <option value="line_desc">Line number (big to small)</option>
+              <option value="agency_asc">Agency (A to Z)</option>
+              <option value="agency_desc">Agency (Z to A)</option>
+              <option value="trips_desc">Trips count (high to low)</option>
+              <option value="destination_asc">Destination (A to Z)</option>
+            </select>
+          </details>
         </section>
 
         <section className="rail-section">
@@ -1440,52 +1333,55 @@ const App: React.FC = () => {
             </option>
             <option value="vector_liberty">Vector Liberty (OpenFreeMap)</option>
           </select>
-          <label style={{ display: "block", marginTop: 8 }}>
-            <input
-              type="checkbox"
-              checked={showAllRoutesLayer}
-              onChange={(e) => setShowAllRoutesLayer(e.target.checked)}
-            />{" "}
-            Show all routes
-          </label>
-          <label style={{ display: "block", marginTop: 6 }}>All-routes scope</label>
-          <select
-            className="rail-select"
-            value={allRoutesScope}
-            onChange={(e) => setAllRoutesScope(e.target.value as AllRoutesScope)}
-          >
-            <option value="all">All feed routes</option>
-            <option value="time_window">Active in time window</option>
-          </select>
-          <label style={{ display: "block", marginTop: 6 }}>All-routes mode</label>
-          <select
-            className="rail-select"
-            value={allRoutesRenderMode}
-            onChange={(e) => setAllRoutesRenderMode(e.target.value as AllRoutesRenderMode)}
-          >
-            <option value="balanced">Balanced</option>
-            <option value="always_visible">Always visible</option>
-          </select>
-          <label style={{ display: "block", marginTop: 8 }}>
-            <input
-              type="checkbox"
-              checked={showRoutesHeatLayer}
-              onChange={(e) => setShowRoutesHeatLayer(e.target.checked)}
-              disabled={!showAllRoutesLayer}
-            />{" "}
-            Show overlap heat
-          </label>
-          <div className="rail-buttons">
-            <button type="button" onClick={() => mapRef.current?.fitToBlockage()} disabled={!blockageGeojson}>
-              Fit blockage
+          <div className="rail-buttons rail-buttons-iconized">
+            <button type="button" onClick={() => mapRef.current?.fitToBlockage()} disabled={!blockageGeojson} title="Fit blockage" aria-label="Fit to blockage">
+              Fit B
             </button>
-            <button type="button" onClick={() => mapRef.current?.fitToRoute()} disabled={!routeGeojson}>
-              Fit route
+            <button type="button" onClick={() => mapRef.current?.fitToRoute()} disabled={!routeGeojson} title="Fit route" aria-label="Fit to route">
+              Fit R
             </button>
-            <button type="button" onClick={() => mapRef.current?.fitToDetour()} disabled={!detour}>
-              Fit detour
+            <button type="button" onClick={() => mapRef.current?.fitToDetour()} disabled={!detour} title="Fit detour" aria-label="Fit to detour">
+              Fit D
             </button>
           </div>
+          <details className="rail-advanced" style={{ marginTop: 8 }}>
+            <summary>Advanced map layers</summary>
+            <label style={{ display: "block", marginTop: 8 }}>
+              <input
+                type="checkbox"
+                checked={showAllRoutesLayer}
+                onChange={(e) => setShowAllRoutesLayer(e.target.checked)}
+              />{" "}
+              Show all routes
+            </label>
+            <label style={{ display: "block", marginTop: 6 }}>All-routes scope</label>
+            <select
+              className="rail-select"
+              value={allRoutesScope}
+              onChange={(e) => setAllRoutesScope(e.target.value as AllRoutesScope)}
+            >
+              <option value="all">All feed routes</option>
+              <option value="time_window">Active in time window</option>
+            </select>
+            <label style={{ display: "block", marginTop: 6 }}>All-routes mode</label>
+            <select
+              className="rail-select"
+              value={allRoutesRenderMode}
+              onChange={(e) => setAllRoutesRenderMode(e.target.value as AllRoutesRenderMode)}
+            >
+              <option value="balanced">Balanced</option>
+              <option value="always_visible">Always visible</option>
+            </select>
+            <label style={{ display: "block", marginTop: 8 }}>
+              <input
+                type="checkbox"
+                checked={showRoutesHeatLayer}
+                onChange={(e) => setShowRoutesHeatLayer(e.target.checked)}
+                disabled={!showAllRoutesLayer}
+              />{" "}
+              Show overlap heat
+            </label>
+          </details>
         </section>
 
         <section className="rail-section">
@@ -1546,22 +1442,25 @@ const App: React.FC = () => {
         )}
         {detour?.turn_by_turn && detour.turn_by_turn.length > 0 && (
           <section className="rail-section">
-            <h2 className="rail-heading">Turn-by-turn</h2>
-            {detour.from_override && (
-              <p className="hint" style={{ marginBottom: 6 }}>
-                Saved street override
-              </p>
-            )}
-            <ol className="turn-by-turn-list" style={{ paddingInlineStart: 20, fontSize: 13 }}>
-              {detour.turn_by_turn.map((s, i) => (
-                <li key={i} style={{ marginBottom: 6 }}>
-                  {(s.instruction_he || "").trim() || (s.instruction_en || "").trim() || s.street || "—"}
-                  {(s.instruction_he || "").trim() && (s.instruction_en || "").trim() ? (
-                    <div style={{ opacity: 0.85, fontSize: 12 }}>{s.instruction_en}</div>
-                  ) : null}
-                </li>
-              ))}
-            </ol>
+            <details className="rail-advanced">
+              <summary>Turn-by-turn</summary>
+              {detour.from_override && <div className="rail-label-small">Saved street override</div>}
+              <ol className="turn-by-turn-list" style={{ paddingInlineStart: 20, fontSize: 13 }}>
+                {(showAllTurnSteps ? detour.turn_by_turn : detour.turn_by_turn.slice(0, 4)).map((s, i) => (
+                  <li key={i} style={{ marginBottom: 6 }}>
+                    {(s.instruction_he || "").trim() || (s.instruction_en || "").trim() || s.street || "—"}
+                    {(s.instruction_he || "").trim() && (s.instruction_en || "").trim() ? (
+                      <div style={{ opacity: 0.85, fontSize: 12 }}>{s.instruction_en}</div>
+                    ) : null}
+                  </li>
+                ))}
+              </ol>
+              {detour.turn_by_turn.length > 4 && (
+                <button type="button" className="btn-time-preset" onClick={() => setShowAllTurnSteps((v) => !v)}>
+                  {showAllTurnSteps ? "Show less" : "Show all steps"}
+                </button>
+              )}
+            </details>
           </section>
         )}
       </aside>

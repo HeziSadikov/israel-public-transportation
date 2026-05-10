@@ -37,14 +37,7 @@ from backend.domain.router_core import (
     routing_edge_weight,
 )
 from backend.domain.detour_graph import build_detour_graph, default_detour_graph_params
-from backend.domain.detour_service import (
-    compute_detour,
-    compute_detour_with_strategies,
-    DetourComputeInput,
-    DetourComputeError,
-    DetourComputeResult,
-)
-from backend.domain.routing_policy import default_by_area_routing_policy, by_area_policy_profile
+from backend.domain.routing_policy import default_by_area_routing_policy
 from backend.adapters.osm_detour import route_avoiding_polygon, evaluate_road_feasibility_for_candidate
 from backend.domain.detour_geo_validation import (
     road_geojson_clear_of_blockage,
@@ -74,8 +67,6 @@ from backend.mcp_server.schemas.api_models import (
     GraphBuildResponse,
     GraphStopsResponse,
     GraphStopsResponseStop,
-    DetourRequest,
-    DetourResponse,
     AreaRoutesQuery,
     AreaRoutesResponse,
     AreaRouteResult,
@@ -84,10 +75,7 @@ from backend.mcp_server.schemas.api_models import (
     StopRoutesResponse,
     StopRouteResult,
     StopSearchResult,
-    DetourByAreaRequest,
-    DetourByAreaResponse,
     DetourByAreaRouteResult,
-    DetourByAreaMode,
     DetourTurnStep,
     GeocodeResult,
     IncidentCreateRequest,
@@ -145,14 +133,6 @@ GRAPH_WARMUP_STATUS: Dict[str, object] = {
 def create_app() -> FastAPI:
     """Compatibility app factory used by transport wrappers."""
     return app
-
-
-def _manual_steps_from_detour_request(req: DetourRequest) -> List[Dict[str, Any]]:
-    if req.turn_by_turn:
-        return [s.model_dump(exclude_none=True) for s in req.turn_by_turn]
-    if req.instructions_text_he and str(req.instructions_text_he).strip():
-        return instructions_text_he_to_steps(req.instructions_text_he)
-    return []
 
 
 def _resolve_route_sig_hash(
@@ -1325,600 +1305,6 @@ def graph_stops(
         f"route_id={route_id} dir={direction_id} hit={cache_hit} elapsed_ms={elapsed:.1f}",
     )
     return GraphStopsResponse(pattern_id=chosen.pattern_id, stops=res_stops)
-
-
-@app.post("/api/v1/detour", response_model=DetourResponse)
-def detour(req: DetourRequest):
-    blockage_geojson = _ensure_geometry(req.blockage_geojson)
-    date_str = req.date or datetime.utcnow().strftime("%Y%m%d")
-
-    log(
-        "detour",
-        f"route_id={req.route_id!r}, direction_id={req.direction_id!r}, "
-        f"date={date_str}, start_stop_id={req.start_stop_id!r}, "
-        f"end_stop_id={req.end_stop_id!r}",
-    )
-
-    candidate_keys = _graph_cache_keys_for_lookup(
-        req.route_id, req.direction_id, date_str
-    )
-    cache = None
-    cache_key_used = None
-    for key in candidate_keys:
-        if key in GRAPH_CACHE:
-            cache = GRAPH_CACHE[key]
-            cache_key_used = key
-            break
-    if cache is None:
-        log(
-            "detour",
-            f"error route_id={req.route_id!r}, direction_id={req.direction_id!r}, "
-            "reason=graph_cache_miss",
-        )
-        raise HTTPException(
-            status_code=400,
-            detail="Graph not built yet; call /graph/build first.",
-        )
-    feed_version = cache_key_used.split("|")[0] if cache_key_used else ""
-    try:
-        feed = load_active_feed()
-    except Exception:
-        feed = None
-
-    start_sec: Optional[int] = None
-    end_sec: Optional[int] = None
-    st_in = (req.start_time or "").strip()
-    et_in = (req.end_time or "").strip()
-    if st_in or et_in:
-        start_sec = _parse_hhmm_to_seconds(st_in) if st_in else 0
-        end_sec = _parse_hhmm_to_seconds(et_in) if et_in else 27 * 3600
-
-    feed_id_pt: Optional[int] = None
-    try:
-        feed_id_pt = db_access_module.get_active_feed_id()
-    except Exception:
-        feed_id_pt = None
-    route_sig_pt = (
-        _resolve_route_sig_hash(feed_id_pt, req.route_id, req.direction_id)
-        if feed_id_pt is not None
-        else None
-    ) or ""
-
-    turn_dicts = None
-    if req.turn_by_turn:
-        turn_dicts = [s.model_dump(exclude_none=True) for s in req.turn_by_turn]
-
-    base_inp = DetourComputeInput(
-        route_id=req.route_id,
-        direction_id=req.direction_id,
-        date_str=date_str,
-        start_stop_id=req.start_stop_id,
-        end_stop_id=req.end_stop_id,
-        blockage_geojson=blockage_geojson,
-        cache_graph=cache["graph"],
-        cache_edge_geometries=cache["edge_geometries"],
-        used_shape=cache["used_shape"],
-        used_osm_snapping=cache["used_osm_snapping"],
-        feed_version=feed_version,
-        feed=feed,
-        start_sec=start_sec,
-        end_sec=end_sec,
-        feed_id=feed_id_pt,
-        route_sig_hash=route_sig_pt,
-        detour_road_geojson=req.detour_road_geojson,
-        turn_by_turn=turn_dicts,
-        instructions_text_he=req.instructions_text_he,
-        remember_override=bool(req.remember_override),
-        routing_engine=req.routing_engine,
-    )
-
-    def _osm_strategy(inp: DetourComputeInput) -> Optional[DetourComputeResult]:
-        if not (HYBRID_DETOUR_ENABLED and VALHALLA_URL and VALHALLA_URL.strip()):
-            return None
-        try:
-            osm_res = detour_osm(req)
-        except HTTPException:
-            return None
-        tbt = [x.model_dump(exclude_none=True) for x in (osm_res.turn_by_turn or [])]
-        return DetourComputeResult(
-            blocked_edges_count=osm_res.blocked_edges_count,
-            stop_path=list(osm_res.stop_path),
-            path_geojson=dict(osm_res.path_geojson),
-            blocked_edges_geojson=dict(osm_res.blocked_edges_geojson),
-            total_travel_time_s=osm_res.total_travel_time_s,
-            total_distance_m=osm_res.total_distance_m,
-            baseline_travel_time_s=osm_res.baseline_travel_time_s,
-            baseline_distance_m=osm_res.baseline_distance_m,
-            detour_delay_s=osm_res.detour_delay_s,
-            detour_extra_distance_m=osm_res.detour_extra_distance_m,
-            used_shape=osm_res.used_shape,
-            used_osm_snapping=osm_res.used_osm_snapping,
-            feed_version=osm_res.feed_version,
-            turn_by_turn=tbt or None,
-            from_override=bool(getattr(osm_res, "from_override", False)),
-            instructions_only=bool(getattr(osm_res, "instructions_only", False)),
-            reason_code=getattr(osm_res, "reason_code", None) or "osm_hybrid_path_found",
-            strategy_used=getattr(osm_res, "strategy_used", None) or "osm_hybrid",
-            confidence=getattr(osm_res, "confidence", None) or 0.9,
-            diagnostics=getattr(osm_res, "diagnostics", None),
-        )
-
-    try:
-        result = compute_detour_with_strategies(
-            base_inp,
-            osm_strategy=_osm_strategy,
-            prefer_osm=True,
-        )
-    except DetourComputeError as e:
-        log(
-            "detour",
-            f"error route_id={req.route_id!r}, direction_id={req.direction_id!r}, "
-            f"status_code={e.status_code} reason={e.detail!r}",
-        )
-        raise HTTPException(status_code=e.status_code, detail=e.detail)
-
-    tt_log = (
-        f"{result.total_travel_time_s:.1f}"
-        if result.total_travel_time_s is not None
-        else "N/A"
-    )
-    log(
-        "detour",
-        f"result route_id={req.route_id!r}, direction_id={req.direction_id!r}, "
-        f"blocked_edges={result.blocked_edges_count}, "
-        f"stop_path_len={len(result.stop_path)}, "
-        f"total_travel_time_s={tt_log}, "
-        f"baseline_travel_time_s={result.baseline_travel_time_s if result.baseline_travel_time_s is not None else 'N/A'}",
-    )
-
-    tbt = None
-    raw_turns = getattr(result, "turn_by_turn", None)
-    if raw_turns:
-        tbt = [DetourTurnStep.model_validate(x) for x in raw_turns]
-
-    return DetourResponse(
-        blocked_edges_count=result.blocked_edges_count,
-        stop_path=result.stop_path,
-        path_geojson=result.path_geojson,
-        blocked_edges_geojson=result.blocked_edges_geojson,
-        total_travel_time_s=result.total_travel_time_s,
-        total_distance_m=result.total_distance_m,
-        baseline_travel_time_s=result.baseline_travel_time_s,
-        baseline_distance_m=result.baseline_distance_m,
-        detour_delay_s=result.detour_delay_s,
-        detour_extra_distance_m=result.detour_extra_distance_m,
-        used_shape=result.used_shape,
-        used_osm_snapping=result.used_osm_snapping,
-        feed_version=result.feed_version,
-        turn_by_turn=tbt,
-        from_override=bool(getattr(result, "from_override", False)),
-        instructions_only=bool(getattr(result, "instructions_only", False)),
-        reason_code=getattr(result, "reason_code", None),
-        strategy_used=getattr(result, "strategy_used", None),
-        confidence=getattr(result, "confidence", None),
-        diagnostics=getattr(result, "diagnostics", None),
-    )
-
-
-@app.post("/api/v1/detour/osm", response_model=DetourResponse)
-def detour_osm(req: DetourRequest):
-    """
-    Experimental: compute the detour segment on the OSM/Valhalla road graph.
-
-    Flow:
-    - Use the cached single-route GTFS graph to:
-      - compute the baseline stop-to-stop path
-      - detect which baseline edges are blocked by the polygon
-      - locate the last unblocked stop before the blockage and the first after
-    - Ask Valhalla /route with exclude_polygons so the road-level path between
-      those two stops avoids the blockage.
-    - Splice: GTFS edges before + OSM detour polyline + GTFS edges after.
-    """
-    if not VALHALLA_URL or not VALHALLA_URL.strip():
-        raise HTTPException(
-            status_code=503,
-            detail="VALHALLA_URL is not configured; OSM-based detours are unavailable.",
-        )
-
-    blockage_geojson = _ensure_geometry(req.blockage_geojson)
-    date_str = req.date or datetime.utcnow().strftime("%Y%m%d")
-
-    # Graph must have been built earlier with /graph/build.
-    candidate_keys = _graph_cache_keys_for_lookup(
-        req.route_id, req.direction_id, date_str
-    )
-    cache = None
-    for key in candidate_keys:
-        if key in GRAPH_CACHE:
-            cache = GRAPH_CACHE[key]
-            break
-    if cache is None:
-        raise HTTPException(
-            status_code=400,
-            detail="Graph not built yet; call /graph/build first.",
-        )
-
-    graph = cache["graph"]
-    edge_geometries = cache["edge_geometries"]
-    used_shape = cache["used_shape"]
-    used_osm_snapping = cache["used_osm_snapping"]
-    feed_version = cache.get("date", "")
-
-    # Resolve physical stop_ids to node_ids on the single-route graph.
-    start_node = next(
-        (n for n in graph.nodes() if graph.nodes[n].get("stop_id") == req.start_stop_id),
-        None,
-    )
-    end_node = next(
-        (n for n in graph.nodes() if graph.nodes[n].get("stop_id") == req.end_stop_id),
-        None,
-    )
-    if not start_node or not end_node:
-        raise HTTPException(
-            status_code=400,
-            detail="start_stop_id or end_stop_id not found in graph.",
-        )
-
-    # Baseline path on the GTFS graph (no blocking yet).
-    try:
-        baseline_path = astar_route(
-            graph=graph,
-            edge_geometries=edge_geometries,
-            start_node_id=start_node,
-            end_node_id=end_node,
-            blocked_edges=set(),
-        )
-    except Exception:
-        raise HTTPException(
-            status_code=409,
-            detail="No baseline path found between the selected stops.",
-        )
-
-    # Identify which edges of the baseline path are blocked by the polygon.
-    blocked_edges, blocked_edges_geojson = compute_blocked_edges(
-        edge_geometries=edge_geometries, blockage_geojson=blockage_geojson
-    )
-    if not blocked_edges:
-        # Nothing on the baseline path is actually blocked; return the baseline GTFS path.
-        path = [graph.nodes[n]["stop_id"] for n in baseline_path]
-        path_geojson = collect_path_geojson(
-            edge_geometries=edge_geometries,
-            path=baseline_path,
-        )
-        total_travel_time_s = 0.0
-        total_distance_m = 0.0
-        for i in range(len(baseline_path) - 1):
-            u, v = baseline_path[i], baseline_path[i + 1]
-            ed = graph.get_edge_data(u, v, default={})
-            total_travel_time_s += float(ed.get("travel_time_s", 0.0))
-            total_distance_m += float(ed.get("distance_m", 0.0))
-        return DetourResponse(
-            blocked_edges_count=0,
-            stop_path=path,
-            path_geojson=path_geojson,
-            blocked_edges_geojson=blocked_edges_geojson,
-            total_travel_time_s=total_travel_time_s,
-            total_distance_m=total_distance_m,
-            baseline_travel_time_s=total_travel_time_s,
-            baseline_distance_m=total_distance_m,
-            detour_delay_s=0.0,
-            detour_extra_distance_m=0.0,
-            used_shape=used_shape,
-            used_osm_snapping=used_osm_snapping,
-            feed_version=str(feed_version),
-            instructions_only=False,
-            reason_code="route_not_affected",
-            strategy_used="baseline_gtfs",
-            confidence=1.0,
-            diagnostics={"blocked_edges": 0},
-        )
-
-    # Find first and last indices on the baseline path that correspond to blocked edges.
-    i_first: Optional[int] = None
-    i_last: Optional[int] = None
-    for i in range(len(baseline_path) - 1):
-        uv = (baseline_path[i], baseline_path[i + 1])
-        if uv in blocked_edges:
-            if i_first is None:
-                i_first = i
-            i_last = i
-    if i_first is None or i_last is None:
-        raise HTTPException(
-            status_code=409,
-            detail="Could not locate a blocked span on the baseline path.",
-        )
-
-    # Stops immediately before and after the blocked span.
-    stop_before = baseline_path[i_first]
-    stop_after = baseline_path[i_last + 1]
-    na = graph.nodes.get(stop_before, {})
-    nb = graph.nodes.get(stop_after, {})
-    lon_a, lat_a = na.get("lon"), na.get("lat")
-    lon_b, lat_b = nb.get("lon"), nb.get("lat")
-    if None in (lon_a, lat_a, lon_b, lat_b):
-        raise HTTPException(
-            status_code=500,
-            detail="Could not resolve coordinates for entry/exit stops of the blocked span.",
-        )
-
-    baseline_travel_time_s = 0.0
-    baseline_distance_m = 0.0
-    for i in range(len(baseline_path) - 1):
-        u, v = baseline_path[i], baseline_path[i + 1]
-        ed = graph.get_edge_data(u, v, default={})
-        baseline_travel_time_s += float(ed.get("travel_time_s", 0.0))
-        baseline_distance_m += float(ed.get("distance_m", 0.0))
-
-    from shapely.geometry import LineString
-
-    parts = []
-    for i in range(i_first, i_last + 1):
-        u, v = baseline_path[i], baseline_path[i + 1]
-        eg = edge_geometries.get((u, v))
-        if eg and eg.linestring and len(eg.linestring.coords) >= 2:
-            parts.append(eg.linestring)
-    segment_line = None
-    if parts:
-        try:
-            coords = []
-            for ls in parts:
-                coords.extend(ls.coords)
-            segment_line = LineString(coords)
-        except Exception:
-            segment_line = parts[0]
-
-    hybrid_seg = _hybrid_osm_detour_segment(
-        blockage_geojson=blockage_geojson,
-        segment_line=segment_line,
-        fallback_from_pt=(float(lon_a), float(lat_a)),
-        fallback_to_pt=(float(lon_b), float(lat_b)),
-    )
-    if not hybrid_seg:
-        feed_id_ov: Optional[int] = None
-        try:
-            feed_id_ov = db_access_module.get_active_feed_id()
-        except Exception:
-            pass
-        sig_ov = (
-            _resolve_route_sig_hash(feed_id_ov, req.route_id, req.direction_id)
-            if feed_id_ov is not None
-            else None
-        ) or ""
-        bh_ov = db_access_module.hash_geojson_canonical(blockage_geojson)
-        steps_try = _manual_steps_from_detour_request(req)
-        road_try: Optional[Dict] = None
-        from_stored = False
-        if (
-            req.detour_road_geojson
-            and road_geojson_has_routable_geometry(req.detour_road_geojson)
-            and road_geojson_clear_of_blockage(req.detour_road_geojson, blockage_geojson)
-        ):
-            road_try = req.detour_road_geojson
-        elif feed_id_ov is not None:
-            okey = db_access_module.build_street_override_key(
-                "point",
-                req.route_id,
-                req.direction_id,
-                bh_ov,
-                req.start_stop_id,
-                req.end_stop_id,
-                sig_ov,
-            )
-            try:
-                stored_ov = db_access_module.get_detour_street_override_pg(feed_id_ov, okey)
-            except Exception:
-                stored_ov = None
-            if stored_ov:
-                sr = stored_ov["road_geojson"]
-                st_steps = list(stored_ov.get("turn_by_turn") or [])
-                if road_geojson_has_routable_geometry(sr) and road_geojson_clear_of_blockage(
-                    sr, blockage_geojson
-                ):
-                    road_try = sr
-                    if st_steps:
-                        steps_try = st_steps
-                    from_stored = True
-                elif st_steps and not road_geojson_has_routable_geometry(sr):
-                    return build_detour_response_instructions_only(
-                        st_steps,
-                        blocked_edges_count=len(blocked_edges),
-                        blocked_edges_geojson=blocked_edges_geojson,
-                        stop_path=[req.start_stop_id, req.end_stop_id],
-                        baseline_travel_time_s=baseline_travel_time_s,
-                        baseline_distance_m=baseline_distance_m,
-                        used_shape=used_shape,
-                        used_osm_snapping=used_osm_snapping,
-                        feed_version=str(feed_version),
-                        from_override=True,
-                    )
-        if road_try and road_geojson_clear_of_blockage(road_try, blockage_geojson):
-            if (
-                req.remember_override
-                and feed_id_ov is not None
-                and req.detour_road_geojson
-                and road_geojson_has_routable_geometry(req.detour_road_geojson)
-            ):
-                try:
-                    db_access_module.save_detour_street_override_pg(
-                        feed_id_ov,
-                        db_access_module.build_street_override_key(
-                            "point",
-                            req.route_id,
-                            req.direction_id,
-                            bh_ov,
-                            req.start_stop_id,
-                            req.end_stop_id,
-                            sig_ov,
-                        ),
-                        "point",
-                        req.route_id,
-                        req.direction_id,
-                        bh_ov,
-                        req.start_stop_id,
-                        req.end_stop_id,
-                        sig_ov,
-                        req.detour_road_geojson,
-                        steps_try,
-                    )
-                except Exception:
-                    pass
-            return build_detour_response_from_road_override(
-                road_try,
-                steps_try,
-                blocked_edges_count=len(blocked_edges),
-                blocked_edges_geojson=blocked_edges_geojson,
-                stop_path=[req.start_stop_id, req.end_stop_id],
-                baseline_travel_time_s=baseline_travel_time_s,
-                baseline_distance_m=baseline_distance_m,
-                used_shape=used_shape,
-                used_osm_snapping=used_osm_snapping,
-                feed_version=str(feed_version),
-                from_override=from_stored,
-            )
-        if steps_try:
-            if req.remember_override and feed_id_ov is not None:
-                try:
-                    db_access_module.save_detour_street_override_pg(
-                        feed_id_ov,
-                        db_access_module.build_street_override_key(
-                            "point",
-                            req.route_id,
-                            req.direction_id,
-                            bh_ov,
-                            req.start_stop_id,
-                            req.end_stop_id,
-                            sig_ov,
-                        ),
-                        "point",
-                        req.route_id,
-                        req.direction_id,
-                        bh_ov,
-                        req.start_stop_id,
-                        req.end_stop_id,
-                        sig_ov,
-                        {"type": "LineString", "coordinates": []},
-                        steps_try,
-                    )
-                except Exception:
-                    pass
-            return build_detour_response_instructions_only(
-                steps_try,
-                blocked_edges_count=len(blocked_edges),
-                blocked_edges_geojson=blocked_edges_geojson,
-                stop_path=[req.start_stop_id, req.end_stop_id],
-                baseline_travel_time_s=baseline_travel_time_s,
-                baseline_distance_m=baseline_distance_m,
-                used_shape=used_shape,
-                used_osm_snapping=used_osm_snapping,
-                feed_version=str(feed_version),
-                from_override=False,
-            )
-        raise HTTPException(
-            status_code=409,
-            detail="Valhalla could not compute a detour around the blockage.",
-        )
-
-    from shapely.geometry import mapping
-
-    # Splice GTFS edges before + OSM detour segment + GTFS edges after into one FeatureCollection.
-    features = []
-    # GTFS before
-    for i in range(i_first):
-        u, v = baseline_path[i], baseline_path[i + 1]
-        eg = edge_geometries.get((u, v))
-        if eg:
-            features.append(
-                {
-                    "type": "Feature",
-                    "geometry": mapping(eg.linestring),
-                    "properties": {
-                        "from_stop_id": eg.from_stop_id,
-                        "to_stop_id": eg.to_stop_id,
-                    },
-                }
-            )
-    # OSM detour: intersection-aware bypass segment.
-    detour_coords = list(hybrid_seg["detour_coords"])
-    features.append(
-        {
-            "type": "Feature",
-            "geometry": {"type": "LineString", "coordinates": detour_coords},
-            "properties": {"kind": "osm_detour", "hybrid": True},
-        }
-    )
-    # GTFS after
-    for i in range(i_last + 1, len(baseline_path) - 1):
-        u, v = baseline_path[i], baseline_path[i + 1]
-        eg = edge_geometries.get((u, v))
-        if eg:
-            features.append(
-                {
-                    "type": "Feature",
-                    "geometry": mapping(eg.linestring),
-                    "properties": {
-                        "from_stop_id": eg.from_stop_id,
-                        "to_stop_id": eg.to_stop_id,
-                    },
-                }
-            )
-
-    path_geojson = {"type": "FeatureCollection", "features": features}
-
-    total_travel_time_s = 0.0
-    total_distance_m = 0.0
-    for i in range(i_first):
-        u, v = baseline_path[i], baseline_path[i + 1]
-        ed = graph.get_edge_data(u, v, default={})
-        total_travel_time_s += float(ed.get("travel_time_s", 0.0))
-        total_distance_m += float(ed.get("distance_m", 0.0))
-    total_travel_time_s += float(hybrid_seg["time_s"])
-    total_distance_m += float(hybrid_seg["distance_m"])
-    for i in range(i_last + 1, len(baseline_path) - 1):
-        u, v = baseline_path[i], baseline_path[i + 1]
-        ed = graph.get_edge_data(u, v, default={})
-        total_travel_time_s += float(ed.get("travel_time_s", 0.0))
-        total_distance_m += float(ed.get("distance_m", 0.0))
-
-    # stop_path excludes the internal pattern-stop ids; return physical stop_ids.
-    path_nodes_osm = baseline_path[: i_first + 1] + baseline_path[i_last + 1 :]
-    stop_path = [graph.nodes[n]["stop_id"] for n in path_nodes_osm]
-
-    detour_delay_s = total_travel_time_s - baseline_travel_time_s
-    detour_extra_distance_m = total_distance_m - baseline_distance_m
-
-    tbt_osm: Optional[List[DetourTurnStep]] = None
-    raw_tbt = hybrid_seg.get("turn_by_turn") or []
-    if raw_tbt:
-        parsed_osm: List[DetourTurnStep] = []
-        for x in raw_tbt:
-            try:
-                parsed_osm.append(DetourTurnStep.model_validate(x))
-            except Exception:
-                continue
-        tbt_osm = parsed_osm or None
-
-    return DetourResponse(
-        blocked_edges_count=len(blocked_edges),
-        stop_path=stop_path,
-        path_geojson=path_geojson,
-        blocked_edges_geojson=blocked_edges_geojson,
-        total_travel_time_s=total_travel_time_s,
-        total_distance_m=total_distance_m,
-        baseline_travel_time_s=baseline_travel_time_s,
-        baseline_distance_m=baseline_distance_m,
-        detour_delay_s=detour_delay_s,
-        detour_extra_distance_m=detour_extra_distance_m,
-        used_shape=used_shape,
-        used_osm_snapping=used_osm_snapping,
-        feed_version=str(feed_version),
-        turn_by_turn=tbt_osm,
-        from_override=False,
-        instructions_only=False,
-        reason_code="osm_hybrid_path_found",
-        strategy_used="osm_hybrid",
-        confidence=0.9,
-        diagnostics={"blocked_edges": len(blocked_edges)},
-    )
 
 
 @app.get("/api/v1/graph/geojson")
@@ -3516,7 +2902,8 @@ def area_routes(req: AreaRoutesQuery):
         "area/routes",
         f"phase=request start_date={start_date_ymd} end_date={end_date_ymd} "
         f"start_time={req.start_time} end_time={req.end_time} max_results={req.max_results} "
-        f"single_day={str(single_day).lower()} feed_id={feed_id}",
+        f"single_day={str(single_day).lower()} feed_id={feed_id} "
+        f"time_semantics_mode={req.time_semantics_mode}",
     )
 
     try:
@@ -3549,6 +2936,7 @@ def area_routes(req: AreaRoutesQuery):
             start_sec=start_sec,
             end_date_ymd=end_date_ymd,
             end_sec=end_sec,
+            time_semantics_mode=req.time_semantics_mode,
         )
         query_elapsed_ms = int((time.perf_counter() - query_t0) * 1000)
         log("area/routes", f"phase=query_ok elapsed_ms={query_elapsed_ms} route_rows={len(routes_raw)}")
@@ -3558,6 +2946,20 @@ def area_routes(req: AreaRoutesQuery):
         raise
     except Exception as e:
         query_elapsed_ms = int((time.perf_counter() - query_t0) * 1000)
+        if type(e).__name__ == "QueryCanceled":
+            log(
+                "area/routes",
+                f"phase=query_timeout elapsed_ms={query_elapsed_ms} "
+                f"time_semantics_mode={req.time_semantics_mode}",
+            )
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Area pass-through query timed out for selected mode "
+                    f"'{req.time_semantics_mode}'. Try a smaller area/window or increase "
+                    "AREA_ROUTES_STATEMENT_TIMEOUT_MS."
+                ),
+            )
         log(
             "area/routes",
             f"phase=query_error elapsed_ms={query_elapsed_ms} error_type={type(e).__name__} error={e!s}",
@@ -3591,6 +2993,8 @@ def area_routes(req: AreaRoutesQuery):
                 last_time=_fmt_time(r.get("last_time_s")),
                 trip_count=r.get("trip_count"),
                 last_stop_name=r.get("last_stop_name"),
+                time_match_confidence=r.get("time_match_confidence"),
+                time_match_note=r.get("time_match_note"),
             )
         )
 
@@ -3637,147 +3041,6 @@ def area_routes(req: AreaRoutesQuery):
         f"calendar_hint={'set' if calendar_hint else 'none'}",
     )
     return AreaRoutesResponse(routes=results, calendar_hint=calendar_hint)
-
-
-@app.post("/api/v1/detours/by-area", response_model=DetourByAreaResponse)
-def detours_by_area(req: DetourByAreaRequest):
-    """
-    Compute detours for routes affected by a blockage polygon.
-
-    mode='route': detour a single selected route:
-      - detect blocked segment on its main pattern
-      - automatically choose entry/exit stops
-      - compute a multi-route detour between them
-
-    mode='all': compute detours for all routes whose shapes intersect the polygon
-      within the given date/time window (up to max_routes).
-    """
-    if not req.blockage_geojson:
-        raise HTTPException(status_code=400, detail="blockage_geojson is required")
-
-    start_date_ymd, start_sec, end_date_ymd, end_sec = _parse_window_range(
-        req.start_date, req.start_time, req.end_date, req.end_time
-    )
-
-    try:
-        polygon_geojson = _normalize_area_geometry(req.blockage_geojson)
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid blockage_geojson: {e}")
-
-    try:
-        feed = load_active_feed()
-    except Exception as e:
-        raise HTTPException(
-            status_code=503,
-            detail=f"GTFS feed could not be loaded. Place israel-public-transportation.zip in the project root or run /feed/update. ({e})",
-        )
-
-    log(
-        "detours/by-area",
-        f"mode={req.mode}, start_date={start_date_ymd}, end_date={end_date_ymd}, "
-        f"time_window={req.start_time}-{req.end_time}, "
-        f"max_routes={req.max_routes}, transfer_radius_m={req.transfer_radius_m}",
-    )
-    policy_profile = by_area_policy_profile()
-    if req.use_osm_detour:
-        policy_profile = f"{policy_profile}|hybrid-osm-v1"
-    blockage_hash = db_access_module.hash_geojson_canonical(polygon_geojson)
-
-    if req.mode == DetourByAreaMode.route:
-        if not req.route_id:
-            raise HTTPException(status_code=400, detail="route_id is required when mode='route'")
-        turn_ba = (
-            [s.model_dump(exclude_none=True) for s in req.turn_by_turn] if req.turn_by_turn else None
-        )
-        result = _compute_route_detour_by_area(
-            feed=feed,
-            date_str=start_date_ymd,
-            start_sec=start_sec,
-            end_sec=end_sec,
-            blockage_geojson=polygon_geojson,
-            blockage_hash=blockage_hash,
-            cache_mode=req.mode.value,
-            policy_profile=policy_profile,
-            route_id=req.route_id,
-            direction_id=req.direction_id,
-            transfer_radius_m=req.transfer_radius_m,
-            use_osm_detour=req.use_osm_detour,
-            apply_request_street_override=True,
-            street_override_road=req.detour_road_geojson,
-            street_override_turns=turn_ba,
-            street_override_remember=bool(req.remember_override),
-            override_stop_before=req.stop_before,
-            override_stop_after=req.stop_after,
-            street_instructions_text_he=req.instructions_text_he,
-            prefer_osm_detour=bool(req.prefer_osm_detour),
-            routing_engine=req.routing_engine,
-        )
-        log(
-            "detours/by-area",
-            f"single route_id={result.route_id!r}, "
-            f"direction_id={result.direction_id!r}, "
-            f"blocked_edges={result.blocked_edges_count}, "
-            f"used_transfers={result.used_transfers}, "
-            f"error={result.error!r}",
-        )
-        return DetourByAreaResponse(mode=req.mode, result=result, feed_version=feed.version_id)
-
-    # mode == 'all'
-    # Find all routes in area/time window (capped by max_routes) and compute per-route detours.
-    try:
-        routes_raw = find_routes_in_polygon(
-            feed=feed,
-            polygon_geojson=polygon_geojson,
-            start_date_ymd=start_date_ymd,
-            start_sec=start_sec,
-            end_date_ymd=end_date_ymd,
-            end_sec=end_sec,
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Area search failed: {e}")
-
-    # Deduplicate by (route_id, direction_id) and cap results.
-    seen: set[tuple[str, Optional[str]]] = set()
-    candidates: list[tuple[str, Optional[str]]] = []
-    for r in routes_raw:
-        key = (r["route_id"], r.get("direction_id"))
-        if key in seen:
-            continue
-        seen.add(key)
-        candidates.append(key)
-        if len(candidates) >= req.max_routes:
-            break
-
-    results: list[DetourByAreaRouteResult] = []
-    for route_id, direction_id in candidates:
-        res = _compute_route_detour_by_area(
-            feed=feed,
-            date_str=start_date_ymd,
-            start_sec=start_sec,
-            end_sec=end_sec,
-            blockage_geojson=polygon_geojson,
-            blockage_hash=blockage_hash,
-            cache_mode=req.mode.value,
-            policy_profile=policy_profile,
-            route_id=route_id,
-            direction_id=direction_id,
-            transfer_radius_m=req.transfer_radius_m,
-            use_osm_detour=req.use_osm_detour,
-            prefer_osm_detour=bool(req.prefer_osm_detour),
-            routing_engine=req.routing_engine,
-        )
-        results.append(res)
-
-    log(
-        "detours/by-area",
-        f"computed {len(results)} route detours "
-        f"for blockage on start_date={start_date_ymd}, end_date={end_date_ymd}, "
-        f"time_window={req.start_time}-{req.end_time}",
-    )
-
-    return DetourByAreaResponse(mode=req.mode, results=results, feed_version=feed.version_id)
 
 
 @app.post("/api/v1/stop/routes", response_model=StopRoutesResponse)

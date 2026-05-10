@@ -58,6 +58,16 @@ def get_active_feed_id(conn=None) -> int:
             cur.execute("SELECT id FROM feed_versions WHERE active = TRUE ORDER BY fetched_at DESC LIMIT 1")
             row = cur.fetchone()
             if not row:
+                # Recovery path for partially migrated/loaded DBs where active was never flipped.
+                cur.execute("SELECT id FROM feed_versions ORDER BY fetched_at DESC LIMIT 1")
+                row = cur.fetchone()
+                if row:
+                    try:
+                        chosen = int(row["id"])  # type: ignore[index]
+                    except Exception:
+                        chosen = int(row[0])
+                    log("db/feed", f"no active feed flag set; using latest feed_id={chosen}")
+                    return chosen
                 raise RuntimeError("No active feed in feed_versions")
             # Support both DictCursor (row["id"]) and regular cursor (row[0]).
             try:
@@ -110,6 +120,8 @@ class RouteInAreaRow:
     last_time_s: Optional[int]
     trip_count: Optional[int]
     last_stop_name: Optional[str] = None
+    time_match_confidence: Optional[str] = None
+    time_match_note: Optional[str] = None
 
 
 def get_routes_in_polygon(
@@ -117,6 +129,7 @@ def get_routes_in_polygon(
     date_ymd: str,
     start_sec: int,
     end_sec: int,
+    time_semantics_mode: str = "legacy_trip_overlap",
     conn=None,
 ) -> List[RouteInAreaRow]:
     """
@@ -134,8 +147,19 @@ def get_routes_in_polygon(
             "area/routes",
             f"phase=pg_single_day_begin feed_id={feed_id} date={date_ymd} "
             f"time_window_sec={start_sec}-{end_sec} wkt_chars={len(polygon_wkt)} "
-            f"statement_timeout_ms={AREA_ROUTES_STATEMENT_TIMEOUT_MS}",
+            f"statement_timeout_ms={AREA_ROUTES_STATEMENT_TIMEOUT_MS} "
+            f"time_semantics_mode={time_semantics_mode}",
         )
+        if time_semantics_mode != "legacy_trip_overlap":
+            return _get_routes_in_polygon_pass_through_single_day(
+                conn=conn,
+                feed_id=feed_id,
+                polygon_wkt=polygon_wkt,
+                date_ymd=date_ymd,
+                start_sec=start_sec,
+                end_sec=end_sec,
+                time_semantics_mode=time_semantics_mode,
+            )
         with conn.cursor() as cur:
             cur.execute(
                 "SET LOCAL statement_timeout = %s", (AREA_ROUTES_STATEMENT_TIMEOUT_MS,)
@@ -2834,12 +2858,569 @@ def search_routes_pg(
             conn.close()
 
 
+def _get_routes_in_polygon_pass_through_single_day(
+    conn,
+    feed_id: int,
+    polygon_wkt: str,
+    date_ymd: str,
+    start_sec: int,
+    end_sec: int,
+    time_semantics_mode: str,
+) -> List[RouteInAreaRow]:
+    confidence_expr = "'approx'::text" if time_semantics_mode == "pass_through_stop_proxy" else (
+        "CASE WHEN bool_and(wh.has_anchor_pair AND wh.has_shape_pair) "
+        "THEN 'high'::text ELSE 'unknown'::text END"
+    )
+    note_expr = "NULL::text" if time_semantics_mode == "pass_through_stop_proxy" else (
+        "CASE WHEN bool_and(wh.has_anchor_pair AND wh.has_shape_pair) THEN NULL::text ELSE "
+        "'Estimated from nearest bracketing stops near polygon; some trips had missing anchors or shape distances.'::text END"
+    )
+    with conn.cursor() as cur:
+        cur.execute("SET LOCAL statement_timeout = %s", (AREA_ROUTES_STATEMENT_TIMEOUT_MS,))
+        cur.execute(
+            f"""
+            WITH poly AS (
+                SELECT ST_GeomFromText(%s, 4326) AS geom
+            ),
+            active_services AS (
+                SELECT c.service_id
+                FROM calendar c
+                WHERE c.feed_id = %s
+                  AND %s BETWEEN c.start_date AND c.end_date
+                  AND CASE EXTRACT(DOW FROM to_timestamp(%s::text, 'YYYYMMDD'))
+                        WHEN 0 THEN c.sunday
+                        WHEN 1 THEN c.monday
+                        WHEN 2 THEN c.tuesday
+                        WHEN 3 THEN c.wednesday
+                        WHEN 4 THEN c.thursday
+                        WHEN 5 THEN c.friday
+                        WHEN 6 THEN c.saturday
+                      END = 1
+                UNION
+                SELECT cd.service_id
+                FROM calendar_dates cd
+                WHERE cd.feed_id = %s
+                  AND cd.date = %s
+                  AND cd.exception_type = 1
+                EXCEPT
+                SELECT cd.service_id
+                FROM calendar_dates cd
+                WHERE cd.feed_id = %s
+                  AND cd.date = %s
+                  AND cd.exception_type = 2
+            ),
+            shapes_in_area AS MATERIALIZED (
+                SELECT sl.feed_id, sl.shape_id
+                FROM shapes_lines sl
+                JOIN poly p ON TRUE
+                WHERE sl.feed_id = %s
+                  AND ST_Intersects(sl.geom, p.geom)
+            ),
+            candidate_trips AS MATERIALIZED (
+                SELECT DISTINCT t.feed_id, t.trip_id, t.route_id, t.direction_id
+                FROM shapes_in_area sia
+                JOIN trips t
+                  ON t.feed_id = sia.feed_id
+                 AND t.shape_id = sia.shape_id
+                 AND t.shape_id IS NOT NULL
+                JOIN active_services s ON s.service_id = t.service_id
+                JOIN trip_time_bounds b
+                  ON b.feed_id = t.feed_id AND b.trip_id = t.trip_id
+                WHERE t.feed_id = %s
+                  AND b.last_sec >= %s
+                  AND b.first_sec <= %s
+            ),
+            trip_stops AS MATERIALIZED (
+                SELECT
+                    ct.trip_id,
+                    ct.route_id,
+                    ct.direction_id,
+                    st.stop_sequence,
+                    (
+                      split_part(trim(coalesce(st.departure_time, st.arrival_time, '')), ':', 1)::int * 3600
+                      + split_part(trim(coalesce(st.departure_time, st.arrival_time, '')), ':', 2)::int * 60
+                      + coalesce(nullif(trim(split_part(trim(coalesce(st.departure_time, st.arrival_time, '')), ':', 3)), ''), '0')::int
+                    ) AS sec,
+                    st.shape_dist_traveled AS shape_dist,
+                    ST_Distance(
+                        ST_SetSRID(ST_MakePoint(sp.lon, sp.lat), 4326),
+                        p.geom
+                    ) AS dist_m
+                FROM candidate_trips ct
+                JOIN stop_times st
+                  ON st.feed_id = ct.feed_id
+                 AND st.trip_id = ct.trip_id
+                JOIN stops sp
+                  ON sp.feed_id = st.feed_id
+                 AND sp.stop_id = st.stop_id
+                JOIN poly p ON TRUE
+                WHERE st.feed_id = %s
+                  AND length(trim(coalesce(st.departure_time, st.arrival_time, ''))) >= 5
+            ),
+            pivot AS MATERIALIZED (
+                SELECT DISTINCT ON (ts.trip_id)
+                    ts.trip_id,
+                    ts.route_id,
+                    ts.direction_id,
+                    ts.stop_sequence AS pivot_seq
+                FROM trip_stops ts
+                ORDER BY ts.trip_id, ts.dist_m ASC, ts.stop_sequence ASC
+            ),
+            anchor_seq AS MATERIALIZED (
+                SELECT
+                    p.trip_id,
+                    p.route_id,
+                    p.direction_id,
+                    MAX(CASE WHEN ts.stop_sequence <= p.pivot_seq THEN ts.stop_sequence END) AS a_seq,
+                    MIN(CASE WHEN ts.stop_sequence >= p.pivot_seq THEN ts.stop_sequence END) AS b_seq
+                FROM pivot p
+                JOIN trip_stops ts
+                  ON ts.trip_id = p.trip_id
+                GROUP BY p.trip_id, p.route_id, p.direction_id
+            ),
+            anchors AS MATERIALIZED (
+                SELECT
+                    s.trip_id,
+                    s.route_id,
+                    s.direction_id,
+                    s.a_seq,
+                    a.sec AS a_sec,
+                    a.dist_m AS a_dist,
+                    a.shape_dist AS a_shape,
+                    s.b_seq,
+                    b.sec AS b_sec,
+                    b.dist_m AS b_dist,
+                    b.shape_dist AS b_shape
+                FROM anchor_seq s
+                LEFT JOIN trip_stops a
+                  ON a.trip_id = s.trip_id
+                 AND a.stop_sequence = s.a_seq
+                LEFT JOIN trip_stops b
+                  ON b.trip_id = s.trip_id
+                 AND b.stop_sequence = s.b_seq
+            ),
+            trip_pass AS MATERIALIZED (
+                SELECT
+                    an.trip_id,
+                    an.route_id,
+                    an.direction_id,
+                    (
+                        CASE
+                            WHEN an.a_seq IS NULL AND an.b_seq IS NULL THEN NULL
+                            WHEN an.a_seq IS NULL THEN an.b_sec
+                            WHEN an.b_seq IS NULL THEN an.a_sec
+                            WHEN an.b_seq = an.a_seq THEN an.a_sec
+                            WHEN an.a_sec IS NULL OR an.b_sec IS NULL THEN NULL
+                            WHEN an.b_sec <= an.a_sec THEN NULL
+                            WHEN coalesce(an.a_dist, 0) + coalesce(an.b_dist, 0) > 0
+                                THEN round(
+                                    an.a_sec
+                                    + (an.b_sec - an.a_sec)
+                                      * (coalesce(an.a_dist, 0) / (coalesce(an.a_dist, 0) + coalesce(an.b_dist, 0)))
+                                )::int
+                            ELSE ((an.a_sec + an.b_sec) / 2)::int
+                        END
+                    ) AS pass_sec,
+                    (an.a_seq IS NOT NULL AND an.b_seq IS NOT NULL AND an.b_seq > an.a_seq) AS has_anchor_pair,
+                    (an.a_shape IS NOT NULL AND an.b_shape IS NOT NULL) AS has_shape_pair
+                FROM anchors an
+            ),
+            window_hits AS MATERIALIZED (
+                SELECT
+                    tp.trip_id,
+                    tp.route_id,
+                    tp.direction_id,
+                    tp.pass_sec,
+                    tp.has_anchor_pair,
+                    tp.has_shape_pair
+                FROM trip_pass tp
+                WHERE tp.pass_sec IS NOT NULL
+                  AND tp.pass_sec BETWEEN %s AND %s
+            ),
+            routes_geom AS (
+                SELECT
+                    wh.route_id,
+                    wh.direction_id,
+                    r.short_name AS route_short_name,
+                    r.long_name AS route_long_name,
+                    r.agency_id,
+                    MIN(wh.pass_sec) AS first_time_s,
+                    MAX(wh.pass_sec) AS last_time_s,
+                    COUNT(DISTINCT wh.trip_id)::int AS trip_count,
+                    {confidence_expr} AS time_match_confidence,
+                    {note_expr} AS time_match_note
+                FROM window_hits wh
+                JOIN routes r
+                  ON r.feed_id = %s AND r.route_id = wh.route_id
+                GROUP BY wh.route_id, wh.direction_id, r.short_name, r.long_name, r.agency_id
+            )
+            SELECT
+                rg.route_id,
+                rg.direction_id,
+                rg.route_short_name,
+                rg.route_long_name,
+                rg.agency_id,
+                a.name AS agency_name,
+                rg.first_time_s,
+                rg.last_time_s,
+                rg.trip_count,
+                NULL::text AS last_stop_name,
+                rg.time_match_confidence,
+                rg.time_match_note
+            FROM routes_geom rg
+            LEFT JOIN agencies a
+              ON a.feed_id = %s AND a.agency_id = rg.agency_id
+            ORDER BY rg.route_short_name, rg.route_id, rg.direction_id
+            """,
+            (
+                polygon_wkt,
+                feed_id,
+                int(date_ymd),
+                date_ymd,
+                feed_id,
+                int(date_ymd),
+                feed_id,
+                int(date_ymd),
+                feed_id,
+                feed_id,
+                start_sec,
+                end_sec,
+                feed_id,
+                start_sec,
+                end_sec,
+                feed_id,
+                feed_id,
+            ),
+        )
+        return [
+            RouteInAreaRow(
+                route_id=r["route_id"],
+                direction_id=r["direction_id"],
+                route_short_name=r["route_short_name"],
+                route_long_name=r["route_long_name"],
+                agency_id=r["agency_id"],
+                agency_name=r["agency_name"],
+                first_time_s=r["first_time_s"],
+                last_time_s=r["last_time_s"],
+                trip_count=r["trip_count"],
+                last_stop_name=r.get("last_stop_name"),
+                time_match_confidence=r.get("time_match_confidence"),
+                time_match_note=r.get("time_match_note"),
+            )
+            for r in cur.fetchall()
+        ]
+
+
+def _get_routes_in_polygon_pass_through_multi_day(
+    conn,
+    feed_id: int,
+    polygon_wkt: str,
+    start_date_ymd: str,
+    start_sec: int,
+    end_date_ymd: str,
+    end_sec: int,
+    time_semantics_mode: str,
+) -> List[RouteInAreaRow]:
+    confidence_expr = "'approx'::text" if time_semantics_mode == "pass_through_stop_proxy" else (
+        "CASE WHEN bool_and(wh.has_anchor_pair AND wh.has_shape_pair) "
+        "THEN 'high'::text ELSE 'unknown'::text END"
+    )
+    note_expr = "NULL::text" if time_semantics_mode == "pass_through_stop_proxy" else (
+        "CASE WHEN bool_and(wh.has_anchor_pair AND wh.has_shape_pair) THEN NULL::text ELSE "
+        "'Estimated from nearest bracketing stops near polygon; some trips had missing anchors or shape distances.'::text END"
+    )
+    with conn.cursor() as cur:
+        cur.execute("SET LOCAL statement_timeout = %s", (AREA_ROUTES_STATEMENT_TIMEOUT_MS,))
+        cur.execute(
+            f"""
+            WITH poly AS (
+                SELECT ST_GeomFromText(%s, 4326) AS geom
+            ),
+            bounds AS (
+                SELECT
+                    to_date(%s::text, 'YYYYMMDD') AS start_date,
+                    to_date(%s::text, 'YYYYMMDD') AS end_date,
+                    %s::int AS start_sec,
+                    %s::int AS end_sec
+            ),
+            day_windows AS (
+                SELECT
+                    to_char(gs::date, 'YYYYMMDD')::int AS date_ymd,
+                    EXTRACT(DOW FROM gs::date)::int AS dow,
+                    CASE WHEN gs::date = b.start_date THEN b.start_sec ELSE 0 END AS day_start_sec,
+                    CASE WHEN gs::date = b.end_date THEN b.end_sec ELSE 27 * 3600 END AS day_end_sec
+                FROM bounds b
+                JOIN LATERAL generate_series(b.start_date, b.end_date, interval '1 day') gs ON TRUE
+            ),
+            calendar_services AS (
+                SELECT dw.date_ymd, dw.day_start_sec, dw.day_end_sec, c.service_id
+                FROM day_windows dw
+                JOIN calendar c ON c.feed_id = %s
+                  AND dw.date_ymd BETWEEN c.start_date AND c.end_date
+                  AND (
+                    (dw.dow = 0 AND c.sunday = 1)
+                    OR (dw.dow = 1 AND c.monday = 1)
+                    OR (dw.dow = 2 AND c.tuesday = 1)
+                    OR (dw.dow = 3 AND c.wednesday = 1)
+                    OR (dw.dow = 4 AND c.thursday = 1)
+                    OR (dw.dow = 5 AND c.friday = 1)
+                    OR (dw.dow = 6 AND c.saturday = 1)
+                  )
+            ),
+            add_services AS (
+                SELECT dw.date_ymd, dw.day_start_sec, dw.day_end_sec, cd.service_id
+                FROM day_windows dw
+                JOIN calendar_dates cd ON cd.feed_id = %s
+                 AND cd.date = dw.date_ymd
+                 AND cd.exception_type = 1
+            ),
+            remove_services AS (
+                SELECT dw.date_ymd, cd.service_id
+                FROM day_windows dw
+                JOIN calendar_dates cd ON cd.feed_id = %s
+                 AND cd.date = dw.date_ymd
+                 AND cd.exception_type = 2
+            ),
+            base_services AS (
+                SELECT date_ymd, day_start_sec, day_end_sec, service_id FROM calendar_services
+                UNION
+                SELECT date_ymd, day_start_sec, day_end_sec, service_id FROM add_services
+            ),
+            active_services AS (
+                SELECT bs.date_ymd, bs.day_start_sec, bs.day_end_sec, bs.service_id
+                FROM base_services bs
+                LEFT JOIN remove_services r
+                  ON r.date_ymd = bs.date_ymd AND r.service_id = bs.service_id
+                WHERE r.service_id IS NULL
+            ),
+            shapes_in_area AS MATERIALIZED (
+                SELECT sl.feed_id, sl.shape_id
+                FROM shapes_lines sl
+                JOIN poly p ON TRUE
+                WHERE sl.feed_id = %s
+                  AND ST_Intersects(sl.geom, p.geom)
+            ),
+            candidate_trips AS MATERIALIZED (
+                SELECT DISTINCT
+                    t.feed_id,
+                    t.trip_id,
+                    t.route_id,
+                    t.direction_id,
+                    s.day_start_sec,
+                    s.day_end_sec
+                FROM shapes_in_area sia
+                JOIN trips t
+                  ON t.feed_id = sia.feed_id
+                 AND t.shape_id = sia.shape_id
+                 AND t.shape_id IS NOT NULL
+                JOIN active_services s ON s.service_id = t.service_id
+                JOIN trip_time_bounds b
+                  ON b.feed_id = t.feed_id AND b.trip_id = t.trip_id
+                WHERE t.feed_id = %s
+                  AND b.last_sec >= s.day_start_sec
+                  AND b.first_sec <= s.day_end_sec
+            ),
+            trip_stops AS MATERIALIZED (
+                SELECT
+                    ct.date_ymd,
+                    ct.day_start_sec,
+                    ct.day_end_sec,
+                    ct.trip_id,
+                    ct.route_id,
+                    ct.direction_id,
+                    st.stop_sequence,
+                    (
+                      split_part(trim(coalesce(st.departure_time, st.arrival_time, '')), ':', 1)::int * 3600
+                      + split_part(trim(coalesce(st.departure_time, st.arrival_time, '')), ':', 2)::int * 60
+                      + coalesce(nullif(trim(split_part(trim(coalesce(st.departure_time, st.arrival_time, '')), ':', 3)), ''), '0')::int
+                    ) AS sec,
+                    st.shape_dist_traveled AS shape_dist,
+                    ST_Distance(
+                        ST_SetSRID(ST_MakePoint(sp.lon, sp.lat), 4326),
+                        p.geom
+                    ) AS dist_m
+                FROM candidate_trips ct
+                JOIN stop_times st
+                  ON st.feed_id = ct.feed_id
+                 AND st.trip_id = ct.trip_id
+                JOIN stops sp
+                  ON sp.feed_id = st.feed_id
+                 AND sp.stop_id = st.stop_id
+                JOIN poly p ON TRUE
+                WHERE st.feed_id = %s
+                  AND length(trim(coalesce(st.departure_time, st.arrival_time, ''))) >= 5
+            ),
+            pivot AS MATERIALIZED (
+                SELECT DISTINCT ON (ts.date_ymd, ts.trip_id)
+                    ts.date_ymd,
+                    ts.day_start_sec,
+                    ts.day_end_sec,
+                    ts.trip_id,
+                    ts.route_id,
+                    ts.direction_id,
+                    ts.stop_sequence AS pivot_seq
+                FROM trip_stops ts
+                ORDER BY ts.date_ymd, ts.trip_id, ts.dist_m ASC, ts.stop_sequence ASC
+            ),
+            anchor_seq AS MATERIALIZED (
+                SELECT
+                    p.date_ymd,
+                    p.day_start_sec,
+                    p.day_end_sec,
+                    p.trip_id,
+                    p.route_id,
+                    p.direction_id,
+                    MAX(CASE WHEN ts.stop_sequence <= p.pivot_seq THEN ts.stop_sequence END) AS a_seq,
+                    MIN(CASE WHEN ts.stop_sequence >= p.pivot_seq THEN ts.stop_sequence END) AS b_seq
+                FROM pivot p
+                JOIN trip_stops ts
+                  ON ts.date_ymd = p.date_ymd
+                 AND ts.trip_id = p.trip_id
+                GROUP BY p.date_ymd, p.day_start_sec, p.day_end_sec, p.trip_id, p.route_id, p.direction_id
+            ),
+            anchors AS MATERIALIZED (
+                SELECT
+                    s.date_ymd,
+                    s.day_start_sec,
+                    s.day_end_sec,
+                    s.trip_id,
+                    s.route_id,
+                    s.direction_id,
+                    s.a_seq,
+                    a.sec AS a_sec,
+                    a.dist_m AS a_dist,
+                    a.shape_dist AS a_shape,
+                    s.b_seq,
+                    b.sec AS b_sec,
+                    b.dist_m AS b_dist,
+                    b.shape_dist AS b_shape
+                FROM anchor_seq s
+                LEFT JOIN trip_stops a
+                  ON a.date_ymd = s.date_ymd
+                 AND a.trip_id = s.trip_id
+                 AND a.stop_sequence = s.a_seq
+                LEFT JOIN trip_stops b
+                  ON b.date_ymd = s.date_ymd
+                 AND b.trip_id = s.trip_id
+                 AND b.stop_sequence = s.b_seq
+            ),
+            trip_pass AS MATERIALIZED (
+                SELECT
+                    an.date_ymd,
+                    an.day_start_sec,
+                    an.day_end_sec,
+                    an.trip_id,
+                    an.route_id,
+                    an.direction_id,
+                    (
+                        CASE
+                            WHEN an.a_seq IS NULL AND an.b_seq IS NULL THEN NULL
+                            WHEN an.a_seq IS NULL THEN an.b_sec
+                            WHEN an.b_seq IS NULL THEN an.a_sec
+                            WHEN an.b_seq = an.a_seq THEN an.a_sec
+                            WHEN an.a_sec IS NULL OR an.b_sec IS NULL THEN NULL
+                            WHEN an.b_sec <= an.a_sec THEN NULL
+                            WHEN coalesce(an.a_dist, 0) + coalesce(an.b_dist, 0) > 0
+                                THEN round(
+                                    an.a_sec
+                                    + (an.b_sec - an.a_sec)
+                                      * (coalesce(an.a_dist, 0) / (coalesce(an.a_dist, 0) + coalesce(an.b_dist, 0)))
+                                )::int
+                            ELSE ((an.a_sec + an.b_sec) / 2)::int
+                        END
+                    ) AS pass_sec,
+                    (an.a_seq IS NOT NULL AND an.b_seq IS NOT NULL AND an.b_seq > an.a_seq) AS has_anchor_pair,
+                    (an.a_shape IS NOT NULL AND an.b_shape IS NOT NULL) AS has_shape_pair
+                FROM anchors an
+            ),
+            window_hits AS MATERIALIZED (
+                SELECT
+                    tp.trip_id,
+                    tp.route_id,
+                    tp.direction_id,
+                    tp.pass_sec,
+                    tp.has_anchor_pair,
+                    tp.has_shape_pair
+                FROM trip_pass tp
+                WHERE tp.pass_sec IS NOT NULL
+                  AND tp.pass_sec BETWEEN tp.day_start_sec AND tp.day_end_sec
+            ),
+            routes_geom AS (
+                SELECT
+                    wh.route_id,
+                    wh.direction_id,
+                    r.short_name AS route_short_name,
+                    r.long_name AS route_long_name,
+                    r.agency_id,
+                    MIN(wh.pass_sec) AS first_time_s,
+                    MAX(wh.pass_sec) AS last_time_s,
+                    COUNT(DISTINCT wh.trip_id)::int AS trip_count,
+                    {confidence_expr} AS time_match_confidence,
+                    {note_expr} AS time_match_note
+                FROM window_hits wh
+                JOIN routes r
+                  ON r.feed_id = %s AND r.route_id = wh.route_id
+                GROUP BY wh.route_id, wh.direction_id, r.short_name, r.long_name, r.agency_id
+            )
+            SELECT
+                rg.route_id,
+                rg.direction_id,
+                rg.route_short_name,
+                rg.route_long_name,
+                rg.agency_id,
+                a.name AS agency_name,
+                rg.first_time_s,
+                rg.last_time_s,
+                rg.trip_count,
+                NULL::text AS last_stop_name,
+                rg.time_match_confidence,
+                rg.time_match_note
+            FROM routes_geom rg
+            LEFT JOIN agencies a
+              ON a.feed_id = %s AND a.agency_id = rg.agency_id
+            ORDER BY rg.route_short_name, rg.route_id, rg.direction_id
+            """,
+            (
+                polygon_wkt,
+                start_date_ymd,
+                end_date_ymd,
+                start_sec,
+                end_sec,
+                feed_id,
+                feed_id,
+                feed_id,
+                feed_id,
+                feed_id,
+                feed_id,
+                feed_id,
+            ),
+        )
+        return [
+            RouteInAreaRow(
+                route_id=r["route_id"],
+                direction_id=r["direction_id"],
+                route_short_name=r["route_short_name"],
+                route_long_name=r["route_long_name"],
+                agency_id=r["agency_id"],
+                agency_name=r["agency_name"],
+                first_time_s=r["first_time_s"],
+                last_time_s=r["last_time_s"],
+                trip_count=r["trip_count"],
+                last_stop_name=r.get("last_stop_name"),
+                time_match_confidence=r.get("time_match_confidence"),
+                time_match_note=r.get("time_match_note"),
+            )
+            for r in cur.fetchall()
+        ]
+
+
 def get_routes_in_polygon_range(
     polygon_wkt: str,
     start_date_ymd: str,
     start_sec: int,
     end_date_ymd: str,
     end_sec: int,
+    time_semantics_mode: str = "legacy_trip_overlap",
     conn=None,
 ) -> List[RouteInAreaRow]:
     close = False
@@ -2859,15 +3440,34 @@ def get_routes_in_polygon_range(
                 f"phase=db_branch branch=single_day_sql date={sd} wkt_chars={len(polygon_wkt)} "
                 f"statement_timeout_ms={AREA_ROUTES_STATEMENT_TIMEOUT_MS}",
             )
-            return get_routes_in_polygon(polygon_wkt, sd, start_sec, end_sec, conn=conn)
+            return get_routes_in_polygon(
+                polygon_wkt,
+                sd,
+                start_sec,
+                end_sec,
+                time_semantics_mode=time_semantics_mode,
+                conn=conn,
+            )
 
         feed_id = get_active_feed_id(conn)
         log(
             "area/routes",
             f"phase=pg_multi_day_begin feed_id={feed_id} start_date={sd} end_date={ed} "
             f"time_window_sec={start_sec}-{end_sec} wkt_chars={len(polygon_wkt)} "
-            f"statement_timeout_ms={AREA_ROUTES_STATEMENT_TIMEOUT_MS}",
+            f"statement_timeout_ms={AREA_ROUTES_STATEMENT_TIMEOUT_MS} "
+            f"time_semantics_mode={time_semantics_mode}",
         )
+        if time_semantics_mode != "legacy_trip_overlap":
+            return _get_routes_in_polygon_pass_through_multi_day(
+                conn=conn,
+                feed_id=feed_id,
+                polygon_wkt=polygon_wkt,
+                start_date_ymd=start_date_ymd,
+                start_sec=start_sec,
+                end_date_ymd=end_date_ymd,
+                end_sec=end_sec,
+                time_semantics_mode=time_semantics_mode,
+            )
         with conn.cursor() as cur:
             cur.execute(
                 "SET LOCAL statement_timeout = %s", (AREA_ROUTES_STATEMENT_TIMEOUT_MS,)
@@ -4398,7 +4998,7 @@ def insert_bus_turn_constraint(
 
 
 def _execute_split_ddl(conn, sql_text: str) -> None:
-    """Run semicolon-separated DDL (no semicolons inside literals in our migration files)."""
+    """Run migration SQL text as one script (supports dollar-quoted DO blocks)."""
     lines: List[str] = []
     for line in sql_text.splitlines():
         s = line.strip()
@@ -4407,11 +5007,7 @@ def _execute_split_ddl(conn, sql_text: str) -> None:
         lines.append(line)
     buf = "\n".join(lines)
     with conn.cursor() as cur:
-        for part in buf.split(";"):
-            stmt = part.strip()
-            if not stmt:
-                continue
-            cur.execute(stmt + ";")
+        cur.execute(buf)
 
 
 def ensure_pattern_physical_layer_schema(conn=None) -> bool:

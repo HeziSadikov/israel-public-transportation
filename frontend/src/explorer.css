@@ -1,0 +1,7 @@
+.explorer-window button {
+  border-radius: 8px;
+}
+
+.explorer-content .row button {
+  font-size: 0.8rem;
+}

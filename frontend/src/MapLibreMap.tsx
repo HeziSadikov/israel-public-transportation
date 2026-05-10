@@ -426,6 +426,8 @@ export type MapLibreMapHandle = {
   undoLastPoint: () => void;
   startPolygon: () => void;
   editBlockagePolygon: () => void;
+  /** Replace MapboxDraw blockage polygon and sync parent state (e.g. after pasting coordinate text). */
+  applyBlockagePolygonToDraw: (geom: GeoJSON.Geometry | null) => void;
   /** Replace the drawn manual detour LineString (e.g. after pasting GeoJSON in the panel). */
   applyManualDetourLineToDraw: (geom: GeoJSON.LineString | null) => void;
   startDrawDetourLine: () => void;
@@ -1693,6 +1695,32 @@ const MapLibreMap = React.forwardRef<MapLibreMapHandle, MapLibreMapProps>(functi
           draw.changeMode("direct_select", { featureId });
         } catch (e) {
           console.error("Failed to enter direct_select mode", e);
+        }
+      },
+      applyBlockagePolygonToDraw(geom: GeoJSON.Geometry | null) {
+        const draw = drawRef.current;
+        if (!draw) return;
+        try {
+          deletePolygonFeaturesFromDraw(draw);
+          if (!geom) {
+            onBlockageChangeRef.current?.(null);
+          } else if (geom.type === "Polygon" || geom.type === "MultiPolygon") {
+            draw.add({
+              type: "Feature",
+              geometry: geom,
+              properties: {},
+            } as GeoJSON.Feature);
+            onBlockageChangeRef.current?.(normalizeBlockageGeometry(geom));
+          } else {
+            onBlockageChangeRef.current?.(null);
+          }
+        } catch (e) {
+          console.error("Failed to apply blockage polygon to draw", e);
+        }
+        try {
+          draw.changeMode("simple_select");
+        } catch {
+          /* ignore */
         }
       },
       applyManualDetourLineToDraw(geom: GeoJSON.LineString | null) {

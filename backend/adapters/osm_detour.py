@@ -644,7 +644,6 @@ TRACE_ATTRIBUTES_INCLUDE_FILTERS: List[str] = [
     "edge.tunnel",
     "edge.bridge",
     "edge.toll",
-    "edge.access_restriction",
     "edge.use",
     "edge.begin_heading",
     "edge.end_heading",

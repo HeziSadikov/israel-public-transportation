@@ -1,6 +1,3 @@
-# Postgres/PostGIS for Israel GTFS Detour Router (primary data layer).
-# Optional: run the API with DATABASE_URL pointing at this service.
-
 services:
   postgis:
     image: postgis/postgis:16-3.4
@@ -9,6 +6,14 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-user}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-pass}
       POSTGRES_DB: ${POSTGRES_DB:-israel_gtfs}
+      TZ: ${LOCAL_TZ:-Asia/Jerusalem}
+      PGTZ: ${LOCAL_TZ:-Asia/Jerusalem}
+    command:
+      - postgres
+      - -c
+      - timezone=${LOCAL_TZ:-Asia/Jerusalem}
+      - -c
+      - log_timezone=${LOCAL_TZ:-Asia/Jerusalem}
     ports:
       - "${POSTGRES_PORT:-5432}:5432"
     volumes:
@@ -18,25 +23,58 @@ services:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-user} -d ${POSTGRES_DB:-israel_gtfs}"]
       interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 20
 
   backend:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
     container_name: israel-gtfs-backend
     depends_on:
       postgis:
         condition: service_healthy
     environment:
-      # Match backend/db_access.py expectation
       DATABASE_URL: "postgresql://${POSTGRES_USER:-user}:${POSTGRES_PASSWORD:-pass}@postgis:5432/${POSTGRES_DB:-israel_gtfs}"
       OSM_ENGINE_URL: "http://osrm:5000"
       VALHALLA_URL: "http://valhalla:8002"
+      TZ: ${LOCAL_TZ:-Asia/Jerusalem}
+      GRAPH_WARMUP_ENABLED: ${GRAPH_WARMUP_ENABLED:-true}
+      GRAPH_WARMUP_TIMEOUT_S: ${GRAPH_WARMUP_TIMEOUT_S:-300}
+      GRAPH_WARMUP_PROFILES: ${GRAPH_WARMUP_PROFILES:-weekday,friday,saturday,sunday}
+      HYBRID_DETOUR_ENABLED: ${HYBRID_DETOUR_ENABLED:-true}
+      # Preview warmup loads tens of thousands of pickled graphs into RAM; Docker Desktop
+      # often OOM-kills (exit 137) before startup finishes. Override with true if you raise memory.
+      GRAPH_WARMUP_PREVIEWS_ENABLED: ${GRAPH_WARMUP_PREVIEWS_ENABLED:-false}
     ports:
       - "8000:8000"
+    volumes:
+      - .:/app
+      - backend_cache:/root/.cache
+    command: python -m run_uvicorn
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    container_name: israel-gtfs-frontend
+    depends_on:
+      - backend
+    environment:
+      VITE_API_BASE: ${VITE_API_BASE:-http://127.0.0.1:8000/api/v1}
+      TZ: ${LOCAL_TZ:-Asia/Jerusalem}
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./frontend:/app/frontend
+      - frontend_node_modules:/app/frontend/node_modules
+    command: npm run dev -- --host 0.0.0.0
 
   osrm:
     image: osrm/osrm-backend:latest
     container_name: osrm-israel
+    profiles: ["routing"]
+    environment:
+      TZ: ${LOCAL_TZ:-Asia/Jerusalem}
     command: >
       osrm-routed
       --algorithm mld
@@ -50,10 +88,11 @@ services:
   valhalla:
     image: ghcr.io/valhalla/valhalla-scripted:latest
     container_name: valhalla-israel
+    profiles: ["routing"]
     environment:
-      # If auto-download saves a ~200 byte file, delete it and follow osm/README.md (manual .pbf).
       tile_urls: "https://download.geofabrik.de/asia/israel-and-palestine-latest.osm.pbf"
       use_tiles_ignore_pbf: "False"
+      TZ: ${LOCAL_TZ:-Asia/Jerusalem}
     ports:
       - "8002:8002"
     volumes:
@@ -62,14 +101,5 @@ services:
 
 volumes:
   postgis_data:
-
-# Usage:
-# 1) Place data:
-#    - GTFS zip at ./israel-public-transportation.zip
-#    - OSM extract at ./osm/israel.osm.pbf
-#    - OSRM preprocessed files at ./osm/israel.osrm* (see README for extract/partition/customize)
-# 2) Start stack:
-#    docker compose up --build
-# 3) Create PostGIS schema (once):
-#    docker compose exec postgis psql -U ${POSTGRES_USER:-user} -d ${POSTGRES_DB:-israel_gtfs} -f /backend/sql/schema/db_postgis_schema.sql
-# 4) Ingest GTFS & build patterns (from host or a one-off container) pointing at postgis:5432.
+  backend_cache:
+  frontend_node_modules:

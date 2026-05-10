@@ -40,4 +40,8 @@ Thumbs.db
 ### Environment / secrets
 .env
 .env.*
+!.env.example
+
+### Local-only golden trip fixtures (feed-specific trip_ids)
+tests/fixtures/area_routes_golden_local.json
 

@@ -2,6 +2,7 @@ import React, { useState } from "react";
 import { postDetourComputeV2, postIncident } from "./api/detourV2";
 import type { DetourV2ComputeResult, DetourV2Attempt } from "./api/detourV2";
 import type { RouteInfo } from "./ExplorerWindow";
+import { SidebarInfo } from "./SidebarInfo";
 
 type Props = {
   blockageGeojson: GeoJSON.Geometry | null;
@@ -152,13 +153,13 @@ export function IncidentDetourV2Panel(props: Props) {
 
   return (
     <section className="rail-section time-window-section">
-      <h2 className="rail-heading">Detour v2 (beta)</h2>
-      <p className="rail-hint">
-        Select a route in the explorer, then compute (uses the main pattern&apos;s trip for the service date). Optional:
-        override with a GTFS <code>trip_id</code>. Requires PostGIS shape + optional Valhalla.
-      </p>
+      <h2 className="rail-heading">
+        Detour v2{" "}
+        <SidebarInfo text="Select a route, optionally override with trip_id, then create incident and compute." />
+      </h2>
       <label className="rail-label">
-        Trip id (optional override)
+        Trip id{" "}
+        <SidebarInfo text="Optional override. Leave empty to use the selected route’s representative trip." />
         <input
           className="rail-input"
           type="text"
@@ -174,7 +175,10 @@ export function IncidentDetourV2Panel(props: Props) {
           checked={debugDetour}
           onChange={(e) => setDebugDetour(e.target.checked)}
         />
-        <span>Debug GeoJSON (anchors, shape, blockage layers in API response)</span>
+        <span>
+          Debug GeoJSON{" "}
+          <SidebarInfo text="Includes anchor/shape/blockage debug layers in the API response." />
+        </span>
       </label>
       <label className="rail-label" style={{ display: "flex", alignItems: "center", gap: 8 }}>
         <input
@@ -182,7 +186,10 @@ export function IncidentDetourV2Panel(props: Props) {
           checked={useMatchedPhysical}
           onChange={(e) => setUseMatchedPhysical(e.target.checked)}
         />
-        <span>Use matched physical geometry (when PostGIS backfill exists)</span>
+        <span>
+          Use matched physical geometry{" "}
+          <SidebarInfo text="Uses backfilled PostGIS matched geometry when available." />
+        </span>
       </label>
       <div className="rail-buttons">
         <button type="button" disabled={loading || !props.blockageGeojson} onClick={handleIncident}>
@@ -192,7 +199,7 @@ export function IncidentDetourV2Panel(props: Props) {
           Compute detour v2
         </button>
       </div>
-      {message && <p className="rail-status">{message}</p>}
+      {message && <div className="rail-status">{message}</div>}
 
       {lastResult && (
         <div style={{ marginTop: 6 }}>
@@ -205,20 +212,15 @@ export function IncidentDetourV2Panel(props: Props) {
           </button>
           {showDiag && (
             <div style={{ border: "1px solid var(--color-border, #ddd)", borderRadius: 4, padding: 6, fontSize: 11 }}>
-              {/* Status and corridor */}
               <div style={{ marginBottom: 4 }}>
                 <strong>Status:</strong> {lastResult.status ?? "—"}{" "}
                 {lastResult.corridor_stage && <span>| corridor: <em>{lastResult.corridor_stage}</em></span>}
               </div>
-
-              {/* Selected summary */}
               {lastResult.selected?.summary_en && (
                 <div style={{ marginBottom: 4, color: "var(--color-success, #2a8a2a)" }}>
                   <strong>Winner:</strong> {lastResult.selected.summary_en}
                 </div>
               )}
-
-              {/* Score breakdown */}
               {breakdown && (
                 <details style={{ marginBottom: 4 }}>
                   <summary style={{ cursor: "pointer", fontWeight: 600 }}>Score breakdown</summary>
@@ -234,8 +236,6 @@ export function IncidentDetourV2Panel(props: Props) {
                   </table>
                 </details>
               )}
-
-              {/* Stops */}
               {(skipped.length > 0 || served.length > 0) && (
                 <div style={{ marginBottom: 4 }}>
                   {skipped.length > 0 && (
@@ -250,8 +250,6 @@ export function IncidentDetourV2Panel(props: Props) {
                   )}
                 </div>
               )}
-
-              {/* Attempts table */}
               {attempts.length > 0 && (
                 <details>
                   <summary style={{ cursor: "pointer", fontWeight: 600 }}>

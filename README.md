@@ -25,7 +25,8 @@ Backend + frontend prototype that:
   - `config.py`: paths, GTFS remote URL, OSM engine URL, simple in‑memory caches.
 - **React + Vite + Leaflet frontend** – in `frontend/`
   - Route search, graph build, stop selection, blockage drawing, and detour visualization.
-- **OSRM docker-compose** – `docker-compose.osrm.yml`
+- **Docker dev stack** – `docker-compose.yml` (PostGIS + backend + frontend, with optional `routing` profile for OSRM/Valhalla)
+- **OSRM-only compose** – `docker-compose.osrm.yml` (standalone OSRM workflow)
 - **Demo script** – `scripts/demo.py`
 
 ---
@@ -93,21 +94,33 @@ The app can use **PostgreSQL with PostGIS** as the primary data layer for area s
   `postgresql://user:pass@localhost:5432/israel_gtfs`  
   (PowerShell: `$env:DATABASE_URL="postgresql://user:pass@localhost:5432/israel_gtfs"`)
 
-**Docker (Postgres + PostGIS)**
+**Docker (dev stack with PostGIS + backend + frontend)**
 
 ```bash
-docker compose up -d
+docker compose up --build
 ```
 
-Then create the schema (once, as superuser for `CREATE EXTENSION postgis`):
+Open:
+
+- Frontend: `http://localhost:5173`
+- Backend health: `http://localhost:8000/health`
+
+Then create the schema (once):
 
 ```bash
-docker compose exec postgis psql -U postgres -d israel_gtfs -f /backend/sql/schema/db_postgis_schema.sql
+docker compose exec postgis psql -U user -d israel_gtfs -f /backend/sql/schema/db_postgis_schema.sql
 ```
 
 **Ingest and patterns**
 
-From the project root, with `DATABASE_URL` set (or pass `--database-url`):
+From the project root:
+
+```bash
+docker compose run --rm backend python -m scripts.precompute_all_postgis --with-ingest --workers 4
+docker compose run --rm backend python -m scripts.precompute_all_postgis --with-ingest --ingest-fetch-if-newer --workers 4
+```
+
+For host-based/manual runs, with `DATABASE_URL` set (or pass `--database-url`):
 
 ```bash
 # All-in-one: patterns (auto date) + graph/preview precompute. Add --with-ingest to run GTFS ingest first.
@@ -161,40 +174,12 @@ Warmup behavior:
   - `GET /graph/cache/status` (includes `warmup.loaded_previews_gtfs`, `loaded_previews_osm`, `previews_skipped_stale`)
   - `POST /graph/cache/warmup?profiles=weekday,friday` — add `include_previews=false` to warm graphs only
 
-Detour-by-area weighted routing + cache:
-- `/detours/by-area` now uses a dedicated weighted routing policy (separate from `/detour` defaults).
-- Route-level detour answers are cached in `detour_by_area_cache` (PostGIS) with key fields:
-  - feed/version context
-  - mode + route_id + direction_id
-  - date/time window + transfer radius + `use_osm_detour`
-  - policy profile + normalized blockage geometry hash
-- Cache entries are guarded by `route_sig_hash`, so route changes automatically invalidate stale rows.
-- New by-area policy env knobs:
-  - `BY_AREA_ROUTING_POLICY_PROFILE=weighted-v1` (cache-key profile token)
-  - `BY_AREA_ROUTING_PER_EDGE_PENALTY_S=20`
-  - `BY_AREA_ROUTING_TRANSFER_PENALTY_S=420`
-  - `BY_AREA_ROUTING_TRANSFER_DISTANCE_PENALTY_PER_M_S=0.30`
-  - `BY_AREA_ROUTING_PATTERN_SWITCH_PENALTY_S=120`
-  - `BY_AREA_ROUTING_FREQ_DISCOUNT_COEF=0.0`
-  - `BY_AREA_ROUTING_FREQ_CAP=60`
-  - `BY_AREA_ROUTING_HEURISTIC_MAX_SPEED_M_S=22.22`
-- Optional global routing knobs (all A* paths):
-  - `ROUTING_TRANSFER_DISTANCE_PENALTY_PER_M_S=0`
-  - `ROUTING_PATTERN_SWITCH_PENALTY_S=0`
-
-Hybrid intersection-aware detours:
-- `POST /detour` now attempts hybrid OSM bypass first (when enabled), then falls back to GTFS detour.
-- `POST /detours/by-area` (`use_osm_detour=true`) uses the same shared hybrid bypass segment builder.
-- Hybrid behavior:
-  - derives entry/exit near blockage from route geometry crossing points
-  - routes around polygon on road graph (Valhalla), then optional map-match polish
-  - rejects bypass segments that still overlap blockage interior
-- Config:
-  - `HYBRID_DETOUR_ENABLED=true|false` (default true)
-  - `VALHALLA_URL=http://localhost:8002` (required for OSM hybrid routing)
-- Logs:
-  - `/detour`: `hybrid=hit` or `hybrid=fallback_gtfs`
-  - `/detours/by-area`: cache profile includes `|hybrid-osm-v1` when OSM hybrid is requested
+Detour v2 endpoints:
+- `POST /incidents` creates an incident from a blockage polygon and derives edge bans.
+- `POST /detours/compute` computes candidate road detours for a selected route/trip.
+- `GET /detours/policy` returns the active detour policy profile and thresholds.
+- `POST /detours/{detour_request_id}/approve` approves a selected computed detour.
+- `GET /detours/{detour_request_id}` returns stored compute details and candidates.
 
 **Optional later optimization:** if `built_fallback` remains costly after precompute + preview warmup, a slimmer stored preview (for example one merged centerline instead of per-edge GeoJSON features) can shrink pickles and client parse time; `backend/route_preview_payload.py` is the single place to evolve the persisted dict shape alongside the API.
 
@@ -553,9 +538,9 @@ The frontend assumes the backend is reachable at `http://localhost:8000` (`API_B
 
    - `./osm/israel.osm.pbf`
 
-### 2. Preprocess and run OSRM
+### 2. Preprocess and run OSRM (standalone OSRM compose)
 
-From the project root, using the provided compose file:
+From the project root, using the OSRM-only compose file:
 
 ```bash
 # Extract
@@ -573,6 +558,18 @@ docker compose -f docker-compose.osrm.yml run --rm osrm \
 # Run the routing engine
 docker compose -f docker-compose.osrm.yml up
 ```
+
+For the full dev stack (backend + frontend + PostGIS + routing engines together), prefer:
+
+```bash
+docker compose --profile routing up --build
+```
+
+Notes:
+
+- The routing profile in `docker-compose.yml` expects OSRM output at `./osm/israel.osrm`.
+- The standalone `docker-compose.osrm.yml` currently references `/data/israel-latest.osrm`.
+- Use one naming convention consistently in `./osm` when switching between these workflows.
 
 This exposes OSRM at:
 
@@ -645,40 +642,45 @@ Demo steps:
 
 ## Quick start summary
 
-1. **Install backend deps**:
+One-command helper (PowerShell, from repo root):
+
+```powershell
+.\docker-up-dev.ps1
+```
+
+With routing engines:
+
+```powershell
+.\docker-up-dev.ps1 -WithRouting
+```
+
+1. **Start the Docker dev stack**:
 
    ```bash
-   pip install -r requirements.txt
+   docker compose up --build
    ```
 
-2. **Place GTFS file**:
+2. **Create PostGIS schema (once)**:
+
+   ```bash
+   docker compose exec postgis psql -U user -d israel_gtfs -f /backend/sql/schema/db_postgis_schema.sql
+   ```
+
+3. **Run ingest + precompute in container**:
+
+   ```bash
+   docker compose run --rm backend python -m scripts.precompute_all_postgis --with-ingest --workers 4
+   ```
+
+4. **(Optional) Start routing engines too**:
+
+   ```bash
+   docker compose --profile routing up --build
+   ```
+
+5. **Place GTFS file** (if not fetched by ingest):
 
    - `./israel-public-transportation.zip`
-
-3. **Run backend**:
-
-   ```bash
-   python -m run_uvicorn
-   ```
-
-4. **(Optional) Run OSRM for OSM “pretty” geometry**:
-
-   - Place `./osm/israel.osm.pbf`.
-   - Run the `osrm-extract`, `osrm-partition`, `osrm-customize`, then:
-
-   ```bash
-   docker compose -f docker-compose.osrm.yml up
-   ```
-
-5. **Run frontend**:
-
-   ```bash
-   cd frontend
-   npm install
-   npm run dev
-   ```
-
-   Then open the URL printed by Vite (default `http://localhost:5173`).
 
 6. **Use the app**:
 
