@@ -52,17 +52,22 @@ class CorridorPolicy:
 @dataclass
 class VehiclePolicy:
     width_threshold_m: float = 2.7
-    # Thresholds for local-share hard rejection (only if reject_hard_local_share is True).
+    # Thresholds for local-share hard rejection.
     local_fraction_hard_reject: float = 0.4
     unknown_width_local_fraction_hard_reject: float = 0.6
-    # Off by default: incident detours often thread through service/residential; segment penalties
-    # already apply. Set True to hard-reject when local share exceeds the thresholds above.
-    reject_hard_local_share: bool = False
-    # Off by default: detours intentionally use roads buses have not driven before.
-    # GTFS evidence is used as a score bonus/penalty, not a hard gate.
-    require_gtfs_way_evidence: bool = False
+    # Hard-reject when local-road share exceeds threshold AND segments are not all synthetic.
+    reject_hard_local_share: bool = True
+    # Hard-reject any detour segment that lacks GTFS-bus or operator-approved evidence.
+    # Pass 2 (relaxed fallback) disables this flag to always surface some candidate.
+    require_gtfs_way_evidence: bool = True
     min_gtfs_way_confidence: float = 0.15
     max_unknown_way_fraction: float = 0.15
+    # Hard-reject segments whose highway tag is non-drivable for buses.
+    reject_segment_pedestrian_class: bool = True
+    # Hard-reject segments with access=no/private that have no bus/psv exception.
+    reject_segment_access_no_without_bus: bool = True
+    # Hard-reject segments whose osm_way_id is in the incident edge bans.
+    reject_segment_in_incident_ban: bool = True
 
 
 @dataclass
@@ -92,17 +97,18 @@ class ServicePolicy:
     # Score impact for detours that skip service stops.
     skipped_stop_penalty_s: float = 90.0
     # Hard-reject when Valhalla reports kUturnLeft/Right (types 12/13) or explicit U-turn text.
-    # Off by default: avoiding a blockage often forces a legal turnaround that Valhalla still
-    # classifies as a U-turn maneuver; scoring still adds turn_pen penalties.
-    reject_explicit_u_turn_maneuver: bool = False
+    reject_explicit_u_turn_maneuver: bool = True
     # Reverse-driving guardrails near anchors (bearing deltas in degrees).
     backtrack_penalty_bearing_deg: float = 125.0
     backtrack_hard_bearing_deg: float = 160.0
-    # Penalty-only by default (see reject_explicit_u_turn_maneuver for the same rationale).
-    reject_hard_backtrack: bool = False
+    reject_hard_backtrack: bool = True
     # Max share of detour polyline length allowed inside the incident geometry (0 = never accept
     # routing through the blockage; a tiny epsilon is applied in code for float noise).
     max_incident_overlap_fraction: float = 0.0
+    # Fraction of detour length that may coincide with the original route slice (exit→rejoin).
+    # A value >= this threshold means "Valhalla just re-routed along the original road"
+    # with no real bypass.  0.85 is safe: real detours still have coinciding ends.
+    max_route_coincide_fraction: float = 0.50
     # Sharp-turn guardrails from /trace_attributes maneuver.turn_degree.
     sharp_turn_threshold_deg: float = 120.0
     sharp_turn_hard_count: int = 3
@@ -141,7 +147,7 @@ class SearchPolicy:
 class DetourPolicyConfig:
     """Versioned policy bundle; inject into all v2 modules."""
 
-    version: str = "v2-default-4"
+    version: str = "v2-default-7"
     anchor: AnchorPolicy = field(default_factory=AnchorPolicy)
     snap: SnapPolicy = field(default_factory=SnapPolicy)
     corridor: CorridorPolicy = field(default_factory=CorridorPolicy)

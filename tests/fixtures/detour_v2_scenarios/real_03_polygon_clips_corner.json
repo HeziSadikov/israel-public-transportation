@@ -1,0 +1,31 @@
+{
+  "id": "real_03_polygon_clips_corner",
+  "description": "Polygon touches the route shape near a corner / turn but does not fully block it. Impact analysis should find a short blocked interval; anchors should be close to the blockage. No forbidden ways.",
+  "trip_id": "test_trip_corner_001",
+  "service_date": "20260511",
+  "route_coords_lonlat": [
+    [34.800, 32.090], [34.802, 32.090], [34.804, 32.090], [34.806, 32.090],
+    [34.808, 32.090], [34.810, 32.090], [34.810, 32.088], [34.810, 32.086],
+    [34.810, 32.084], [34.810, 32.082], [34.810, 32.080], [34.812, 32.080],
+    [34.814, 32.080], [34.816, 32.080], [34.818, 32.080]
+  ],
+  "blockage_geojson": {
+    "type": "Polygon",
+    "coordinates": [[[34.808, 32.087], [34.812, 32.087], [34.812, 32.092], [34.808, 32.092], [34.808, 32.087]]]
+  },
+  "detour_coords_lonlat": [
+    [34.806, 32.090], [34.807, 32.093], [34.813, 32.093], [34.813, 32.088],
+    [34.813, 32.080], [34.814, 32.080]
+  ],
+  "stop_shape_dist_step_m": 200,
+  "mock_valhalla": "detour_ok",
+  "expect": {
+    "min_tier_status": "low_confidence",
+    "blocked_span_m": [400, 2000],
+    "blocked_span_tolerance_m": 800,
+    "exit_bbox_lonlat": [34.798, 32.085, 34.810, 32.095],
+    "rejoin_bbox_lonlat": [34.808, 32.078, 34.820, 32.090],
+    "max_skipped_stops": 8,
+    "forbidden_osm_way_ids": []
+  }
+}

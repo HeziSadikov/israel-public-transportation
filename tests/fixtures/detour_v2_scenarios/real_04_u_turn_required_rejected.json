@@ -1,0 +1,27 @@
+{
+  "id": "real_04_u_turn_required_rejected",
+  "description": "Valhalla returns a route that includes an explicit U-turn maneuver. With reject_explicit_u_turn_maneuver=True (new default), this should be rejected by pass-1 and surfaced as emergency_fallback by pass-2.",
+  "trip_id": "test_trip_uturn_001",
+  "service_date": "20260511",
+  "route_coords_lonlat": [
+    [34.750, 32.100], [34.752, 32.100], [34.754, 32.100], [34.756, 32.100],
+    [34.758, 32.100], [34.760, 32.100], [34.762, 32.100], [34.764, 32.100],
+    [34.766, 32.100], [34.768, 32.100]
+  ],
+  "blockage_geojson": {
+    "type": "Polygon",
+    "coordinates": [[[34.756, 32.098], [34.762, 32.098], [34.762, 32.103], [34.756, 32.103], [34.756, 32.098]]]
+  },
+  "detour_coords_lonlat": [
+    [34.754, 32.100], [34.754, 32.095], [34.764, 32.095], [34.764, 32.100]
+  ],
+  "stop_shape_dist_step_m": 200,
+  "mock_valhalla": "uturn_ok",
+  "expect": {
+    "status": "emergency_fallback",
+    "blocked_span_m": [600, 2400],
+    "blocked_span_tolerance_m": 800,
+    "forbidden_osm_way_ids": []
+  },
+  "_note": "mock_valhalla=uturn_ok injects maneuver_type=12 (kUturnRight). With reject_explicit_u_turn_maneuver=True, pass-1 hard-rejects this candidate; pass-2 relaxed policy accepts it and surfaces emergency_fallback. The engine never returns no_safe_detour."
+}

@@ -190,7 +190,12 @@ def _decode_from_trace_edges(
     edges: List[Dict[str, Any]],
     travel_time_s: float,
 ) -> Optional[DecodedCandidate]:
-    """Build DecodedCandidate from /trace_attributes edge list."""
+    """Build DecodedCandidate from /trace_attributes edge list.
+
+    Uses real OSM node IDs (begin_osm_node_id / end_osm_node_id) from the Valhalla
+    response so that TurnRef.via_node_id matches real OSM node ids used by
+    IncidentTurnBan and bus_turn_evidence triplets.
+    """
     if not edges:
         return None
     total_len_km = sum(float(e.get("length") or 0.0) for e in edges)
@@ -199,24 +204,28 @@ def _decode_from_trace_edges(
     total_len_m = total_len_km * 1000.0
     segs: List[RoadSegmentRef] = []
     turns: List[TurnRef] = []
+    # Seed the first begin-node from edge[0].begin_osm_node_id (0 when absent).
+    prev_end_node: int = int(edges[0].get("begin_osm_node_id") or 0)
     for i, edge in enumerate(edges):
         way_id = int(edge.get("way_id") or 0)
         length_m = float(edge.get("length") or 0.0) * 1000.0
         t_frac = length_m / total_len_m if total_len_m > 0 else (1.0 / len(edges))
         road_class = str(edge.get("road_class") or "")
         highway = _ROAD_CLASS_TO_HIGHWAY.get(road_class, road_class or "unknown")
-        # Derive access/bus tags from Valhalla edge attributes.
         use = str(edge.get("use") or "")
         access_restriction = bool(edge.get("access_restriction") or False)
         bus_val = "yes" if use in {"road", "bus"} else None
         access_val = "no" if access_restriction and not bus_val else None
+        # Real OSM node IDs — 0 if /trace_attributes didn't return them.
+        begin_node = int(edge.get("begin_osm_node_id") or prev_end_node)
+        end_node = int(edge.get("end_osm_node_id") or 0)
         seg_id = 3_000_000 + i
         segs.append(
             RoadSegmentRef(
                 segment_id=seg_id,
                 osm_way_id=way_id,
-                from_node_id=i,
-                to_node_id=i + 1,
+                from_node_id=begin_node,
+                to_node_id=end_node,
                 sequence_index=i,
                 length_m=max(length_m, 0.1),
                 travel_time_s=max(0.0, travel_time_s * t_frac),
@@ -229,16 +238,19 @@ def _decode_from_trace_edges(
             )
         )
         if i > 0:
+            # via_node_id is the junction between previous edge's end and this edge's begin.
+            via = begin_node if begin_node != 0 else prev_end_node
             turns.append(
                 TurnRef(
                     from_segment_id=segs[i - 1].segment_id,
                     to_segment_id=seg_id,
-                    via_node_id=i,
+                    via_node_id=via,
                     sequence_index=i - 1,
                     turn_angle=None,
                     turn_type="continue",
                 )
             )
+        prev_end_node = end_node if end_node != 0 else begin_node
     return DecodedCandidate(
         road_segments=segs,
         turns=turns,

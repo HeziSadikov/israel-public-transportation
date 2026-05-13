@@ -24,6 +24,7 @@ TIER_ORDER = {
     "review_recommended": 3,
     "low_confidence": 2,
     "emergency_fallback": 1,
+    "no_safe_detour": 1,
     "no_impact": 0,
     "error": -1,
 }
@@ -114,6 +115,26 @@ def _build_stubs(scenario: Dict[str, Any]) -> Tuple[str, Dict[str, Any], Any]:
         )
     mock_kind = str(scenario.get("mock_valhalla") or "none")
 
+    def _make_uturn_route_response(coords: List[Tuple[float, float]], km: float) -> Dict[str, Any]:
+        """Response with an explicit U-turn maneuver instruction."""
+        return {
+            "trip": {
+                "legs": [
+                    {
+                        "summary": {"length": km, "time": 60.0},
+                        "shape": _encode_polyline6(coords),
+                        "maneuvers": [
+                            {"instruction": "Head south", "type": 1},
+                            {"instruction": "Make a U-turn", "type": 12, "maneuver_type": 12},
+                            {"instruction": "You have arrived.", "type": 4},
+                        ],
+                    }
+                ],
+                "summary": {"length": km, "time": 60.0},
+            },
+            "alternates": [],
+        }
+
     def _mock_post(*_a, **_kw):
         resp = MagicMock()
         resp.status_code = 200
@@ -124,6 +145,9 @@ def _build_stubs(scenario: Dict[str, Any]) -> Tuple[str, Dict[str, Any], Any]:
             resp.json = lambda: {"error_code": 442, "error": "No path"}
         elif mock_kind == "detour_ok" and detour_coords:
             data = _make_valhalla_route_response(detour_coords, max(km, 0.05), time_s=90.0)
+            resp.json = lambda: data
+        elif mock_kind == "uturn_ok" and detour_coords:
+            data = _make_uturn_route_response(detour_coords, max(km, 0.05))
             resp.json = lambda: data
         else:
             resp.json = lambda: {"trip": {"legs": [], "summary": {"length": 0, "time": 0}}, "alternates": []}
@@ -187,10 +211,12 @@ def test_detour_v2_scenario_contract(scenario: Dict[str, Any], monkeypatch):
         )
 
     if "status" in exp:
-        assert out.status == exp["status"], scenario["id"]
+        assert out.status == exp["status"], (
+            f"{scenario['id']}: expected status={exp['status']} got {out.status} "
+            f"(error={out.error}, attempts={[r.get('candidate_generation_reason') for r in (out.attempts or [])]})"
+        )
 
-    if exp.get("status") == "no_impact":
-        assert out.status == "no_impact"
+    if exp.get("status") in ("no_impact", "no_safe_detour"):
         return
 
     assert out.status != "error", f"{scenario['id']}: {out.error}"

@@ -1,0 +1,24 @@
+{
+  "id": "real_02_no_safe_detour_surrounded",
+  "description": "Very large blockage polygon that covers all realistic exit/rejoin windows. All Valhalla candidates should be rejected or Valhalla should return nothing. Expected: no_safe_detour or emergency_fallback (but NOT a confident route through the polygon).",
+  "trip_id": "test_trip_surrounded_001",
+  "service_date": "20260511",
+  "route_coords_lonlat": [
+    [34.770, 32.060], [34.774, 32.060], [34.778, 32.060], [34.782, 32.060],
+    [34.786, 32.060], [34.790, 32.060], [34.794, 32.060], [34.798, 32.060],
+    [34.802, 32.060], [34.806, 32.060]
+  ],
+  "blockage_geojson": {
+    "type": "Polygon",
+    "coordinates": [[[34.770, 32.050], [34.806, 32.050], [34.806, 32.072], [34.770, 32.072], [34.770, 32.050]]]
+  },
+  "detour_coords_lonlat": [],
+  "stop_shape_dist_step_m": 400,
+  "mock_valhalla": "none",
+  "expect": {
+    "status": "emergency_fallback",
+    "max_skipped_stops": 20,
+    "forbidden_osm_way_ids": []
+  },
+  "_note": "Polygon covers the entire route. Valhalla returns no legs (no_legs_in_response) so the engine falls back to emergency_fallback — distinguished from no_safe_detour (where Valhalla found paths but feasibility rejected them all). In a real E2E run, very large polygons may also trigger no_safe_detour if Valhalla finds paths through back-streets that get rejected."
+}

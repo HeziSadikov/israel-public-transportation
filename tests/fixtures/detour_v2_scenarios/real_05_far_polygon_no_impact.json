@@ -1,0 +1,20 @@
+{
+  "id": "real_05_far_polygon_no_impact",
+  "description": "Polygon is far from the route (>500 m lateral offset). Impact analysis should return no_impact immediately without calling Valhalla.",
+  "trip_id": "test_trip_nohit_001",
+  "service_date": "20260511",
+  "route_coords_lonlat": [
+    [34.800, 32.070], [34.802, 32.070], [34.804, 32.070], [34.806, 32.070],
+    [34.808, 32.070], [34.810, 32.070], [34.812, 32.070], [34.814, 32.070]
+  ],
+  "blockage_geojson": {
+    "type": "Polygon",
+    "coordinates": [[[34.820, 32.090], [34.826, 32.090], [34.826, 32.095], [34.820, 32.095], [34.820, 32.090]]]
+  },
+  "detour_coords_lonlat": [],
+  "stop_shape_dist_step_m": 400,
+  "mock_valhalla": "none",
+  "expect": {
+    "status": "no_impact"
+  }
+}

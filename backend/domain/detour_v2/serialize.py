@@ -3,7 +3,24 @@
 from __future__ import annotations
 
 import json
+import math
 from typing import Any, Dict, List, Optional
+
+
+def _sanitize_json(obj: Any) -> Any:
+    """Recursively replace non-finite floats (inf, -inf, nan) with None.
+
+    json.dumps serialises Python float('inf') as the bare token ``Infinity``
+    which is not valid JSON and is rejected by PostgreSQL jsonb.  All dicts
+    returned to callers (API, persistence, logs) must pass through this helper.
+    """
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _sanitize_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_json(v) for v in obj]
+    return obj
 
 from .models import (
     AnchorPair,
@@ -77,6 +94,16 @@ def _anchors(a: AnchorPair) -> Dict[str, Any]:
         d["exit_osm_segment_id"] = a.exit_osm_segment_id
     if a.rejoin_osm_segment_id is not None:
         d["rejoin_osm_segment_id"] = a.rejoin_osm_segment_id
+    if a.exit_road_class is not None:
+        d["exit_road_class"] = a.exit_road_class
+    if a.rejoin_road_class is not None:
+        d["rejoin_road_class"] = a.rejoin_road_class
+    d["exit_road_class_rank"] = a.exit_road_class_rank
+    d["rejoin_road_class_rank"] = a.rejoin_road_class_rank
+    if getattr(a, "exit_cross_road_class", None) is not None:
+        d["exit_cross_road_class"] = a.exit_cross_road_class
+    if getattr(a, "rejoin_cross_road_class", None) is not None:
+        d["rejoin_cross_road_class"] = a.rejoin_cross_road_class
     return d
 
 
@@ -201,7 +228,7 @@ def build_detour_ai_log_payload(out: DetourComputeOutput) -> Dict[str, Any]:
             }
         )
 
-    return {
+    return _sanitize_json({
         "trip_id": out.trip_id,
         "route_id": out.route_id,
         "status": out.status,
@@ -217,7 +244,7 @@ def build_detour_ai_log_payload(out: DetourComputeOutput) -> Dict[str, Any]:
         "candidates_ranked": candidates_brief,
         "discarded_ranked": discarded_brief[:50],
         "selected": selected_brief,
-    }
+    })
 
 
 def format_detour_ai_log_line(out: DetourComputeOutput, *, max_chars: int = 48000) -> str:
@@ -254,4 +281,4 @@ def detour_compute_output_to_dict(out: DetourComputeOutput) -> Dict[str, Any]:
         d["debug"] = dict(out.debug)
     if out.discarded:
         d["discarded"] = [_ranked(c) for c in out.discarded[:50]]
-    return d
+    return _sanitize_json(d)

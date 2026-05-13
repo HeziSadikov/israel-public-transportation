@@ -13,6 +13,7 @@ DetourComputeStatus = Literal[
     "review_recommended",
     "low_confidence",
     "emergency_fallback",
+    "no_safe_detour",
     "no_impact",
     "error",
 ]
@@ -56,6 +57,15 @@ class AnchorPair:
     rejoin_osm_segment_id: Optional[int] = None
     # Which widening radius (m) produced this pair (0 if unknown).
     search_radius_m: float = 0.0
+    # Road class at the snap point from Valhalla /locate (e.g. "primary", "secondary", "residential", "service").
+    exit_road_class: Optional[str] = None
+    rejoin_road_class: Optional[str] = None
+    # 0=preferred-bus-artery (trunk/primary/secondary/tertiary), 1=tolerated (residential/unclassified), 2=avoid (service/track/path).
+    exit_road_class_rank: int = 1
+    rejoin_road_class_rank: int = 1
+    # Best drivable cross-street road class at each intersection anchor (None for stop-based anchors).
+    exit_cross_road_class: Optional[str] = None
+    rejoin_cross_road_class: Optional[str] = None
 
 
 @dataclass

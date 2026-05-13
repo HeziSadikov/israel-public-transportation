@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import math
@@ -31,7 +32,8 @@ from backend.domain.detour_physical.debug_geojson import (
 from backend.domain.detour_physical.matched_trip_geometry import MatchedTripPhysical
 from backend.infra import pattern_edge_match_repo as pattern_edge_match_repo
 
-from .anchor_selector import enumerate_anchor_candidates
+from .anchor_selector import enumerate_anchor_candidates, enumerate_intersection_anchor_candidates
+from .intersection_finder import find_route_intersections
 from . import legal_anchor_runtime
 from .bus_feasibility_evaluator import evaluate_candidate
 from .detour_validator import validate_detour_carriageway
@@ -45,6 +47,17 @@ from .policy import DetourPolicyConfig, get_default_policy
 from .road_candidate_generator import generate_candidates_with_debug
 from .service_stitching import compute_stitching
 from .trip_impact_analyzer import analyze_trip_impact
+
+
+def _make_relaxed_policy(pol: DetourPolicyConfig) -> DetourPolicyConfig:
+    """Return a copy of *pol* with GTFS-evidence hard-reject and coincide cap disabled.
+
+    Used in the pass-2 fallback so the engine always surfaces *something*
+    when strict mode rejects every Valhalla candidate.
+    """
+    relaxed_vehicle = dataclasses.replace(pol.vehicle, require_gtfs_way_evidence=False)
+    relaxed_service = dataclasses.replace(pol.service, max_route_coincide_fraction=1.0)
+    return dataclasses.replace(pol, vehicle=relaxed_vehicle, service=relaxed_service)
 
 
 def _load_trip_context(trip_id: str) -> Tuple[Optional[str], Optional[str], Optional[LineString]]:
@@ -91,6 +104,58 @@ def _line_fraction_inside_blockage(
     return min(1.0, ilen / float(line.length))
 
 
+def _coincides_with_route_fraction(
+    detour_coords: list[tuple[float, float]],
+    route_line: LineString,
+    exit_dist_m: float,
+    rejoin_dist_m: float,
+    total_m: float,
+    *,
+    tolerance_m: float = 30.0,
+    sample_step_m: float = 20.0,
+) -> float:
+    """Fraction of detour length that lies within *tolerance_m* of the original route slice.
+
+    A value close to 1.0 means Valhalla returned the original road segment
+    unchanged (no real bypass).  We sample every *sample_step_m* along the
+    detour and test proximity to the route sub-line between the exit and rejoin
+    anchors.  Returns 0.0 on any geometry error.
+    """
+    if len(detour_coords) < 2 or total_m <= 0 or route_line.is_empty:
+        return 0.0
+    try:
+        from shapely.ops import substring as _substring
+
+        exit_norm = max(0.0, min(1.0, exit_dist_m / total_m))
+        rejoin_norm = max(0.0, min(1.0, rejoin_dist_m / total_m))
+        if rejoin_norm <= exit_norm:
+            return 0.0
+        route_slice = _substring(route_line, exit_norm, rejoin_norm, normalized=True)
+        if route_slice is None or route_slice.is_empty:
+            return 0.0
+
+        detour_line = LineString(detour_coords)
+        det_len = float(detour_line.length)
+        if det_len <= 0:
+            return 0.0
+
+        # Convert tolerance to degrees (approx; 1 deg ≈ 111 320 m at the equator).
+        tol_deg = tolerance_m / 111_320.0
+        # Walk detour every sample_step_m worth of degrees.
+        step_deg = max(sample_step_m / 111_320.0, det_len / 500.0)
+        dist = 0.0
+        coinciding = 0.0
+        while dist <= det_len + 1e-9:
+            pt = detour_line.interpolate(min(dist, det_len))
+            if float(route_slice.distance(pt)) <= tol_deg:
+                coinciding += step_deg
+            dist += step_deg
+
+        return min(1.0, coinciding / det_len)
+    except Exception:
+        return 0.0
+
+
 def _bearing_deg(lon1: float, lat1: float, lon2: float, lat2: float) -> float:
     """Initial great-circle bearing in [0,360)."""
     p = math.pi / 180.0
@@ -118,18 +183,31 @@ def _line_forward_bearing(line: LineString, dist_m: float, total_m: float, probe
 
 
 def _polyline_probe_bearing(coords: list[tuple[float, float]], from_start: bool, min_probe_m: float = 45.0) -> Optional[float]:
+    """Bearing probed from the start or end of a polyline in the FORWARD travel direction."""
     if len(coords) < 2:
         return None
-    seq = coords if from_start else list(reversed(coords))
-    lon0, lat0 = seq[0]
-    acc_m = 0.0
-    for i in range(1, len(seq)):
-        lon1, lat1 = seq[i]
-        seg_m = float(LineString([(lon0, lat0), (lon1, lat1)]).length * 111_320.0)
-        acc_m += seg_m
-        if acc_m >= min_probe_m or i == len(seq) - 1:
-            return _bearing_deg(lon0, lat0, lon1, lat1)
-        lon0, lat0 = lon1, lat1
+    if from_start:
+        lon0, lat0 = coords[0]
+        acc_m = 0.0
+        for i in range(1, len(coords)):
+            lon1, lat1 = coords[i]
+            seg_m = float(LineString([(lon0, lat0), (lon1, lat1)]).length * 111_320.0)
+            acc_m += seg_m
+            if acc_m >= min_probe_m or i == len(coords) - 1:
+                return _bearing_deg(lon0, lat0, lon1, lat1)
+            lon0, lat0 = lon1, lat1
+    else:
+        # Approach bearing at the END — travel direction as the route nears its last point.
+        # Walk backward from second-to-last to find a point far enough, then measure
+        # bearing FROM that point TO the final point (forward direction).
+        final_lon, final_lat = coords[-1]
+        acc_m = 0.0
+        for i in range(len(coords) - 2, -1, -1):
+            lon0, lat0 = coords[i]
+            seg_m = float(LineString([(lon0, lat0), (final_lon, final_lat)]).length * 111_320.0)
+            acc_m += seg_m
+            if acc_m >= min_probe_m or i == 0:
+                return _bearing_deg(lon0, lat0, final_lon, final_lat)
     return None
 
 
@@ -226,14 +304,27 @@ def _exclude_hash(geojson: Optional[Dict[str, Any]]) -> str:
         return "err"
 
 
+_ROAD_CLASS_RANK: Dict[str, int] = {
+    "motorway": 0, "motorway_link": 0,
+    "trunk": 0, "trunk_link": 0,
+    "primary": 0, "primary_link": 0,
+    "secondary": 0, "secondary_link": 0,
+    "tertiary": 0, "tertiary_link": 0,
+    "residential": 1, "unclassified": 1, "road": 1,
+    "service": 2, "service_other": 2,
+    "living_street": 2, "alley": 2, "driveway": 2, "parking_aisle": 2,
+    "track": 2, "footway": 2, "path": 2, "cycleway": 2,
+    "pedestrian": 2, "steps": 2, "bridleway": 2,
+}
+
+
 def _validate_anchors_via_locate(
     anchors_list: List[AnchorPair],
     policy: DetourPolicyConfig,
+    banned_way_ids: Optional[set[int]] = None,
 ) -> List[AnchorPair]:
-    """Drop anchor pairs whose exit or rejoin is unreachable via Valhalla /locate (A3)."""
+    """Drop unreachable anchors and enrich with road class; filter out service/footway/banned anchors."""
     min_reach = int(getattr(policy.anchor, "min_locate_reachability_nodes", 50))
-    if min_reach <= 0:
-        return anchors_list
     # Collect unique points.
     points: List[Tuple[float, float]] = []
     seen: set[tuple[float, float]] = set()
@@ -242,31 +333,78 @@ def _validate_anchors_via_locate(
             if pt not in seen:
                 seen.add(pt)
                 points.append(pt)
+    loc_results = None
     try:
-        loc_results = valhalla_locate(points, costing="bus")
+        if points:
+            loc_results = valhalla_locate(points, costing="bus")
     except Exception:
         loc_results = None
-    if not loc_results or not isinstance(loc_results, list):
-        return anchors_list
-    # Build reachability map by point.
-    reach_map: Dict[Tuple[float, float], int] = {}
-    for i, (lon, lat) in enumerate(points):
-        if i >= len(loc_results):
-            break
-        loc = loc_results[i]
-        if not isinstance(loc, dict):
-            continue
-        edges = loc.get("edges") or []
-        best = max((int(e.get("minimum_reachability") or 0) for e in edges if isinstance(e, dict)), default=0)
-        reach_map[(round(lon, 7), round(lat, 7))] = best
 
-    validated: List[AnchorPair] = []
+    reach_map: Dict[Tuple[float, float], int] = {}
+    road_class_map: Dict[Tuple[float, float], str] = {}
+    road_class_rank_map: Dict[Tuple[float, float], int] = {}
+    way_id_map: Dict[Tuple[float, float], int] = {}
+
+    if loc_results and isinstance(loc_results, list):
+        for i, (lon, lat) in enumerate(points):
+            if i >= len(loc_results):
+                break
+            loc = loc_results[i]
+            if not isinstance(loc, dict):
+                continue
+            edges = loc.get("edges") or []
+            best_reach = max((int(e.get("minimum_reachability") or 0) for e in edges if isinstance(e, dict)), default=0)
+            key = (round(lon, 7), round(lat, 7))
+            reach_map[key] = best_reach
+            # Use the best-reachability edge for road class + way ID.
+            best_edge = max(
+                (e for e in edges if isinstance(e, dict)),
+                key=lambda e: int(e.get("minimum_reachability") or 0),
+                default=None,
+            )
+            if best_edge is not None:
+                rc = str(best_edge.get("road_class") or "")
+                road_class_map[key] = rc
+                road_class_rank_map[key] = _ROAD_CLASS_RANK.get(rc.lower(), 1)
+                wid = int(best_edge.get("way_id") or 0)
+                way_id_map[key] = wid
+
+    validated_ok: List[AnchorPair] = []
+    rejected_class2: List[AnchorPair] = []
     for ap in anchors_list:
-        exit_r = reach_map.get((round(ap.exit_lon, 7), round(ap.exit_lat, 7)), min_reach)
-        rejoin_r = reach_map.get((round(ap.rejoin_lon, 7), round(ap.rejoin_lat, 7)), min_reach)
-        if exit_r >= min_reach and rejoin_r >= min_reach:
-            validated.append(ap)
-    return validated if validated else anchors_list
+        exit_key = (round(ap.exit_lon, 7), round(ap.exit_lat, 7))
+        rejoin_key = (round(ap.rejoin_lon, 7), round(ap.rejoin_lat, 7))
+        # Reachability gate (skip when locate call failed → default to passing).
+        if min_reach > 0 and loc_results is not None:
+            exit_r = reach_map.get(exit_key, min_reach)
+            rejoin_r = reach_map.get(rejoin_key, min_reach)
+            if exit_r < min_reach or rejoin_r < min_reach:
+                continue
+        # Enrich with road class.
+        ap.exit_road_class = road_class_map.get(exit_key)
+        ap.rejoin_road_class = road_class_map.get(rejoin_key)
+        ap.exit_road_class_rank = road_class_rank_map.get(exit_key, 1)
+        ap.rejoin_road_class_rank = road_class_rank_map.get(rejoin_key, 1)
+        # Drop anchors whose snap way is in the incident ban list.
+        exit_wid = way_id_map.get(exit_key, 0)
+        rejoin_wid = way_id_map.get(rejoin_key, 0)
+        if banned_way_ids and ((exit_wid and exit_wid in banned_way_ids) or (rejoin_wid and rejoin_wid in banned_way_ids)):
+            continue
+        max_rank = max(ap.exit_road_class_rank, ap.rejoin_road_class_rank)
+        if max_rank >= 2:
+            rejected_class2.append(ap)
+        else:
+            validated_ok.append(ap)
+
+    if validated_ok:
+        # Sort by best road-class rank first, then keep original ordering within same rank.
+        validated_ok.sort(key=lambda a: (max(a.exit_road_class_rank, a.rejoin_road_class_rank), 0))
+        return validated_ok
+    # Fall back to class-2 anchors if nothing better exists.
+    if rejected_class2:
+        return rejected_class2
+    # Nothing survived: return original list (Valhalla unavailable / all banned).
+    return anchors_list
 
 
 def _ridership_weight_for_stop(
@@ -642,18 +780,70 @@ def compute_detour_for_trip(
         radii = list(getattr(pol.anchor, "search_radii_m", None) or [400.0, 800.0, 1500.0, 3000.0, 5000.0])
         anchor_seen: set[Tuple[int, int]] = set()
         anchor_candidates: List[AnchorPair] = []
-        for rad in radii:
-            batch = enumerate_anchor_candidates(
-                line=anchor_shape_line,
-                blocked=impact.blocked,
-                stop_rows=stop_rows,
-                stop_lonlat=stop_lonlat,
-                policy=pol,
-                max_pairs=pol.anchor.candidate_pairs_k,
-                search_before_window_m=float(rad),
-                search_after_window_m=float(rad),
-                blockage_geojson=blockage_geojson,
+
+        # Build a (stop_id, shape_dist_m) list for intersection anchor labelling.
+        from .anchor_selector import _stops_with_dist_along as _swd_along
+        stops_with_dist_list = _swd_along(anchor_shape_line, total_m, stop_rows, stop_lonlat)
+
+        # Attempt intersection-based anchor selection first.
+        anchor_shape_coords_for_trace = list(anchor_shape_line.coords)
+        try:
+            route_intersections = find_route_intersections(
+                route_coords_lonlat=anchor_shape_coords_for_trace,
+                total_m=total_m,
+                blocked_start_m=impact.blocked.blocked_start_m,
+                blocked_end_m=impact.blocked.blocked_end_m,
+                window_m=float(radii[-1]) if radii else 5000.0,
             )
+        except Exception:
+            route_intersections = []
+
+        anchor_source_used = "intersection_finder" if route_intersections else "stop_window"
+        _log_stage(
+            trip_id,
+            "anchor_source",
+            anchor_source=anchor_source_used,
+            intersection_count=len(route_intersections),
+        )
+
+        for rad in radii:
+            if route_intersections:
+                batch = enumerate_intersection_anchor_candidates(
+                    intersections=route_intersections,
+                    blocked=impact.blocked,
+                    stops_with_dist=stops_with_dist_list,
+                    policy=pol,
+                    max_pairs=pol.anchor.candidate_pairs_k,
+                    search_before_window_m=float(rad),
+                    search_after_window_m=float(rad),
+                    blockage_geojson=blockage_geojson,
+                )
+                if not batch:
+                    # No intersection pair straddles the blockage at this radius;
+                    # fall back to stop-window for this radius iteration.
+                    batch = enumerate_anchor_candidates(
+                        line=anchor_shape_line,
+                        blocked=impact.blocked,
+                        stop_rows=stop_rows,
+                        stop_lonlat=stop_lonlat,
+                        policy=pol,
+                        max_pairs=pol.anchor.candidate_pairs_k,
+                        search_before_window_m=float(rad),
+                        search_after_window_m=float(rad),
+                        blockage_geojson=blockage_geojson,
+                    )
+            else:
+                batch = enumerate_anchor_candidates(
+                    line=anchor_shape_line,
+                    blocked=impact.blocked,
+                    stop_rows=stop_rows,
+                    stop_lonlat=stop_lonlat,
+                    policy=pol,
+                    max_pairs=pol.anchor.candidate_pairs_k,
+                    search_before_window_m=float(rad),
+                    search_after_window_m=float(rad),
+                    blockage_geojson=blockage_geojson,
+                )
             for anc in batch:
                 key = (int(round(anc.exit_shape_dist_m)), int(round(anc.rejoin_shape_dist_m)))
                 if key in anchor_seen:
@@ -693,7 +883,7 @@ def compute_detour_for_trip(
                             anchor_candidates.insert(0, legal_pair)
             except Exception:
                 pass
-        anchor_candidates = _validate_anchors_via_locate(anchor_candidates, pol)
+        anchor_candidates = _validate_anchors_via_locate(anchor_candidates, pol, banned_way_ids=banned)
         if not anchor_candidates:
             anchor_candidates = enumerate_anchor_candidates(
                 line=anchor_shape_line,
@@ -719,6 +909,7 @@ def compute_detour_for_trip(
             trip_id,
             stage,
             anchor_candidate_count=len(anchor_candidates),
+            anchor_source=anchor_source_used,
             exit_stop_id=anchors.exit_stop_id,
             rejoin_stop_id=anchors.rejoin_stop_id,
         )
@@ -728,6 +919,9 @@ def compute_detour_for_trip(
             Tuple[str, float, float, Any, Dict[str, Any], Any]
         ] = []
         all_metas: List[Dict[str, Any]] = []
+        # Parallel list: raw kwargs passed to evaluate_candidate per entry in all_rank_inputs.
+        # Used by pass-2 to re-evaluate the same candidates with relaxed policy.
+        eval_param_records: List[Dict[str, Any]] = []
         best_gtfs_ev: Dict[int, Dict[str, Any]] = {}
 
         val_blocked_seg: set[int] = set()
@@ -890,9 +1084,17 @@ def compute_detour_for_trip(
                     olap = _line_fraction_inside_blockage(coords, blockage_geojson)
                     cap = float(pol.service.max_incident_overlap_fraction)
                     path_bad = olap > cap + _INCIDENT_OVERLAP_FRAC_EPS
+                    coincide_frac = _coincides_with_route_fraction(
+                        coords,
+                        anchor_shape_line,
+                        anchors.exit_shape_dist_m,
+                        anchors.rejoin_shape_dist_m,
+                        total_m,
+                    )
                     _log_stage(
                         trip_id, decode_stage, anchor_index=anchor_idx, strategy=rc.strategy,
                         blockage_overlap_fraction=round(olap, 6), max_incident_overlap_fraction=cap,
+                        route_coincide_fraction=round(coincide_frac, 4),
                     )
                     cv_reasons: List[str] = []
                     if VALIDATE_DETOUR_CARRIAGEWAY:
@@ -955,11 +1157,17 @@ def compute_detour_for_trip(
                         stitch_ok=stitch_pre.stitch_ok,
                         invalid_geometry=invalid_geom,
                         carriageway_reasons=cv_reasons if cv_reasons else None,
+                        route_coincide_fraction=coincide_frac,
                     )
                     _log_stage(
                         trip_id, decode_stage, anchor_index=anchor_idx, strategy=rc.strategy,
                         bearing_delta_exit_deg=round(float(d_exit or 0.0), 2),
                         bearing_delta_rejoin_deg=round(float(d_rejoin or 0.0), 2),
+                        blocked_start_m=round(float(impact.blocked.blocked_start_m if impact.blocked else 0.0), 1),
+                        blocked_end_m=round(float(impact.blocked.blocked_end_m if impact.blocked else 0.0), 1),
+                        exit_shape_dist_m=round(float(anchors.exit_shape_dist_m), 1),
+                        rejoin_shape_dist_m=round(float(anchors.rejoin_shape_dist_m), 1),
+                        route_coincide_fraction=round(coincide_frac, 4),
                     )
                     if skipped_n > 0:
                         weight = _ridership_weight_for_stop(
@@ -977,6 +1185,24 @@ def compute_detour_for_trip(
                     }
                     all_rank_inputs.append((rc.strategy, rc.time_s, rc.distance_m, feas, extra, decoded))
                     all_metas.append({"anchors": anchors, "stitch_full": stitch_full, "gtfs_ev": gtfs_ev})
+                    eval_param_records.append({
+                        "projection": projection,
+                        "baseline_blocked_distance_m": baseline_d,
+                        "baseline_blocked_time_s": baseline_t,
+                        "detour_distance_m": rc.distance_m,
+                        "detour_time_s": rc.time_s,
+                        "banned_way_ids": banned,
+                        "gtfs_way_evidence": gtfs_ev,
+                        "bus_edge_evidence": bus_ev,
+                        "turn_by_turn": rc.turn_by_turn,
+                        "bearing_delta_exit_deg": d_exit,
+                        "bearing_delta_rejoin_deg": d_rejoin,
+                        "path_intersects_blockage": path_bad,
+                        "stitch_ok": stitch_pre.stitch_ok,
+                        "invalid_geometry": invalid_geom,
+                        "carriageway_reasons": cv_reasons if cv_reasons else None,
+                        "route_coincide_fraction": coincide_frac,
+                    })
                 rank_stage = "ranking"
                 _log_stage(
                     trip_id, rank_stage,
@@ -1004,6 +1230,48 @@ def compute_detour_for_trip(
         ranked_all = rank_candidates(all_rank_inputs, pol)
         discarded: List[RankedCandidate] = [x for x in ranked_all if x.total_score >= float("inf")]
         winners_raw = [x for x in ranked_all if x.total_score < float("inf")]
+
+        valhalla_produced_any = any(r.get("candidate_count", 0) > 0 for r in corridor_debug)
+        all_feasibility_rejected = bool(all_rank_inputs) and not winners_raw
+
+        # Pass 2: when strict GTFS / coincide checks rejected everything, re-evaluate
+        # the same decoded candidates with a relaxed policy and surface the least-bad
+        # one as EMERGENCY_FALLBACK.  This ensures the engine never returns no_safe_detour
+        # while Valhalla actually produced candidates.
+        used_strict_fallback = False
+        pass1_reject_reasons: List[str] = []
+        if not winners_raw and valhalla_produced_any and all_feasibility_rejected:
+            seen_reasons: set[str] = set()
+            for c in discarded:
+                for r_reason in (c.rejection_reasons or []):
+                    if r_reason not in seen_reasons:
+                        seen_reasons.add(r_reason)
+                        pass1_reject_reasons.append(r_reason)
+            _log_stage(
+                trip_id, "strict_pass_rejected_all",
+                rejected_count=len(discarded),
+                top_reasons=",".join(pass1_reject_reasons[:5]),
+                running_pass2=True,
+            )
+            relaxed_pol = _make_relaxed_policy(pol)
+            pass2_rank_inputs: List[Tuple[str, float, float, Any, Dict[str, Any], Any]] = []
+            pass2_metas: List[Dict[str, Any]] = []
+            for (strat, t_s, d_m, _old_feas, extra, decoded), params, meta in zip(
+                all_rank_inputs, eval_param_records, all_metas
+            ):
+                feas2 = evaluate_candidate(decoded=decoded, policy=relaxed_pol, **params)
+                feas2.warnings.append("strict_gtfs_pass_failed_fallback_relaxed")
+                pass2_rank_inputs.append((strat, t_s, d_m, feas2, extra, decoded))
+                pass2_metas.append(meta)
+            ranked_p2 = rank_candidates(pass2_rank_inputs, relaxed_pol)
+            p2_winners = [x for x in ranked_p2 if x.total_score < float("inf")]
+            if p2_winners:
+                winners_raw = p2_winners
+                discarded = [x for x in ranked_p2 if x.total_score >= float("inf")]
+                all_metas = pass2_metas
+                # Remap all_rank_inputs so _meta_for_ranked works correctly.
+                all_rank_inputs = pass2_rank_inputs
+                used_strict_fallback = True
 
         if not winners_raw:
             fb = _build_emergency_fallback(
@@ -1078,6 +1346,12 @@ def compute_detour_for_trip(
             best_selected = via_candidate
             best_ranked = [via_candidate] + [x for x in best_ranked if x is not via_candidate][:2]
             best_ranked[0].candidate_rank = 1
+        # Pass-2 winners are always surfaced as EMERGENCY_FALLBACK regardless of their
+        # computed tier, since strict policy was relaxed to find them.
+        if used_strict_fallback:
+            best_selected.tier = "EMERGENCY_FALLBACK"
+            for c in best_ranked:
+                c.tier = "EMERGENCY_FALLBACK"
         out_status = _tier_status(str(best_selected.tier))
         _log_stage(
             trip_id, "select_best",
@@ -1086,6 +1360,7 @@ def compute_detour_for_trip(
             corridor=best_corridor,
             tier=best_selected.tier,
             anchor_index=best_row.get("anchor_index") if isinstance(best_row, dict) else None,
+            strict_fallback=used_strict_fallback,
         )
         dbg_ok: Dict[str, Any] = {
             "candidate_generation": corridor_debug,

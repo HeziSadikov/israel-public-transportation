@@ -8,9 +8,34 @@ from shapely.geometry import LineString, Point, shape as shp_shape
 
 from backend.infra.config import ANCHOR_STOP_MAX_PROJECTION_M
 
+from .intersection_finder import IntersectionPoint
 from .models import AnchorPair, BlockedShapeInterval
 from .policy import DetourPolicyConfig
 from .trip_impact_analyzer import _line_length_m
+
+
+# Road-class rank used when scoring intersection anchors. Lower = better.
+_ROAD_CLASS_RANK: Dict[str, int] = {
+    "motorway": 0,
+    "trunk": 0,
+    "primary": 0,
+    "secondary": 0,
+    "tertiary": 0,
+    "unclassified": 1,
+    "residential": 1,
+    "service": 2,
+    "service_other": 2,
+    "alley": 2,
+    "driveway": 2,
+    "parking_aisle": 2,
+    "footway": 3,
+    "path": 3,
+    "cycleway": 3,
+    "pedestrian": 3,
+    "steps": 3,
+    "track": 3,
+    "living_street": 2,
+}
 
 
 def _point_on_line_at_m(line: LineString, dist_m: float, total_m: float) -> Tuple[float, float]:
@@ -222,6 +247,187 @@ def enumerate_anchor_candidates(
                 anchor_quality_note="interpolated_shape_anchor",
             )
         ]
+
+    scored.sort(key=lambda x: x[0])
+    return [cand for _, cand in scored[:k]]
+
+
+# ---------------------------------------------------------------------------
+# Intersection-based anchor enumeration (Option A architecture)
+# ---------------------------------------------------------------------------
+
+def _nearest_stop_id_by_shape_dist(
+    shape_dist_m: float,
+    stops_with_dist: List[Tuple[str, float]],
+) -> Optional[str]:
+    """Return the stop_id whose shape distance is closest to *shape_dist_m*.
+
+    Used only for display / service-stitching labelling; the actual anchor
+    lat/lon comes from the intersection, not the stop.
+    """
+    if not stops_with_dist:
+        return None
+    best_sid, best_delta = None, float("inf")
+    for sid, d in stops_with_dist:
+        delta = abs(d - shape_dist_m)
+        if delta < best_delta:
+            best_delta = delta
+            best_sid = sid
+    return best_sid
+
+
+def enumerate_intersection_anchor_candidates(
+    *,
+    intersections: List[IntersectionPoint],
+    blocked: BlockedShapeInterval,
+    stops_with_dist: List[Tuple[str, float]],
+    policy: DetourPolicyConfig,
+    max_pairs: Optional[int] = None,
+    search_before_window_m: Optional[float] = None,
+    search_after_window_m: Optional[float] = None,
+    blockage_geojson: Optional[Dict[str, Any]] = None,
+) -> List[AnchorPair]:
+    """Generate exit/rejoin anchor pairs using OSM intersection nodes.
+
+    Each intersection is at a real road junction, so Valhalla has a legal
+    route that can diverge from the current road.  Falls back to an empty list
+    when no intersections straddle the blockage (caller should then fall back
+    to ``enumerate_anchor_candidates``).
+    """
+    ap = policy.anchor
+    total_m = blocked.shape_length_m
+    bs, be = blocked.blocked_start_m, blocked.blocked_end_m
+    gap = ap.min_anchor_gap_m
+
+    before_w = float(
+        search_before_window_m if search_before_window_m is not None else ap.search_before_window_m
+    )
+    after_w = float(
+        search_after_window_m if search_after_window_m is not None else ap.search_after_window_m
+    )
+
+    exit_lo = max(0.0, bs - before_w)
+    exit_hi = max(0.0, bs - gap)
+    rejoin_lo = min(total_m, be + gap)
+    rejoin_hi = min(total_m, be + after_w)
+
+    poly = None
+    if blockage_geojson:
+        try:
+            poly = shp_shape(blockage_geojson)
+            if poly.is_empty:
+                poly = None
+        except Exception:
+            poly = None
+
+    # Minimum clearance gate: discard intersections within 50 m of the blockage
+    # edge so Valhalla has room to manoeuvre.  Everything else is kept and ranked
+    # by fewest skipped stops first.
+    MIN_CLEARANCE_M = 50.0
+    exits = [
+        ix for ix in intersections
+        if exit_lo <= ix.shape_dist_m <= exit_hi
+        and (bs - ix.shape_dist_m) >= MIN_CLEARANCE_M
+    ]
+    rejoins = [
+        ix for ix in intersections
+        if rejoin_lo <= ix.shape_dist_m <= rejoin_hi
+        and (ix.shape_dist_m - be) >= MIN_CLEARANCE_M
+    ]
+
+    if not exits or not rejoins:
+        return []
+
+    k = max(1, int(max_pairs if max_pairs is not None else ap.candidate_pairs_k))
+    max_side = max(1, int(ap.candidate_stops_per_side))
+    exits = exits[:max_side]
+    rejoins = rejoins[:max_side]
+
+    stop_dists_all = [d for _, d in stops_with_dist]
+
+    # Clearance used only as a tiebreaker when skipped_est is equal.
+    blocked_len = max(50.0, be - bs)
+    target_clear = min(400.0, max(150.0, 0.5 * blocked_len))
+
+    def _cross_rank(ix: IntersectionPoint) -> int:
+        """Lowest (best) road-class rank among the drivable cross-streets."""
+        if not ix.cross_road_classes:
+            return 99
+        return min(_ROAD_CLASS_RANK.get(rc, 1) for rc in ix.cross_road_classes)
+
+    def _route_rank(ix: IntersectionPoint) -> int:
+        return _ROAD_CLASS_RANK.get(ix.road_class, 1)
+
+    scored: List[Tuple[Tuple, AnchorPair]] = []
+    for e_ix in exits:
+        for r_ix in rejoins:
+            if e_ix.shape_dist_m >= r_ix.shape_dist_m:
+                continue
+
+            # Skip if either point is inside the blockage polygon.
+            if poly is not None:
+                try:
+                    if poly.contains(Point(e_ix.lon, e_ix.lat)) or poly.contains(
+                        Point(r_ix.lon, r_ix.lat)
+                    ):
+                        continue
+                except Exception:
+                    pass
+
+            e_route_rank = _route_rank(e_ix)
+            r_route_rank = _route_rank(r_ix)
+            e_cross_rank = _cross_rank(e_ix)
+            r_cross_rank = _cross_rank(r_ix)
+
+            # Number of stops between exit and rejoin (skipped estimate).
+            skipped_est = sum(1 for d in stop_dists_all if e_ix.shape_dist_m < d < r_ix.shape_dist_m)
+
+            # Clearance penalty used only as tiebreaker when skipped_est ties.
+            exit_clear = bs - e_ix.shape_dist_m
+            rejoin_clear = r_ix.shape_dist_m - be
+            clearance_pen = (
+                max(0.0, target_clear - exit_clear)
+                + max(0.0, target_clear - rejoin_clear)
+            )
+
+            # Lower score = better anchor.
+            # Priority: route road class → cross road class → fewest skipped stops → clearance tiebreaker.
+            score = (
+                e_route_rank + r_route_rank,
+                e_cross_rank + r_cross_rank,
+                float(skipped_est),
+                clearance_pen,
+            )
+
+            e_stop_id = _nearest_stop_id_by_shape_dist(e_ix.shape_dist_m, stops_with_dist)
+            r_stop_id = _nearest_stop_id_by_shape_dist(r_ix.shape_dist_m, stops_with_dist)
+
+            best_e_cross = min(e_ix.cross_road_classes, key=lambda rc: _ROAD_CLASS_RANK.get(rc, 1), default=None)
+            best_r_cross = min(r_ix.cross_road_classes, key=lambda rc: _ROAD_CLASS_RANK.get(rc, 1), default=None)
+            cand = AnchorPair(
+                exit_lon=e_ix.lon,
+                exit_lat=e_ix.lat,
+                rejoin_lon=r_ix.lon,
+                rejoin_lat=r_ix.lat,
+                exit_stop_id=e_stop_id,
+                rejoin_stop_id=r_stop_id,
+                exit_shape_dist_m=e_ix.shape_dist_m,
+                rejoin_shape_dist_m=r_ix.shape_dist_m,
+                anchor_quality_note="intersection_anchor",
+                anchor_source="intersection_finder",
+                exit_osm_segment_id=e_ix.osm_node_id if e_ix.osm_node_id else None,
+                rejoin_osm_segment_id=r_ix.osm_node_id if r_ix.osm_node_id else None,
+                exit_road_class=e_ix.road_class or None,
+                rejoin_road_class=r_ix.road_class or None,
+                exit_road_class_rank=e_route_rank,
+                rejoin_road_class_rank=r_route_rank,
+                exit_cross_road_class=best_e_cross,
+                rejoin_cross_road_class=best_r_cross,
+            )
+            scored.append((score, cand))
+
+    if not scored:
+        return []
 
     scored.sort(key=lambda x: x[0])
     return [cand for _, cand in scored[:k]]

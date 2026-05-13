@@ -2,12 +2,37 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any, Dict, List, Optional, Tuple
 
 from shapely.geometry import LineString, Point
 
 from .models import StitchingResult
 from .policy import DetourPolicyConfig
+
+
+def _local_bearing_at_fraction(line: LineString, frac: float, probe_deg: float = 0.0002) -> Optional[float]:
+    """Bearing of the detour line at a normalized fraction position (probe forward ~20 m)."""
+    if line.is_empty or line.length <= 0:
+        return None
+    t0 = max(0.0, min(1.0, frac))
+    t1 = max(0.0, min(1.0, frac + probe_deg / max(line.length, 1e-12)))
+    if t1 <= t0:
+        t1 = min(1.0, t0 + 1e-6)
+    p0 = line.interpolate(t0, normalized=True)
+    p1 = line.interpolate(t1, normalized=True)
+    lon0, lat0 = float(p0.x), float(p0.y)
+    lon1, lat1 = float(p1.x), float(p1.y)
+    p = math.pi / 180.0
+    y = math.sin((lon1 - lon0) * p) * math.cos(lat1 * p)
+    x = math.cos(lat0 * p) * math.sin(lat1 * p) - math.sin(lat0 * p) * math.cos(lat1 * p) * math.cos((lon1 - lon0) * p)
+    b = math.degrees(math.atan2(y, x))
+    return (b + 360.0) % 360.0
+
+
+def _bearing_delta(a: float, b: float) -> float:
+    d = abs(a - b) % 360.0
+    return min(d, 360.0 - d)
 
 
 def stops_with_dist(
@@ -93,10 +118,14 @@ def compute_stitching(
 
     skipped_reasons: Dict[str, str] = {s: "between_anchors" for s in skipped}
 
-    # Rescue: detour path passes near skipped stop (no zig-zag heuristic — proximity only).
+    # Rescue: detour path passes near skipped stop with matching travel direction.
     radius_m = float(getattr(policy.service, "stop_service_radius_m", 70.0))
+    # Max bearing delta to accept a proximity rescue: >90° means reaching the stop requires
+    # opposite-direction travel, which would need an illegal turnaround.
+    rescue_max_bearing_delta = 90.0
     if detour_line is not None and not detour_line.is_empty and skipped and stitch_ok:
         deg_per_m = 1.0 / 111_320.0
+        detour_total_len = detour_line.length
         rescued: List[str] = []
         still_skipped: List[str] = []
         for sid in skipped:
@@ -107,12 +136,27 @@ def compute_stitching(
             try:
                 pt = Point(ll[0], ll[1])
                 dist_deg = float(detour_line.distance(pt))
-                if dist_deg <= radius_m * deg_per_m:
-                    rescued.append(sid)
-                    notes.append(f"served_via_detour_proximity:{sid}")
-                    skipped_reasons[sid] = "served_via_detour_proximity"
-                else:
+                if dist_deg > radius_m * deg_per_m:
                     still_skipped.append(sid)
+                    continue
+                # Direction check: compare detour bearing at the nearest point to the
+                # original shape bearing at the stop's shape position.
+                proj_frac = float(detour_line.project(pt, normalized=True))
+                detour_bearing = _local_bearing_at_fraction(detour_line, proj_frac)
+                # Approximate shape bearing using stop's position along the route shape.
+                shape_proj = float(line.project(pt, normalized=True))
+                shape_bearing = _local_bearing_at_fraction(line, shape_proj)
+                if (
+                    detour_bearing is not None
+                    and shape_bearing is not None
+                    and _bearing_delta(detour_bearing, shape_bearing) > rescue_max_bearing_delta
+                ):
+                    still_skipped.append(sid)
+                    notes.append(f"rescue_rejected_wrong_direction:{sid}")
+                    continue
+                rescued.append(sid)
+                notes.append(f"served_via_detour_proximity:{sid}")
+                skipped_reasons[sid] = "served_via_detour_proximity"
             except Exception:
                 still_skipped.append(sid)
         skipped = still_skipped

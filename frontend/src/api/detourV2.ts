@@ -32,6 +32,15 @@ export type DetourTier =
   | "LOW_CONFIDENCE"
   | "EMERGENCY_FALLBACK";
 
+export type DetourComputeStatus =
+  | "auto_ok"
+  | "review_recommended"
+  | "low_confidence"
+  | "emergency_fallback"
+  | "no_safe_detour"
+  | "no_impact"
+  | "error";
+
 export type DetourV2ComputeCandidate = {
   strategy?: string;
   total_score?: number | null;
@@ -69,10 +78,14 @@ export type DetourV2Anchors = {
   rejoin_lat?: number;
   exit_stop_id?: string | null;
   rejoin_stop_id?: string | null;
+  exit_road_class?: string | null;
+  rejoin_road_class?: string | null;
+  exit_road_class_rank?: number | null;
+  rejoin_road_class_rank?: number | null;
 };
 
 export type DetourV2ComputeResult = {
-  status?: string;
+  status?: DetourComputeStatus | string;
   trip_id?: string;
   route_id?: string;
   error?: string | null;

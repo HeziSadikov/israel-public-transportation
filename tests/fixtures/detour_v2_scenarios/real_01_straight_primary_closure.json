@@ -1,0 +1,34 @@
+{
+  "id": "real_01_straight_primary_closure",
+  "description": "Blockage across a straight section of a primary road (e.g. Jabotinsky Street Petah Tikva). Detour expected on parallel secondary road. Anchor must land on primary/secondary, not residential.",
+  "trip_id": "test_trip_primary_001",
+  "service_date": "20260511",
+  "route_coords_lonlat": [
+    [34.876, 32.082], [34.878, 32.082], [34.880, 32.082], [34.882, 32.082],
+    [34.884, 32.082], [34.886, 32.082], [34.888, 32.082], [34.890, 32.082],
+    [34.892, 32.082], [34.894, 32.082], [34.896, 32.082], [34.898, 32.082],
+    [34.900, 32.082], [34.902, 32.082], [34.904, 32.082], [34.906, 32.082],
+    [34.908, 32.082], [34.910, 32.082], [34.912, 32.082], [34.914, 32.082]
+  ],
+  "blockage_geojson": {
+    "type": "Polygon",
+    "coordinates": [[[34.887, 32.079], [34.893, 32.079], [34.893, 32.085], [34.887, 32.085], [34.887, 32.079]]]
+  },
+  "detour_coords_lonlat": [
+    [34.885, 32.082], [34.885, 32.078], [34.890, 32.078], [34.896, 32.078],
+    [34.896, 32.082], [34.898, 32.082]
+  ],
+  "stop_shape_dist_step_m": 200,
+  "mock_valhalla": "detour_ok",
+  "expect": {
+    "min_tier_status": "low_confidence",
+    "min_confidence_score": 0.0,
+    "blocked_span_m": [1000, 3000],
+    "blocked_span_tolerance_m": 1000,
+    "exit_bbox_lonlat": [34.878, 32.075, 34.890, 32.090],
+    "rejoin_bbox_lonlat": [34.892, 32.075, 34.905, 32.090],
+    "max_skipped_stops": 10,
+    "forbidden_osm_way_ids": []
+  },
+  "_note": "Replace trip_id with a real GTFS trip_id when running E2E (RUN_VALHALLA_E2E=1). The detour_coords_lonlat here are synthetic; real Valhalla will route around the polygon automatically."
+}

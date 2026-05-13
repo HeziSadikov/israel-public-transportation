@@ -26,6 +26,8 @@ MAJOR = frozenset(
     }
 )
 LOCAL = frozenset({"residential", "service", "unclassified", "tertiary_link"})
+# Highway classes that are never drivable by a bus.
+NON_DRIVABLE = frozenset({"footway", "path", "cycleway", "pedestrian", "steps", "bridleway", "construction"})
 
 # Valhalla DirectionsLeg.Maneuver.Type (directions.proto): kUturnRight=12, kUturnLeft=13
 _VALHALLA_UTURN_MANEUVER_TYPES = frozenset({12, 13})
@@ -102,6 +104,7 @@ def evaluate_candidate(
     stitch_ok: bool = True,
     invalid_geometry: bool = False,
     carriageway_reasons: Optional[List[str]] = None,
+    route_coincide_fraction: Optional[float] = None,
 ) -> FeasibilityResult:
     """
     Absolute hard rejects (only):
@@ -140,6 +143,17 @@ def evaluate_candidate(
             confidence_score=0.0,
             warnings=["path_intersects_blockage"],
         )
+    # Hard reject: detour coincides with the original route (no real bypass).
+    if route_coincide_fraction is not None:
+        cap_coincide = float(getattr(policy.service, "max_route_coincide_fraction", 0.85))
+        if route_coincide_fraction >= cap_coincide:
+            hard.append(f"no_real_bypass:coincide={round(route_coincide_fraction, 2)}")
+            return FeasibilityResult(
+                accepted=False,
+                hard_reject_reasons=hard,
+                confidence_score=0.0,
+                warnings=[f"detour_coincides_with_route_{round(route_coincide_fraction * 100)}pct"],
+            )
     if not stitch_ok:
         hard.append("cannot_stitch_service")
         return FeasibilityResult(
@@ -151,7 +165,7 @@ def evaluate_candidate(
 
     hard_thr = float(policy.service.backtrack_hard_bearing_deg)
     max_backtrack = max(float(bearing_delta_exit_deg or 0.0), float(bearing_delta_rejoin_deg or 0.0))
-    if max_backtrack >= hard_thr:
+    if max_backtrack >= hard_thr and bool(getattr(policy.service, "reject_hard_backtrack", True)):
         hard.append("wrong_direction_rejoin")
         return FeasibilityResult(
             accepted=False,
@@ -159,6 +173,34 @@ def evaluate_candidate(
             confidence_score=0.0,
             warnings=[f"wrong_direction_rejoin_delta_deg={round(max_backtrack, 1)}"],
         )
+
+    # Explicit U-turn maneuver check (kUturnRight=12, kUturnLeft=13).
+    if turn_by_turn:
+        _uturn_detected = False
+        for row in turn_by_turn:
+            mti = _maneuver_type_as_int(row.get("maneuver_type"))
+            if mti is not None and mti in _VALHALLA_UTURN_MANEUVER_TYPES:
+                _uturn_detected = True
+                break
+            txt = str(row.get("instruction_en") or "")
+            if _text_indicates_explicit_u_turn(txt):
+                _uturn_detected = True
+                break
+        if _uturn_detected:
+            if bool(getattr(policy.service, "reject_explicit_u_turn_maneuver", True)):
+                hard.append("explicit_u_turn_maneuver")
+                return FeasibilityResult(
+                    accepted=False,
+                    hard_reject_reasons=hard,
+                    confidence_score=0.0,
+                    warnings=["u_turn_maneuver_detected"],
+                )
+            else:
+                # Penalty-only fallback when flag is disabled.
+                turn_pen += max(float(policy.penalty.turn_sharp_s) * 2.0, 30.0)
+                notes.append("explicit_u_turn_instruction")
+                warnings.append("u_turn_maneuver_detected")
+                confidence -= 0.05
 
     pen_thr = float(policy.service.backtrack_penalty_bearing_deg)
     if max_backtrack >= pen_thr:
@@ -173,6 +215,8 @@ def evaluate_candidate(
     unk_local_d = 0.0
     unknown_way_d = 0.0
 
+    all_synthetic = all(s.synthetic for s in decoded.road_segments) if decoded.road_segments else True
+
     for seg in decoded.road_segments:
         if seg.synthetic:
             unc_pen += policy.penalty.segment_uncertainty_local_per_segment_s * 0.25
@@ -183,29 +227,88 @@ def evaluate_candidate(
             confidence -= 0.02
             continue
         cls = _segment_class(seg.highway)
-        if seg.osm_way_id and seg.osm_way_id in banned_way_ids:
-            seg_pen += 400.0
-            warnings.append(f"uses_banned_incident_way_{seg.osm_way_id}")
-            confidence -= 0.15
+        hw = (seg.highway or "").strip().lower()
         access = (seg.access or "").strip().lower()
         bus_v = (seg.bus or "").strip().lower()
         psv_v = (seg.psv or "").strip().lower()
+        wid = int(seg.osm_way_id or 0)
+
+        # Hard reject: non-drivable road class (footway, path, cycleway, pedestrian, …).
+        if not all_synthetic and bool(getattr(policy.vehicle, "reject_segment_pedestrian_class", True)):
+            if hw in NON_DRIVABLE:
+                hard.append(f"non_drivable_class:{hw}:{wid}")
+                return FeasibilityResult(
+                    accepted=False,
+                    hard_reject_reasons=hard,
+                    confidence_score=0.0,
+                    warnings=[f"non_drivable_highway_{hw}_{wid}"],
+                )
+
+        # Hard reject: access=no/private without bus/psv exception.
+        if not all_synthetic and bool(getattr(policy.vehicle, "reject_segment_access_no_without_bus", True)):
+            if access in {"no", "private"} and bus_v not in {"yes", "designated"} and psv_v not in {"yes", "designated"}:
+                hard.append(f"access_restricted_without_bus_exception:{wid}")
+                return FeasibilityResult(
+                    accepted=False,
+                    hard_reject_reasons=hard,
+                    confidence_score=0.0,
+                    warnings=[f"access_restricted_way_{wid}"],
+                )
+
+        # Hard reject: bus explicitly forbidden.
+        if not all_synthetic and (bus_v in {"no", "private"} or psv_v in {"no", "private"}):
+            hard.append(f"bus_explicitly_forbidden:{wid}")
+            return FeasibilityResult(
+                accepted=False,
+                hard_reject_reasons=hard,
+                confidence_score=0.0,
+                warnings=[f"non_bus_tag_way_{wid}"],
+            )
+
+        # Hard reject: segment is in the incident edge ban list.
+        if not all_synthetic and bool(getattr(policy.vehicle, "reject_segment_in_incident_ban", True)):
+            if wid and wid in banned_way_ids:
+                hard.append(f"uses_banned_incident_way:{wid}")
+                return FeasibilityResult(
+                    accepted=False,
+                    hard_reject_reasons=hard,
+                    confidence_score=0.0,
+                    warnings=[f"uses_banned_incident_way_{wid}"],
+                )
+
+        if wid and wid in banned_way_ids:
+            seg_pen += 400.0
+            warnings.append(f"uses_banned_incident_way_{wid}")
+            confidence -= 0.15
         if bus_v in {"no", "private"} or psv_v in {"no", "private"}:
             seg_pen += 300.0
-            warnings.append(f"non_bus_tag_way_{seg.osm_way_id}")
+            warnings.append(f"non_bus_tag_way_{wid}")
             confidence -= 0.12
         if access in {"no", "private"} and bus_v not in {"yes", "designated"} and psv_v not in {"yes", "designated"}:
             seg_pen += 350.0
-            warnings.append(f"access_restricted_way_{seg.osm_way_id}")
+            warnings.append(f"access_restricted_way_{wid}")
             confidence -= 0.14
         if policy.vehicle.require_gtfs_way_evidence:
-            ev = gtfs_way_evidence.get(int(seg.osm_way_id or 0))
-            conf = float((ev or {}).get("confidence_score") or 0.0)
-            if conf < float(policy.vehicle.min_gtfs_way_confidence):
-                seg_pen += 80.0
-                unknown_way_d += seg.length_m
-                warnings.append(f"not_in_gtfs_bus_corridor_{seg.osm_way_id}")
-                confidence -= 0.04
+            wid_int = int(seg.osm_way_id or 0)
+            ev = gtfs_way_evidence.get(wid_int)
+            gtfs_conf = float((ev or {}).get("confidence_score") or 0.0)
+            # Also credit operator-approved bus_edge_evidence as "known".
+            bus_ev_entry = bus_edge_evidence.get(wid_int)
+            bus_ev_conf = float((bus_ev_entry or {}).get("confidence_score") or 0.0)
+            bus_ev_appr = int((bus_ev_entry or {}).get("approved_detour_count") or 0)
+            has_known = (
+                gtfs_conf >= float(policy.vehicle.min_gtfs_way_confidence)
+                or bus_ev_conf >= 0.2
+                or bus_ev_appr > 0
+            )
+            if not has_known:
+                hard.append(f"not_in_gtfs_bus_corridor:{wid_int}")
+                return FeasibilityResult(
+                    accepted=False,
+                    hard_reject_reasons=hard,
+                    confidence_score=0.0,
+                    warnings=[f"way_{wid_int}_no_gtfs_bus_evidence"],
+                )
         if cls == "living":
             seg_pen += 500.0
             warnings.append("living_street")
@@ -217,7 +320,6 @@ def evaluate_candidate(
         elif cls == "other":
             seg_pen += (seg.length_m / 1000.0) * policy.penalty.segment_unclassified_per_km_s
 
-        wid = int(seg.osm_way_id or 0)
         if wid and wid in bus_edge_evidence:
             be = bus_edge_evidence[wid]
             bconf = float((be or {}).get("confidence_score") or 0.0)
@@ -226,19 +328,26 @@ def evaluate_candidate(
                 ev_bonus += (seg.length_m / 1000.0) * policy.penalty.segment_evidence_bonus_per_km_s
                 confidence += 0.02
 
-    all_synthetic = all(s.synthetic for s in decoded.road_segments) if decoded.road_segments else True
     if total_d > 0 and not all_synthetic:
         lf = local_d / total_d
         uf = unk_local_d / total_d
-        if bool(getattr(policy.vehicle, "reject_hard_local_share", False)):
+        if bool(getattr(policy.vehicle, "reject_hard_local_share", True)):
             if lf > policy.vehicle.local_fraction_hard_reject:
-                seg_pen += 200.0
-                warnings.append("local_fraction_exceeded")
-                confidence -= 0.1
+                hard.append(f"local_road_share_too_high:{round(lf, 2)}")
+                return FeasibilityResult(
+                    accepted=False,
+                    hard_reject_reasons=hard,
+                    confidence_score=0.0,
+                    warnings=["local_fraction_exceeded"],
+                )
             if uf > policy.vehicle.unknown_width_local_fraction_hard_reject:
-                seg_pen += 200.0
-                warnings.append("unknown_width_local_fraction_exceeded")
-                confidence -= 0.1
+                hard.append(f"unknown_local_share_too_high:{round(uf, 2)}")
+                return FeasibilityResult(
+                    accepted=False,
+                    hard_reject_reasons=hard,
+                    confidence_score=0.0,
+                    warnings=["unknown_width_local_fraction_exceeded"],
+                )
         else:
             if lf > policy.vehicle.local_fraction_hard_reject:
                 seg_pen += 120.0
@@ -269,23 +378,6 @@ def evaluate_candidate(
         svc_pen += (detour_distance_m - policy.service.hard_extra_distance_limit_m) / 20.0
         warnings.append("service_distance_excessive")
         confidence -= 0.06
-
-    if turn_by_turn:
-        has_u_turn = False
-        for row in turn_by_turn:
-            mti = _maneuver_type_as_int(row.get("maneuver_type"))
-            if mti is not None and mti in _VALHALLA_UTURN_MANEUVER_TYPES:
-                has_u_turn = True
-                break
-            txt = str(row.get("instruction_en") or "")
-            if _text_indicates_explicit_u_turn(txt):
-                has_u_turn = True
-                break
-        if has_u_turn:
-            turn_pen += max(float(policy.penalty.turn_sharp_s) * 2.0, 30.0)
-            notes.append("explicit_u_turn_instruction")
-            warnings.append("u_turn_maneuver_detected")
-            confidence -= 0.05
 
     sharp_turn_thr = float(getattr(policy.service, "sharp_turn_threshold_deg", 120.0))
     sharp_turn_hard = int(getattr(policy.service, "sharp_turn_hard_count", 3))

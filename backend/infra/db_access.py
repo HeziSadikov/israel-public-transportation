@@ -4585,6 +4585,23 @@ def insert_incident(
             conn.close()
 
 
+def _sanitize_for_jsonb(obj: Any) -> Any:
+    """Recursively replace non-finite floats with None before json.dumps.
+
+    PostgreSQL jsonb rejects the bare tokens ``Infinity``, ``-Infinity`` and
+    ``NaN`` that Python's json.dumps emits for float('inf') / float('nan').
+    """
+    import math as _math  # local import so it doesn't pollute module-level namespace
+
+    if isinstance(obj, float):
+        return obj if _math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _sanitize_for_jsonb(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_for_jsonb(v) for v in obj]
+    return obj
+
+
 def insert_detour_request(
     *,
     feed_id: int,
@@ -4615,7 +4632,7 @@ def insert_detour_request(
                     service_date,
                     incident_id,
                     status,
-                    json.dumps(payload_json),
+                    json.dumps(_sanitize_for_jsonb(payload_json), allow_nan=False),
                 ),
             )
             row = cur.fetchone()
@@ -4661,15 +4678,15 @@ def insert_detour_candidate(
                     detour_request_id,
                     candidate_rank,
                     strategy,
-                    json.dumps(geometry_json) if geometry_json is not None else None,
-                    json.dumps(road_sequence_json),
-                    json.dumps(turn_sequence_json),
-                    travel_time_s,
-                    distance_m,
-                    score,
+                    json.dumps(_sanitize_for_jsonb(geometry_json), allow_nan=False) if geometry_json is not None else None,
+                    json.dumps(_sanitize_for_jsonb(road_sequence_json), allow_nan=False),
+                    json.dumps(_sanitize_for_jsonb(turn_sequence_json), allow_nan=False),
+                    _sanitize_for_jsonb(travel_time_s),
+                    _sanitize_for_jsonb(distance_m),
+                    _sanitize_for_jsonb(score),
                     accepted,
-                    json.dumps(rejection_reasons_json),
-                    json.dumps(score_breakdown_json),
+                    json.dumps(_sanitize_for_jsonb(rejection_reasons_json), allow_nan=False),
+                    json.dumps(_sanitize_for_jsonb(score_breakdown_json), allow_nan=False),
                 ),
             )
             conn.commit()
@@ -4893,6 +4910,8 @@ def bump_bus_turn_evidence(from_way_id: int, via_node_id: int, to_way_id: int, c
                 VALUES (%s, %s, %s, 1, NOW())
                 ON CONFLICT (from_way_id, via_node_id, to_way_id) DO UPDATE SET
                     approved_detour_count = bus_turn_evidence.approved_detour_count + 1,
+                    confidence_score = (bus_turn_evidence.approved_detour_count + 1)::double precision
+                        / ((bus_turn_evidence.approved_detour_count + 1) + COALESCE(bus_turn_evidence.manual_reject_count, 0) + 2.0),
                     last_seen_at = NOW()
                 """,
                 (from_way_id, via_node_id, to_way_id),
@@ -4919,6 +4938,8 @@ def bump_bus_edge_evidence(osm_way_id: int, direction: Optional[str], conn=None)
                 VALUES (%s, %s, 1, NOW())
                 ON CONFLICT (osm_way_id, direction) DO UPDATE SET
                     approved_detour_count = bus_edge_evidence.approved_detour_count + 1,
+                    confidence_score = (bus_edge_evidence.approved_detour_count + 1)::double precision
+                        / ((bus_edge_evidence.approved_detour_count + 1) + COALESCE(bus_edge_evidence.manual_reject_count, 0) + 2.0),
                     last_seen_at = NOW()
                 """,
                 (osm_way_id, d),
