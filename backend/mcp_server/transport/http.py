@@ -58,6 +58,8 @@ from backend.infra.config import (
     DETOUR_V2_AI_LOG,
     DETOUR_V2_DEBUG,
     DETOUR_ENGINE,
+    DETOUR_V3_ENABLED,
+    detour_per_trip_engine_default,
 )
 from backend.mcp_server.schemas.api_models import (
     RouteSearchRequest,
@@ -108,7 +110,8 @@ from backend.infra import db_access as db_access_module
 from backend.infra.logging_utils import log
 from backend.domain.service_calendar import ServiceCalendar, resolve_service_profile
 from backend.infra.uvicorn_logging import LOGGING_CONFIG
-from backend.domain.detour_v2.compute import compute_detour_for_trip
+from backend.detour_v3.compute import compute_detour_for_trip as compute_detour_v3_for_trip
+from backend.domain.detour_v2.compute import compute_detour_for_trip as compute_detour_v2_for_trip
 from backend.domain.detour_v2.serialize import detour_compute_output_to_dict, format_detour_ai_log_line
 from backend.domain.detour_v2.policy import get_default_policy
 from backend.domain.detour_v2.incident_projector import project_incident_polygon
@@ -3132,9 +3135,22 @@ def post_incident(req: IncidentCreateRequest):
     )
 
 
+
+def _detour_compute_engine_for_http(req: DetourComputeV2Request) -> str:
+    """Resolve per-request engine: explicit compute_engine > DETOUR_ENGINE default."""
+    raw = getattr(req, "compute_engine", None)
+    if isinstance(raw, str):
+        s = raw.strip().lower()
+        if s == "v2":
+            return "v2"
+        if s == "v3":
+            return "v3"
+    return detour_per_trip_engine_default()
+
+
 @app.post("/api/v1/detours/compute", response_model=DetourComputeV2Response)
 def post_detours_compute_v2(req: DetourComputeV2Request):
-    """Compute road-graph detours for one or more trips (detour v2 engine)."""
+    """Compute road-graph detours for one or more trips (detour v2 and/or v3 engine)."""
     if not DETOUR_V2_ENABLED:
         raise HTTPException(status_code=503, detail="Detour v2 API is disabled (DETOUR_V2_ENABLED=0).")
     if not req.blockage_geojson:
@@ -3163,6 +3179,9 @@ def post_detours_compute_v2(req: DetourComputeV2Request):
         trip_ids_to_compute = [tid]
         source = "route_id"
     pol = get_default_policy()
+    compute_engine = _detour_compute_engine_for_http(req)
+    if compute_engine == "v3" and not DETOUR_V3_ENABLED:
+        compute_engine = "v2"
     log(
         "detours/v2/compute",
         " ".join(
@@ -3174,6 +3193,8 @@ def post_detours_compute_v2(req: DetourComputeV2Request):
                 f"source={source}",
                 f"route_id={req.route_id or ''}",
                 f"direction_id={req.direction_id if req.direction_id is not None else ''}",
+                f"compute_engine={compute_engine}",
+                f"DETOUR_ENGINE={DETOUR_ENGINE}",
             ]
         ),
     )
@@ -3195,16 +3216,27 @@ def post_detours_compute_v2(req: DetourComputeV2Request):
         out = None
         payload: Dict[str, Any]
         try:
-            out = compute_detour_for_trip(
-                trip_id=trip_id,
-                blockage_geojson=req.blockage_geojson,
-                service_date=req.service_date,
-                incident_id=req.incident_id,
-                _valhalla_cache=valhalla_cache,
-                debug_detour=use_geojson,
-                use_matched_physical=bool(getattr(req, "use_matched_physical", False)),
-            )
-            if use_ai_log:
+            if compute_engine == "v3":
+                out = compute_detour_v3_for_trip(
+                    trip_id=trip_id,
+                    blockage_geojson=req.blockage_geojson,
+                    service_date=req.service_date,
+                    incident_id=req.incident_id,
+                    _valhalla_cache=valhalla_cache,
+                    debug_detour=use_geojson,
+                    use_matched_physical=False,
+                )
+            else:
+                out = compute_detour_v2_for_trip(
+                    trip_id=trip_id,
+                    blockage_geojson=req.blockage_geojson,
+                    service_date=req.service_date,
+                    incident_id=req.incident_id,
+                    _valhalla_cache=valhalla_cache,
+                    debug_detour=use_geojson,
+                    use_matched_physical=bool(getattr(req, "use_matched_physical", False)),
+                )
+            if use_ai_log and compute_engine != "v3":
                 try:
                     log("detours/v2/compute_ai", format_detour_ai_log_line(out))
                 except Exception as ai_log_exc:
@@ -3213,6 +3245,8 @@ def post_detours_compute_v2(req: DetourComputeV2Request):
                         f"trip_id={trip_id} error=ai_log_failed err={ai_log_exc!s}",
                     )
             payload = detour_compute_output_to_dict(out)
+            payload["compute_engine_used"] = compute_engine
+            payload.setdefault("detour_engine_config", DETOUR_ENGINE)
         except Exception as e:
             payload = {
                 "status": "error",
@@ -3223,6 +3257,8 @@ def post_detours_compute_v2(req: DetourComputeV2Request):
                 "error_type": type(e).__name__,
                 "error_message": str(e),
                 "candidates": [],
+                "compute_engine_used": compute_engine,
+                "detour_engine_config": DETOUR_ENGINE,
             }
             log(
                 "detours/v2/compute",

@@ -6239,6 +6239,383 @@ def bulk_upsert_pattern_edge_match_summaries(
             )
 
 
+def fetch_osm_road_segments_by_way_endpoint_triples(
+    triples: Sequence[Tuple[int, int, int]],
+    conn,
+) -> Dict[Tuple[int, int, int], List[Dict[str, Any]]]:
+    """
+    Bulk-load candidate ``osm_road_segments`` rows for each directed triple
+    (osm_way_id, from_node_id, to_node_id). Multiple rows per key are possible
+    when legacy stubs overlap v3 geometry.
+    """
+    out: Dict[Tuple[int, int, int], List[Dict[str, Any]]] = defaultdict(list)
+    uniq = sorted({(int(w), int(f), int(t)) for w, f, t in triples})
+    if not uniq:
+        return out
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT segment_id, osm_way_id, from_node_id, to_node_id,
+                   heading_start_deg, heading_end_deg, COALESCE(import_source, '') AS import_source,
+                   length_m
+            FROM osm_road_segments
+            WHERE (osm_way_id, from_node_id, to_node_id) IN %s
+            """,
+            (tuple(uniq),),
+        )
+        for r in cur.fetchall() or []:
+            key = (
+                int(r["osm_way_id"]),
+                int(r["from_node_id"]),
+                int(r["to_node_id"]),
+            )
+            out[key].append(dict(r))
+    return out
+
+
+def count_pattern_osm_segments(
+    *,
+    feed_id: int,
+    pattern_id: str,
+    conn,
+) -> int:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT COUNT(*) AS n FROM pattern_osm_segments
+            WHERE feed_id = %s AND pattern_id = %s
+            """,
+            (int(feed_id), str(pattern_id)),
+        )
+        row = cur.fetchone()
+        return int(row["n"] or 0) if row else 0
+
+
+def replace_pattern_osm_segments(
+    *,
+    feed_id: int,
+    pattern_id: str,
+    rows: Sequence[Dict[str, Any]],
+    conn,
+) -> None:
+    """
+    Replace stored path for ``(feed_id, pattern_id)``.
+
+    rows: seq (int, 1-based), segment_id (int), confidence (optional float),
+    source (optional str).
+    """
+    from psycopg2.extras import execute_values
+
+    fid = int(feed_id)
+    pid = str(pattern_id)
+    with conn.cursor() as cur:
+        cur.execute(
+            "DELETE FROM pattern_osm_segments WHERE feed_id = %s AND pattern_id = %s",
+            (fid, pid),
+        )
+        if not rows:
+            return
+        flat = [
+            (
+                fid,
+                pid,
+                int(r["seq"]),
+                int(r["segment_id"]),
+                r.get("confidence"),
+                str(r["source"]) if r.get("source") is not None else None,
+            )
+            for r in rows
+        ]
+        execute_values(
+            cur,
+            """
+            INSERT INTO pattern_osm_segments (feed_id, pattern_id, seq, segment_id, confidence, source)
+            VALUES %s
+            """,
+            flat,
+        )
+
+
+def fetch_pattern_osm_segments_path(
+    *,
+    feed_id: int,
+    pattern_id: str,
+    conn,
+) -> List[Dict[str, Any]]:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT seq, segment_id, confidence, source
+            FROM pattern_osm_segments
+            WHERE feed_id = %s AND pattern_id = %s
+            ORDER BY seq ASC
+            """,
+            (int(feed_id), str(pattern_id)),
+        )
+        return [dict(r) for r in cur.fetchall() or []]
+
+
+def resolve_pattern_id_for_trip(trip_id: str, conn) -> Optional[str]:
+    """
+    Pick a ``patterns.pattern_id`` row for the trip using route, direction, shape, and optional repr_trip_id tie-break.
+    """
+    feed_id = get_active_feed_id(conn)
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT route_id, direction_id, shape_id
+            FROM trips
+            WHERE feed_id = %s AND trip_id = %s
+            LIMIT 1
+            """,
+            (feed_id, str(trip_id)),
+        )
+        tr = cur.fetchone()
+        if not tr:
+            return None
+        route_id = str(tr["route_id"])
+        dir_id = tr.get("direction_id")
+        shape_id = tr.get("shape_id")
+        shape_s = str(shape_id) if shape_id is not None else None
+
+        cur.execute(
+            """
+            SELECT pattern_id
+            FROM patterns
+            WHERE feed_id = %s
+              AND route_id = %s
+              AND (direction_id IS NOT DISTINCT FROM %s)
+              AND (
+                repr_shape_id IS NOT DISTINCT FROM %s
+                OR repr_shape_id IS NULL
+              )
+            ORDER BY
+              CASE WHEN repr_trip_id = %s THEN 0 ELSE 1 END,
+              CASE WHEN repr_shape_id IS NOT NULL THEN 0 ELSE 1 END,
+              pattern_id
+            LIMIT 1
+            """,
+            (feed_id, route_id, dir_id, shape_s, str(trip_id)),
+        )
+        r1 = cur.fetchone()
+        if r1 and r1.get("pattern_id"):
+            return str(r1["pattern_id"])
+
+        cur.execute(
+            """
+            SELECT pattern_id
+            FROM patterns
+            WHERE feed_id = %s AND route_id = %s
+              AND (direction_id IS NOT DISTINCT FROM %s)
+            ORDER BY COALESCE(frequency, 0) DESC, pattern_id
+            LIMIT 1
+            """,
+            (feed_id, route_id, dir_id),
+        )
+        r2 = cur.fetchone()
+        return str(r2["pattern_id"]) if r2 and r2.get("pattern_id") else None
+
+
+def fetch_gtfs_bus_observed_segment_ids(*, feed_id: int, conn) -> Set[int]:
+    """Segment ids present in ``gtfs_bus_segment_evidence`` for the feed."""
+    out: Set[int] = set()
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT segment_id FROM gtfs_bus_segment_evidence WHERE feed_id = %s",
+            (int(feed_id),),
+        )
+        for r in cur.fetchall() or []:
+            out.add(int(r["segment_id"]))
+    return out
+
+
+def detour_path_intersects_polygon_wkt(
+    segment_ids: Sequence[int],
+    polygon_wkt: str,
+    *,
+    conn,
+) -> bool:
+    """True when any ``osm_road_segments.geom`` on the path intersects the polygon."""
+    ids = [int(x) for x in segment_ids if x is not None]
+    if not ids:
+        return False
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT EXISTS (
+              SELECT 1
+              FROM osm_road_segments s,
+                   (SELECT ST_SetSRID(ST_GeomFromText(%s, 4326), 4326) AS g) AS poly
+              WHERE s.segment_id = ANY(%s)
+                AND ST_Intersects(s.geom, poly.g)
+            )
+            """,
+            (str(polygon_wkt), ids),
+        )
+        row = cur.fetchone()
+        return bool(row and row.get("exists"))
+
+
+def fetch_segment_path_geojson_feature(
+    segment_ids: Sequence[int],
+    *,
+    conn,
+    properties: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Merge ordered segment geometries into one GeoJSON LineString/MultiLineString feature."""
+    ids = [int(x) for x in segment_ids]
+    if not ids:
+        return {"type": "Feature", "geometry": {"type": "LineString", "coordinates": []}, "properties": properties or {}}
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT ST_AsGeoJSON(
+              ST_LineMerge(
+                ST_Collect(s.geom ORDER BY array_position(%s::bigint[], s.segment_id))
+              )
+            )::text AS gj
+            FROM osm_road_segments s
+            WHERE s.segment_id = ANY(%s)
+            """,
+            (ids, ids),
+        )
+        row = cur.fetchone()
+        gj_raw = row["gj"] if row else None
+    try:
+        geom = json.loads(gj_raw) if gj_raw else {"type": "LineString", "coordinates": []}
+    except Exception:
+        geom = {"type": "LineString", "coordinates": []}
+    feat: Dict[str, Any] = {"type": "Feature", "geometry": geom, "properties": dict(properties or {})}
+    return feat
+
+
+def rebuild_gtfs_bus_corridor_evidence(*, feed_id: int, conn) -> Dict[str, int]:
+    """
+    Replace ``gtfs_bus_segment_evidence`` and ``gtfs_bus_turn_evidence`` for ``feed_id``
+    from ``pattern_osm_segments`` + ``patterns`` + ``trips`` join keys.
+    Caller should commit.
+    """
+    fid = int(feed_id)
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM gtfs_bus_turn_evidence WHERE feed_id = %s", (fid,))
+        turn_deleted = cur.rowcount
+        cur.execute("DELETE FROM gtfs_bus_segment_evidence WHERE feed_id = %s", (fid,))
+        seg_deleted = cur.rowcount
+
+        cur.execute(
+            """
+            WITH pat_trips AS (
+              SELECT p.pattern_id, COUNT(DISTINCT t.trip_id)::int AS trip_cnt
+              FROM patterns p
+              INNER JOIN trips t
+                ON t.feed_id = p.feed_id
+               AND t.route_id = p.route_id
+               AND (t.direction_id IS NOT DISTINCT FROM p.direction_id)
+               AND (
+                    (p.repr_shape_id IS NOT NULL AND (t.shape_id IS NOT DISTINCT FROM p.repr_shape_id))
+                 OR (p.repr_shape_id IS NULL)
+               )
+              WHERE p.feed_id = %s
+              GROUP BY p.pattern_id
+            ),
+            seg_exp AS (
+              SELECT
+                pos.segment_id,
+                pos.pattern_id,
+                p.route_id,
+                COALESCE(pt.trip_cnt, 0) AS trip_cnt,
+                COALESCE(pos.confidence, 0.5)::double precision AS conf
+              FROM pattern_osm_segments pos
+              INNER JOIN patterns p
+                ON p.feed_id = pos.feed_id AND p.pattern_id = pos.pattern_id
+              LEFT JOIN pat_trips pt ON pt.pattern_id = p.pattern_id
+              WHERE pos.feed_id = %s
+            ),
+            seg_agg AS (
+              SELECT
+                segment_id,
+                SUM(trip_cnt)::int AS trip_count,
+                COUNT(DISTINCT pattern_id)::int AS pattern_count,
+                COUNT(DISTINCT route_id)::int AS route_count,
+                AVG(conf)::double precision AS confidence_score
+              FROM seg_exp
+              GROUP BY segment_id
+            )
+            INSERT INTO gtfs_bus_segment_evidence (
+              feed_id, segment_id, trip_count, route_count, pattern_count, confidence_score
+            )
+            SELECT %s, segment_id, trip_count, route_count, pattern_count, confidence_score
+            FROM seg_agg
+            """,
+            (fid, fid, fid),
+        )
+        seg_inserted = cur.rowcount
+
+        cur.execute(
+            """
+            WITH pat_trips AS (
+              SELECT p.pattern_id, COUNT(DISTINCT t.trip_id)::int AS trip_cnt
+              FROM patterns p
+              INNER JOIN trips t
+                ON t.feed_id = p.feed_id
+               AND t.route_id = p.route_id
+               AND (t.direction_id IS NOT DISTINCT FROM p.direction_id)
+               AND (
+                    (p.repr_shape_id IS NOT NULL AND (t.shape_id IS NOT DISTINCT FROM p.repr_shape_id))
+                 OR (p.repr_shape_id IS NULL)
+               )
+              WHERE p.feed_id = %s
+              GROUP BY p.pattern_id
+            ),
+            turn_exp AS (
+              SELECT
+                pos.segment_id AS from_segment_id,
+                nxt.segment_id AS to_segment_id,
+                pos.pattern_id,
+                p.route_id,
+                COALESCE(pt.trip_cnt, 0) AS trip_cnt,
+                (
+                  COALESCE(pos.confidence, 0.5) + COALESCE(nxt.confidence, 0.5)
+                ) / 2.0::double precision AS conf
+              FROM pattern_osm_segments pos
+              INNER JOIN pattern_osm_segments nxt
+                ON nxt.feed_id = pos.feed_id
+               AND nxt.pattern_id = pos.pattern_id
+               AND nxt.seq = pos.seq + 1
+              INNER JOIN patterns p
+                ON p.feed_id = pos.feed_id AND p.pattern_id = pos.pattern_id
+              LEFT JOIN pat_trips pt ON pt.pattern_id = p.pattern_id
+              WHERE pos.feed_id = %s
+            ),
+            turn_agg AS (
+              SELECT
+                from_segment_id,
+                to_segment_id,
+                SUM(trip_cnt)::int AS trip_count,
+                COUNT(DISTINCT pattern_id)::int AS pattern_count,
+                COUNT(DISTINCT route_id)::int AS route_count,
+                AVG(conf)::double precision AS confidence_score
+              FROM turn_exp
+              GROUP BY from_segment_id, to_segment_id
+            )
+            INSERT INTO gtfs_bus_turn_evidence (
+              feed_id, from_segment_id, to_segment_id, trip_count, route_count, pattern_count, confidence_score
+            )
+            SELECT %s, from_segment_id, to_segment_id, trip_count, route_count, pattern_count, confidence_score
+            FROM turn_agg
+            """,
+            (fid, fid, fid),
+        )
+        turn_inserted = cur.rowcount
+
+    return {
+        "gtfs_bus_segment_evidence_deleted_approx": int(seg_deleted),
+        "gtfs_bus_turn_evidence_deleted_approx": int(turn_deleted),
+        "gtfs_bus_segment_evidence_inserted": int(seg_inserted),
+        "gtfs_bus_turn_evidence_inserted": int(turn_inserted),
+    }
+
+
 def insert_detour_audit_row(
     *,
     detour_id: str,

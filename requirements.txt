@@ -8,3 +8,6 @@ pydantic>=2.6.0
 python-dateutil>=2.9.0
 geopandas>=0.14.0
 numpy>=1.26.0
+# Detour v3 OSM PBF importer (backend.osm_import.pbf_importer).
+# pyosmium is the Python binding to libosmium; PyPI package name is "osmium".
+osmium>=3.6.0

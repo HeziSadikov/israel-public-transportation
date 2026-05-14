@@ -290,6 +290,24 @@ CREATE INDEX IF NOT EXISTS idx_detour_street_override_lookup
 -- Detour v2: OSM segments, incidents, constraints, evidence, detour storage
 -- ---------------------------------------------------------------------------
 
+-- Detour v3: osm_import_runs is referenced by osm_road_segments / osm_turn_restrictions
+-- via the provenance columns (import_run_id). Declared early so the FKs resolve at
+-- create time on fresh installs.
+CREATE TABLE IF NOT EXISTS osm_import_runs (
+    id                BIGSERIAL PRIMARY KEY,
+    pbf_path          TEXT,
+    pbf_url           TEXT,
+    pbf_size_bytes    BIGINT,
+    pbf_modified_at   TIMESTAMPTZ,
+    started_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    finished_at       TIMESTAMPTZ,
+    status            TEXT NOT NULL DEFAULT 'running',
+    stats_json        JSONB
+);
+
+CREATE INDEX IF NOT EXISTS idx_osm_import_runs_started_at
+    ON osm_import_runs(started_at DESC);
+
 CREATE TABLE IF NOT EXISTS osm_road_segments (
     segment_id       BIGSERIAL PRIMARY KEY,
     osm_way_id       BIGINT NOT NULL,
@@ -311,12 +329,20 @@ CREATE TABLE IF NOT EXISTS osm_road_segments (
     bridge             BOOLEAN,
     tunnel             BOOLEAN,
     layer              INT,
-    tags_json          JSONB
+    tags_json          JSONB,
+    -- Physical layer + Detour v3 additions:
+    length_m           DOUBLE PRECISION,
+    heading_start_deg  DOUBLE PRECISION,
+    heading_end_deg    DOUBLE PRECISION,
+    import_run_id      BIGINT REFERENCES osm_import_runs(id) ON DELETE SET NULL,
+    import_source      TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_osm_road_segments_geom ON osm_road_segments USING GIST (geom);
 CREATE INDEX IF NOT EXISTS idx_osm_road_segments_way ON osm_road_segments (osm_way_id);
 CREATE INDEX IF NOT EXISTS idx_osm_road_segments_nodes ON osm_road_segments (from_node_id, to_node_id);
+CREATE INDEX IF NOT EXISTS idx_osm_road_segments_import_run
+    ON osm_road_segments(import_run_id) WHERE import_run_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS osm_turn_restrictions (
     id                 BIGSERIAL PRIMARY KEY,
@@ -324,11 +350,109 @@ CREATE TABLE IF NOT EXISTS osm_turn_restrictions (
     via_node_id        BIGINT NOT NULL,
     to_way_id          BIGINT NOT NULL,
     restriction_type   TEXT,
-    tags_json          JSONB
+    tags_json          JSONB,
+    -- Detour v3 additions:
+    via_way_id         BIGINT,
+    applies_to_bus     BOOLEAN,
+    except_bus         BOOLEAN,
+    except_psv         BOOLEAN,
+    import_run_id      BIGINT REFERENCES osm_import_runs(id) ON DELETE SET NULL,
+    import_source      TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_osm_turn_via ON osm_turn_restrictions (via_node_id);
 CREATE INDEX IF NOT EXISTS idx_osm_turn_triplet ON osm_turn_restrictions (from_way_id, via_node_id, to_way_id);
+CREATE INDEX IF NOT EXISTS idx_osm_turn_restrictions_import_run
+    ON osm_turn_restrictions(import_run_id) WHERE import_run_id IS NOT NULL;
+
+-- Detour v3: raw OSM parse tables, precomputed legal turns, bus-corridor evidence.
+-- These are wholly v3-owned and may be truncated on --reset-osm-import.
+CREATE TABLE IF NOT EXISTS osm_nodes (
+    node_id BIGINT PRIMARY KEY,
+    geom    GEOMETRY(Point, 4326) NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_osm_nodes_geom
+    ON osm_nodes USING GIST (geom);
+
+CREATE TABLE IF NOT EXISTS osm_ways (
+    way_id     BIGINT PRIMARY KEY,
+    highway    TEXT,
+    name       TEXT,
+    oneway     TEXT,
+    access     TEXT,
+    bus        TEXT,
+    psv        TEXT,
+    service    TEXT,
+    junction   TEXT,
+    maxwidth   DOUBLE PRECISION,
+    maxheight  DOUBLE PRECISION,
+    tags_json  JSONB
+);
+
+CREATE INDEX IF NOT EXISTS idx_osm_ways_highway
+    ON osm_ways(highway);
+
+CREATE TABLE IF NOT EXISTS osm_way_nodes (
+    way_id  BIGINT NOT NULL,
+    seq     INT NOT NULL,
+    node_id BIGINT NOT NULL,
+    PRIMARY KEY (way_id, seq)
+);
+
+CREATE INDEX IF NOT EXISTS idx_osm_way_nodes_node
+    ON osm_way_nodes(node_id);
+
+CREATE TABLE IF NOT EXISTS osm_segment_turns (
+    from_segment_id    BIGINT NOT NULL,
+    via_node_id        BIGINT NOT NULL,
+    to_segment_id      BIGINT NOT NULL,
+    turn_angle_deg     DOUBLE PRECISION,
+    is_forbidden       BOOLEAN NOT NULL,
+    is_only_restricted BOOLEAN NOT NULL,
+    restriction_id     BIGINT,
+    is_u_turn          BOOLEAN NOT NULL,
+    PRIMARY KEY (from_segment_id, to_segment_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_osm_segment_turns_via
+    ON osm_segment_turns(via_node_id);
+
+CREATE INDEX IF NOT EXISTS idx_osm_segment_turns_from
+    ON osm_segment_turns(from_segment_id);
+
+CREATE TABLE IF NOT EXISTS pattern_osm_segments (
+    feed_id     INT NOT NULL REFERENCES feed_versions(id) ON DELETE CASCADE,
+    pattern_id  TEXT NOT NULL,
+    seq         INT NOT NULL,
+    segment_id  BIGINT NOT NULL,
+    confidence  DOUBLE PRECISION,
+    source      TEXT,
+    PRIMARY KEY (feed_id, pattern_id, seq)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pattern_osm_segments_feed_segment
+    ON pattern_osm_segments(feed_id, segment_id);
+
+CREATE TABLE IF NOT EXISTS gtfs_bus_segment_evidence (
+    feed_id          INT NOT NULL REFERENCES feed_versions(id) ON DELETE CASCADE,
+    segment_id       BIGINT NOT NULL,
+    trip_count       INT NOT NULL DEFAULT 0,
+    route_count      INT NOT NULL DEFAULT 0,
+    pattern_count    INT NOT NULL DEFAULT 0,
+    confidence_score DOUBLE PRECISION,
+    PRIMARY KEY (feed_id, segment_id)
+);
+
+CREATE TABLE IF NOT EXISTS gtfs_bus_turn_evidence (
+    feed_id          INT NOT NULL REFERENCES feed_versions(id) ON DELETE CASCADE,
+    from_segment_id  BIGINT NOT NULL,
+    to_segment_id    BIGINT NOT NULL,
+    trip_count       INT NOT NULL DEFAULT 0,
+    route_count      INT NOT NULL DEFAULT 0,
+    confidence_score DOUBLE PRECISION,
+    PRIMARY KEY (feed_id, from_segment_id, to_segment_id)
+);
 
 CREATE TABLE IF NOT EXISTS incidents (
     id              SERIAL PRIMARY KEY,

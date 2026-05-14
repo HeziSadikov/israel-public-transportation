@@ -242,6 +242,13 @@ class DetourComputeV2Request(BaseModel):
     persist: bool = True
     route_id: Optional[str] = None
     direction_id: Optional[str] = None
+    compute_engine: Optional[Literal["inherit", "v2", "v3"]] = Field(
+        default=None,
+        description=(
+            "Per-request engine for /detours/compute: v2 Valhalla-backed pipeline, v3 PostGIS bus-corridor A*, "
+            "or omit / inherit to follow DETOUR_ENGINE (v2 / v3 / v3_default)."
+        ),
+    )
     detour_debug: bool = Field(
         default=False,
         description=(

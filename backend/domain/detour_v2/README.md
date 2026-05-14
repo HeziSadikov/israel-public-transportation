@@ -4,8 +4,9 @@ Road-graph-first detour computation for Israeli buses (`standard_plus_bus`).
 
 ## Relationship to legacy flow
 
-- **Legacy** (`/api/v1/detours/by-area`, `detour_graph.py`): GTFS pattern graph + optional Valhalla hybrid; caches in `detour_by_area_cache`. Responses include `diagnostics.detour_engine` (`v1`|`v2`, from `DETOUR_ENGINE` in config) for observability; per-trip bus-quality detours use `POST /api/v1/detours/compute`.
-- **v2** (`/api/v1/detours/compute`, this package): planned-service context from GTFS shapes/stops, Valhalla road candidates between anchors, feasibility on decoded segments/turns, explainable ranking; persistence in `detour_requests` / `detour_candidates` / `approved_detours`.
+- **Legacy** (`/api/v1/detours/by-area`, `detour_graph.py`): GTFS pattern graph + optional Valhalla hybrid; caches in `detour_by_area_cache`. Responses include `diagnostics.detour_engine` (`v1`|`v2`|`v3`, from `DETOUR_ENGINE` / request) for observability; per-trip bus-quality detours use `POST /api/v1/detours/compute`.
+- **v2** (`/api/v1/detours/compute`, default when `DETOUR_ENGINE=v2` or `compute_engine=v2`): planned-service context from GTFS shapes/stops, Valhalla road candidates between anchors, feasibility on decoded segments/turns, explainable ranking; persistence in `detour_requests` / `detour_candidates` / `approved_detours`.
+- **v3** (`backend/detour_v3`, selected when `DETOUR_ENGINE=v3` / `v3_default` or `compute_engine=v3`): PostGIS `pattern_osm_segments` + `osm_segment_turns` + A* avoidance routing; Valhalla is offline-only for map-matching in `match_patterns_to_osm`.
 
 ## Module map
 
@@ -35,7 +36,10 @@ Road-graph-first detour computation for Israeli buses (`standard_plus_bus`).
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `DETOUR_V2_ENABLED` | `true` | Enable v2 HTTP endpoints. |
-| `DETOUR_ENGINE` | `v2` | `v1` \| `v2` — tags legacy by-area diagnostics; default `v2`. |
+| `DETOUR_ENGINE` | `v2` | `v1` \| `v2` \| `v3` \| `v3_default` — default per-trip engine when JSON `compute_engine` is omitted (`v3` / `v3_default` ⇒ detour_v3 graph). Legacy by-area tagging still distinguishes `v1` vs richer modes. |
+| `DETOUR_V3_ENABLED` | `true` | When false, `/detours/compute` never runs v3 (falls back to v2). |
+| `DETOUR_V3_IMPORT_RUN_ID` | — | Optional: restrict router load to segments from one provenance run id. |
+| `DETOUR_V3_COST_MODE` | `bus_corridor_plus_connectors` | `strict_bus_corridor` or plus-connectors softer penalties. |
 | `DETOUR_POLICY_JSON` | — | Path to JSON file overriding policy fields. |
 | `VALHALLA_URL` | — | Valhalla base URL (e.g. `http://valhalla:8002`). |
 | `VALHALLA_LOCATION_RADIUS_M` | `90` | Snap radius for route endpoints (reduces 442). |

@@ -67,7 +67,8 @@ services:
     volumes:
       - ./frontend:/app/frontend
       - frontend_node_modules:/app/frontend/node_modules
-    command: npm run dev -- --host 0.0.0.0
+    # Run Vite directly (not via npm) so SIGTERM from `docker compose stop` / redeploy hits Vite, not npm's wrapper.
+    command: ["node", "node_modules/vite/bin/vite.js", "--host", "0.0.0.0"]
 
   osrm:
     image: osrm/osrm-backend:latest

@@ -7,12 +7,17 @@ Run the full PostGIS data pipeline in one go:
   2. Build route patterns + ride network — same defaults as build_patterns_postgis (auto date)
   2b. (Optional) Rebuild gtfs_bus_way_evidence — see --rebuild-gtfs-bus-way-evidence
   3. Precompute route graphs + route previews — same as scripts.precompute_graphs_postgis
+     (`--workers` for graph build; pattern OSM match uses `--pattern-osm-workers` or the same value.)
+  4. (Optional) Detour v3 layers: `--with-osm-import`, `--with-segment-turns` (rebuild ``osm_segment_turns``;
+     redundant if import already used ``--with-turns`` in ``--osm-import-extra``), ``--with-pattern-osm-match`` (needs Valhalla for
+     trace_attributes offline unless you pass skip flags in ``--pattern-osm-extra``), ``--with-bus-evidence``.
 
 From the repository root:
 
     python -m scripts.precompute_all_postgis
     python -m scripts.precompute_all_postgis --with-ingest --workers 4
     python -m scripts.precompute_all_postgis --with-ingest --ingest-fetch-always --workers 4
+    python -m scripts.precompute_all_postgis --skip-graphs --with-osm-import --with-segment-turns --with-pattern-osm-match --with-bus-evidence
     python -m scripts.precompute_all_postgis --rebuild-gtfs-bus-way-evidence --workers 4
 """
 
@@ -63,7 +68,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(
         description=(
             "One command: optional ingest, build_patterns_postgis, optional gtfs_bus_way_evidence "
-            "rebuild, precompute_graphs_postgis."
+            "rebuild, optional detour v3 OSM/pattern/evidence layers, precompute_graphs_postgis."
         ),
     )
     ap.add_argument(
@@ -101,6 +106,14 @@ def main() -> None:
         help=(
             "With --with-ingest: pass --fetch-if-newer "
             "(download only when remote metadata indicates a newer GTFS zip)."
+        ),
+    )
+    ap.add_argument(
+        "--rebuild-gtfs-bus-way-evidence",
+        action="store_true",
+        help=(
+            "After pattern build: run backend.scripts.build_gtfs_bus_way_evidence "
+            "(GTFS shapes → OSM ways for detour v2; ingest already does this when --with-ingest is used)."
         ),
     )
     ap.add_argument(
@@ -146,7 +159,22 @@ def main() -> None:
         "--workers",
         type=int,
         default=1,
-        help="Parallel workers for graph precompute.",
+        help=(
+            "Parallel workers for scripts.precompute_graphs_postgis (ProcessPoolExecutor). "
+            "Also the default for match_patterns_to_osm when --with-pattern-osm-match is set "
+            "unless overridden by --pattern-osm-workers. Does not parallelize ingest, pattern build, "
+            "OSM import, or bus evidence."
+        ),
+    )
+    ap.add_argument(
+        "--pattern-osm-workers",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "With --with-pattern-osm-match: pass --workers to match_patterns_to_osm (Valhalla+DB threads). "
+            "Default: same as --workers."
+        ),
     )
     ap.add_argument(
         "--progress-every",
@@ -160,16 +188,66 @@ def main() -> None:
         help="Forward to graph precompute: run OSRM map-match and pretty_osm cache rows (slow).",
     )
     ap.add_argument(
-        "--rebuild-gtfs-bus-way-evidence",
+        "--with-osm-import",
+        action="store_true",
+        help="After patterns: run backend.scripts.import_osm_pbf (pass extra args via --osm-import-extra).",
+    )
+    ap.add_argument(
+        "--osm-import-extra",
+        type=str,
+        default="",
+        help=(
+            "Comma-separated argv tokens forwarded to import_osm_pbf "
+            "(e.g. --with-segments,--with-turns). Split on commas only. "
+            "Values starting with - must use equals form: "
+            "--osm-import-extra=--with-segments,--with-turns "
+            "(otherwise argparse treats the next --flag as a new option)."
+        ),
+    )
+    ap.add_argument(
+        "--with-pattern-osm-match",
+        action="store_true",
+        help="After optional OSM import: run backend.scripts.match_patterns_to_osm (Valhalla + pattern_osm_segments).",
+    )
+    ap.add_argument(
+        "--pattern-osm-extra",
+        type=str,
+        default="",
+        help=(
+            "Comma-separated tokens for match_patterns_to_osm. "
+            "If any token starts with -, use --pattern-osm-extra=--limit,10 style."
+        ),
+    )
+    ap.add_argument(
+        "--with-bus-evidence",
+        action="store_true",
+        help="Rebuild gtfs_bus_segment_evidence / gtfs_bus_turn_evidence via backend.scripts.build_bus_evidence.",
+    )
+    ap.add_argument(
+        "--with-segment-turns",
         action="store_true",
         help=(
-            "After patterns: run backend.scripts.build_gtfs_bus_way_evidence (refreshes shapes_lines "
-            "then rebuilds gtfs_bus_way_evidence). Use when you did not pass --with-ingest but need "
-            "detour v2 GTFS way evidence. Idempotent if ingest already ran in the same invocation."
+            "Run backend.scripts.build_segment_turns (rebuild osm_segment_turns). "
+            "Use after segments exist; redundant when import_osm_pbf was run with --with-turns in --osm-import-extra."
         ),
+    )
+    ap.add_argument(
+        "--segment-turns-import-run-id",
+        type=int,
+        default=None,
+        metavar="ID",
+        help="Forward to build_segment_turns: only adjacency from segments with this import_run_id.",
     )
     args = ap.parse_args()
     db = args.database_url
+
+    if int(args.workers) > 1 or (
+        args.pattern_osm_workers is not None and int(args.pattern_osm_workers) > 1
+    ):
+        log(
+            "precompute-all",
+            "note=parallel workers: graphs use --workers; pattern OSM match uses --pattern-osm-workers or --workers",
+        )
 
     if args.route_batch_size < 1:
         ap.error("--route-batch-size must be >= 1")
@@ -216,6 +294,39 @@ def main() -> None:
         log("precompute-all", "phase=gtfs_bus_way_evidence start")
         _run_py_module("backend.scripts.build_gtfs_bus_way_evidence", [], db)
         log("precompute-all", "phase=gtfs_bus_way_evidence done")
+
+    if args.with_osm_import:
+        log("precompute-all", "phase=osm_import start")
+        extra_toks = [t.strip() for t in str(args.osm_import_extra).split(",") if t.strip()]
+        _run_py_module("backend.scripts.import_osm_pbf", extra_toks, db)
+        log("precompute-all", "phase=osm_import done")
+
+    if args.with_segment_turns:
+        log("precompute-all", "phase=segment_turns start")
+        st_extra: list[str] = []
+        if args.segment_turns_import_run_id is not None:
+            st_extra.extend(["--import-run-id", str(int(args.segment_turns_import_run_id))])
+        _run_py_module("backend.scripts.build_segment_turns", st_extra, db)
+        log("precompute-all", "phase=segment_turns done")
+
+    if args.with_pattern_osm_match:
+        log("precompute-all", "phase=pattern_osm_match start")
+        pom_extra = [t.strip() for t in str(args.pattern_osm_extra).split(",") if t.strip()]
+        pom_workers = (
+            int(args.pattern_osm_workers)
+            if args.pattern_osm_workers is not None
+            else int(args.workers)
+        )
+        pom_workers = max(1, pom_workers)
+        if not any(t == "--workers" or t.startswith("--workers=") for t in pom_extra):
+            pom_extra.extend(["--workers", str(pom_workers)])
+        _run_py_module("backend.scripts.match_patterns_to_osm", pom_extra, db)
+        log("precompute-all", "phase=pattern_osm_match done")
+
+    if args.with_bus_evidence:
+        log("precompute-all", "phase=bus_evidence start")
+        _run_py_module("backend.scripts.build_bus_evidence", [], db)
+        log("precompute-all", "phase=bus_evidence done")
 
     if not args.skip_graphs:
         log("precompute-all", "phase=graphs_pipeline start")

@@ -1,5 +1,6 @@
 from pathlib import Path
 import os
+from typing import Optional
 
 
 BASE_DIR = Path(__file__).resolve().parents[2]
@@ -57,6 +58,15 @@ GTFS_REMOTE_FILENAME = os.getenv(
 
 # OSM engine (OSRM / Valhalla) base URL — used for map-matching (OSRM)
 OSM_ENGINE_URL = os.getenv("OSM_ENGINE_URL", "http://localhost:5000")
+
+# Detour v3: OSM PBF importer.
+# OSM_PBF_PATH points at the local extract that the pyosmium importer reads.
+# OSM_PBF_URL is used by --fetch / --fetch-if-newer to refresh that file.
+OSM_PBF_PATH = Path(os.getenv("OSM_PBF_PATH", str(BASE_DIR / "osm" / "israel.osm.pbf")))
+OSM_PBF_URL = os.getenv(
+    "OSM_PBF_URL",
+    "https://download.geofabrik.de/asia/israel-and-palestine-latest.osm.pbf",
+)
 
 # Valhalla base URL — used for detour routing (route avoiding polygon).
 # If set, /detour will use Valhalla to route around the blocked area on the road network.
@@ -158,6 +168,38 @@ GOVMAP_TILE_UPSTREAM_TEMPLATE = os.getenv("GOVMAP_TILE_UPSTREAM_TEMPLATE", "").s
 DETOUR_V2_ENABLED = parse_bool_env("DETOUR_V2_ENABLED", True)
 # Engine for legacy area-detour flows: "v2" tags diagnostics and prefers OSM/Valhalla hybrid when available;
 # "v1" keeps previous hybrid gating (use_osm_detour flag only). Per-trip bus detours use POST /api/v1/detours/compute.
+# "v3" / "v3_default": use detour v3 (PostGIS graph + pattern_osm_segments) for /detours/compute when not overridden per-request.
 _DETOUR_ENGINE_RAW = (os.getenv("DETOUR_ENGINE", "v2") or "v2").strip().lower()
-DETOUR_ENGINE: str = _DETOUR_ENGINE_RAW if _DETOUR_ENGINE_RAW in ("v1", "v2") else "v2"
+DETOUR_ENGINE: str = (
+    _DETOUR_ENGINE_RAW if _DETOUR_ENGINE_RAW in ("v1", "v2", "v3", "v3_default") else "v2"
+)
+DETOUR_V3_ENABLED = parse_bool_env("DETOUR_V3_ENABLED", True)
+
+
+def parse_optional_positive_int_env(name: str) -> Optional[int]:
+    raw = os.getenv(name)
+    if raw is None or not str(raw).strip():
+        return None
+    try:
+        v = int(str(raw).strip())
+        return v if v > 0 else None
+    except Exception:
+        return None
+
+
+# Restrict v3 road-graph load to one OSM import cohort (optional; unset = all segments in DB).
+DETOUR_V3_IMPORT_RUN_ID = parse_optional_positive_int_env("DETOUR_V3_IMPORT_RUN_ID")
+# Routing cost policy: "bus_corridor_plus_connectors" (default) or "strict_bus_corridor".
+DETOUR_V3_COST_MODE = (
+    (os.getenv("DETOUR_V3_COST_MODE", "bus_corridor_plus_connectors") or "bus_corridor_plus_connectors")
+    .strip()
+    .lower()
+)
+
+
+def detour_per_trip_engine_default() -> str:
+    """Return \"v2\" or \"v3\" for POST /detours/compute when the request does not override."""
+    if DETOUR_ENGINE in ("v3", "v3_default"):
+        return "v3"
+    return "v2"
 

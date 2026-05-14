@@ -105,6 +105,8 @@ Open:
 - Frontend: `http://localhost:5173`
 - Backend health: `http://localhost:8000/health`
 
+The frontend container runs **Vite directly** (not `npm run dev`) so Docker stop signals go to the dev server cleanly. If you still see `npm error signal SIGTERM` in old logs, that was npm’s wrapper when the stack was stopped or the container was recreated—that is normal shutdown, not a Vite crash. The “CJS build of Vite's Node API is deprecated” line is a harmless upstream warning.
+
 Then create the schema (once):
 
 ```bash
@@ -235,6 +237,30 @@ For realistic latency checks, avoid `--reload`:
 ---
 
 ## Graph and routing logic
+
+### Detour v3 (PostGIS graph + GTFS corridors)
+
+Production detours historically used **detour v2** (GTFS anchors + Valhalla road candidates + feasibility scoring). **Detour v3** adds an optional pipeline that prefers your own imported OSM cohort in PostGIS (`osm_road_segments`, `osm_segment_turns`) and GTFS-derived **segment-level corridors** (`pattern_osm_segments` → `gtfs_bus_segment_evidence` / `gtfs_bus_turn_evidence`), then routes with **A\*** plus polygon overlays.
+
+| Concern | v2 default | v3 |
+|------|-------------|-----|
+| Road candidates | Valhalla `/route` online | Offline graph in PostGIS |
+| GTFS grounding | Shape + `gtfs_bus_way_evidence` | `pattern_osm_segments` + segment/turn evidence |
+| Engine selection | Always v2 unless changed | Server `DETOUR_ENGINE=v3` (or `v3_default`), or JSON `compute_engine` on `POST /api/v1/detours/compute` |
+
+**Endpoints:** Same `POST /api/v1/detours/compute` body as today; optional field `compute_engine`: `"v2"` \| `"v3"`. Omit the field to follow `DETOUR_ENGINE` (`v2`, `v3`, `v3_default`, or legacy `v1` for mixed flows). Responses include `compute_engine_used`.
+
+**Operational env:**
+
+- `DETOUR_V3_ENABLED` — gate server-side v3 (falls back to v2).
+- `DETOUR_V3_IMPORT_RUN_ID` — optional: load only segments/turn edges from one `osm_import_runs.id` cohort.
+- `DETOUR_V3_COST_MODE` — `bus_corridor_plus_connectors` (default, soft surcharge off-corridor segments) or `strict_bus_corridor` (heavy penalty unless segment is GTFS-evidenced).
+
+**CLI (detour v3 layers):** `python -m backend.scripts.import_osm_pbf --with-segments --with-turns`, `python -m backend.scripts.build_segment_turns` (rebuild turns only), `python -m backend.scripts.match_patterns_to_osm`, `python -m backend.scripts.build_bus_evidence`.
+
+**Offline precompute (flags on `scripts/precompute_all_postgis.py`):** ``--with-osm-import``, ``--with-segment-turns`` (optional rebuild of ``osm_segment_turns``), ``--with-pattern-osm-match``, ``--with-bus-evidence``; import extras via ``--osm-import-extra=--with-segments,--with-turns`` (use ``=`` when values start with ``-``; avoids argparse/PowerShell eating the next token) / pattern match via ``--pattern-osm-extra``; optional ``--segment-turns-import-run-id`` (forwards to ``build_segment_turns --import-run-id``). Valhalla ``trace_attributes`` is only required for **`match_patterns_to_osm`**, not for runtime v3 routing.
+
+**Frontend:** optional `VITE_DETOUR_COMPUTE_ENGINE=v3` merges into requests when the UI does not set `compute_engine`.
 
 ### Route patterns
 

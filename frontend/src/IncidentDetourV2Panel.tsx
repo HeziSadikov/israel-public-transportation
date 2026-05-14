@@ -122,8 +122,7 @@ function roadClassLabel(rc: string | null | undefined, rank: number | null | und
 }
 
 /**
- * Detour v2: create incident preview (affected routes + OSM edge bans) and compute road-level detours
- * for the selected route (representative trip) or an optional explicit trip id override.
+ * Detour compute: create incident preview and compute road-level detours (v2 Valhalla or v3 PostGIS graph).
  */
 export function IncidentDetourV2Panel(props: Props) {
   const [tripId, setTripId] = useState("");
@@ -135,6 +134,8 @@ export function IncidentDetourV2Panel(props: Props) {
   const [showDiag, setShowDiag] = useState(false);
   const [debugDetour, setDebugDetour] = useState(false);
   const [useMatchedPhysical, setUseMatchedPhysical] = useState(false);
+  /** inherit = server DETOUR_ENGINE; v2 / v3 force pipeline for this request */
+  const [computeEngine, setComputeEngine] = useState<"inherit" | "v2" | "v3">("inherit");
   const [lastDetourRequestId, setLastDetourRequestId] = useState<number | null>(null);
   const [approveBusyRank, setApproveBusyRank] = useState<number | null>(null);
 
@@ -181,6 +182,8 @@ export function IncidentDetourV2Panel(props: Props) {
     setLoading(true);
     setMessage(null);
     try {
+      const engineField =
+        computeEngine === "inherit" ? {} : { compute_engine: computeEngine as "v2" | "v3" };
       const body =
         override.length > 0
           ? {
@@ -191,6 +194,7 @@ export function IncidentDetourV2Panel(props: Props) {
               persist: true as const,
               debug_detour: debugDetour,
               use_matched_physical: useMatchedPhysical,
+              ...engineField,
             }
           : {
               service_date: props.startDateYmd,
@@ -200,6 +204,7 @@ export function IncidentDetourV2Panel(props: Props) {
               persist: true as const,
               debug_detour: debugDetour,
               use_matched_physical: useMatchedPhysical,
+              ...engineField,
             };
       const r = await postDetourComputeV2(body);
       const first = (r.results?.[0] ?? null) as DetourV2ComputeResult | null;
@@ -213,8 +218,9 @@ export function IncidentDetourV2Panel(props: Props) {
       const statusNote = first?.selected?.summary_en
         ? ` ${first.selected.summary_en}`
         : "";
+      const eng = first?.compute_engine_used ? ` engine=${first.compute_engine_used}` : "";
       setMessage(
-        `Computed (policy ${r.policy_version}). Request ids: ${r.detour_request_ids.join(", ") || "none"}.${routeEcho}${statusNote}`
+        `Computed (policy ${r.policy_version}).${eng} Request ids: ${r.detour_request_ids.join(", ") || "none"}.${routeEcho}${statusNote}`
       );
     } catch (e: unknown) {
       setMessage(e instanceof Error ? e.message : String(e));
@@ -262,8 +268,8 @@ export function IncidentDetourV2Panel(props: Props) {
   return (
     <section className="rail-section time-window-section">
       <h2 className="rail-heading">
-        Detour v2{" "}
-        <SidebarInfo text="Select a route, optionally override with trip_id, then create incident and compute." />
+        Detour compute{" "}
+        <SidebarInfo text="Select a route, optionally override with trip_id, then create incident and compute. v3 uses PostGIS graph + pattern_osm_segments when the server enables it." />
       </h2>
       <label className="rail-label">
         Trip id{" "}
@@ -299,12 +305,26 @@ export function IncidentDetourV2Panel(props: Props) {
           <SidebarInfo text="Uses backfilled PostGIS matched geometry when available." />
         </span>
       </label>
+      <label className="rail-label" style={{ marginTop: 6 }}>
+        Engine{" "}
+        <SidebarInfo text="inherit follows server DETOUR_ENGINE. v2 = Valhalla candidates; v3 = own-graph A* (needs pattern_osm_segments + OSM graph)." />
+        <select
+          className="rail-input"
+          style={{ marginLeft: 8, maxWidth: 180 }}
+          value={computeEngine}
+          onChange={(e) => setComputeEngine(e.target.value as "inherit" | "v2" | "v3")}
+        >
+          <option value="inherit">inherit (server default)</option>
+          <option value="v2">v2 (Valhalla)</option>
+          <option value="v3">v3 (PostGIS graph)</option>
+        </select>
+      </label>
       <div className="rail-buttons">
         <button type="button" disabled={loading || !props.blockageGeojson} onClick={handleIncident}>
           Create incident (preview)
         </button>
         <button type="button" disabled={loading || !canUse} onClick={handleCompute}>
-          Compute detour v2
+          Compute detour
         </button>
       </div>
       {message && <div className="rail-status">{message}</div>}
@@ -407,7 +427,26 @@ export function IncidentDetourV2Panel(props: Props) {
               <div style={{ marginBottom: 4 }}>
                 <strong>Status:</strong> {lastResult.status ?? "—"}{" "}
                 {lastResult.corridor_stage && <span>| corridor: <em>{lastResult.corridor_stage}</em></span>}
+                {lastResult.compute_engine_used && (
+                  <span>
+                    {" "}
+                    | <strong>engine:</strong> {lastResult.compute_engine_used}
+                    {lastResult.detour_engine_config && (
+                      <span style={{ color: "#666" }}> (config {lastResult.detour_engine_config})</span>
+                    )}
+                  </span>
+                )}
               </div>
+              {lastResult.debug &&
+                typeof lastResult.debug === "object" &&
+                "detour_v3" in (lastResult.debug as object) && (
+                  <details style={{ marginBottom: 4 }}>
+                    <summary style={{ cursor: "pointer", fontWeight: 600 }}>Detour v3 debug</summary>
+                    <pre style={{ fontSize: 9, overflow: "auto", maxHeight: 200 }}>
+                      {JSON.stringify((lastResult.debug as { detour_v3?: unknown }).detour_v3, null, 2)}
+                    </pre>
+                  </details>
+                )}
               {lastResult.selected?.summary_en && (
                 <div style={{ marginBottom: 4, color: "var(--color-success, #2a8a2a)" }}>
                   <strong>נבחר:</strong> {lastResult.selected.summary_en}

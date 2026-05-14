@@ -8,6 +8,9 @@ This script:
     for a given service date.
   - Writes results into the PostGIS-backed `patterns` and `pattern_stops` tables.
 
+  Multi-process parallelism across route batches is intentionally deferred: profile
+  whether time is in SQL vs PatternBuilder before adding worker pools.
+
 Usage:
 
   python -m backend.scripts.build_patterns_postgis

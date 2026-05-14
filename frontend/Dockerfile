@@ -9,4 +9,5 @@ COPY frontend .
 
 EXPOSE 5173
 
-CMD ["npm", "run", "dev", "--", "--host", "0.0.0.0"]
+# Avoid `npm run dev` as container PID 1 — npm swallows signals poorly; SIGTERM then surfaces as npm "command failed".
+CMD ["node", "node_modules/vite/bin/vite.js", "--host", "0.0.0.0"]

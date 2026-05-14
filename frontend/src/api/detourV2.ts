@@ -101,6 +101,8 @@ export type DetourV2ComputeResult = {
     stitch_ok?: boolean;
     stitch_notes?: string[];
   } | null;
+  compute_engine_used?: string | null;
+  detour_engine_config?: string | null;
   /** Present when debug_detour=true: layers for QGIS / inspection */
   debug?: { geojson?: GeoJSON.FeatureCollection; candidate_generation?: unknown } | null;
 };
@@ -114,10 +116,24 @@ export async function postDetourComputeV2(body: {
   blockage_geojson: GeoJSON.Geometry;
   incident_id?: number | null;
   persist?: boolean;
+  /** When set on the backend, selects detour pipeline: v2 (Valhalla) vs v3 (PostGIS graph). Omit to inherit DETOUR_ENGINE. */
+  compute_engine?: "v2" | "v3" | null;
   debug_detour?: boolean;
   use_matched_physical?: boolean;
 }): Promise<{ results: DetourV2ComputeResult[]; detour_request_ids: number[]; policy_version: string }> {
-  const res = await axios.post(`${API_BASE}/detours/compute`, body);
+  const envEngRaw =
+    typeof import.meta.env?.VITE_DETOUR_COMPUTE_ENGINE === "string"
+      ? import.meta.env.VITE_DETOUR_COMPUTE_ENGINE.trim().toLowerCase()
+      : "";
+  const envEng =
+    envEngRaw === "v3" || envEngRaw === "v2" ? (envEngRaw as "v2" | "v3") : undefined;
+
+  const payload = {
+    ...body,
+    ...(body.compute_engine == null && envEng !== undefined ? { compute_engine: envEng } : {}),
+  };
+
+  const res = await axios.post(`${API_BASE}/detours/compute`, payload);
   return res.data;
 }
 

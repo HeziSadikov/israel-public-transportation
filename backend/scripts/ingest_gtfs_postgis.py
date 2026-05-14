@@ -37,7 +37,7 @@ import time
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Iterable, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import psycopg2
 from psycopg2 import errors as pg_errors
@@ -93,6 +93,68 @@ def _read_csv_from_zip(zf: zipfile.ZipFile, name: str) -> Iterable[Dict[str, str
         return []
 
 
+# Progress for very large GTFS tables (Israel stop_times is tens of millions of rows).
+_STOP_TIMES_CSV_LOG_EVERY = 250_000
+# COPY runs faster than execute_values; larger chunks = fewer commits (less WAL sync churn).
+_STOP_TIMES_COPY_CHUNK = 200_000
+
+
+def _stop_times_copy_text_field(value: object) -> str:
+    """PostgreSQL COPY TEXT format: tab-separated, \\N for NULL."""
+    if value is None:
+        return "\\N"
+    s = str(value)
+    return (
+        s.replace("\\", "\\\\")
+        .replace("\t", "\\t")
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+    )
+
+
+def _normalize_stop_times_pickup_dropoff(row: Tuple) -> Tuple:
+    """Empty pickup/drop_off from GTFS → NULL for COPY into INT columns."""
+    lst = list(row)
+    for i in (6, 7):
+        if lst[i] == "":
+            lst[i] = None
+    return tuple(lst)
+
+
+def _bulk_insert_stop_times_via_copy(
+    cur,
+    table: str,
+    columns: Tuple[str, ...],
+    rows: List[Tuple],
+    *,
+    chunk_size: int = _STOP_TIMES_COPY_CHUNK,
+    label: str = "",
+) -> None:
+    """Load stop_times with COPY FROM STDIN + commit per chunk (fast path vs execute_values)."""
+    if not rows:
+        return
+    total = len(rows)
+    t0 = time.perf_counter()
+    tag = f" ({label})" if label else ""
+    for off in range(0, total, chunk_size):
+        chunk = rows[off : off + chunk_size]
+        buf = io.StringIO()
+        for t in chunk:
+            t = _normalize_stop_times_pickup_dropoff(t)
+            buf.write("\t".join(_stop_times_copy_text_field(x) for x in t))
+            buf.write("\n")
+        buf.seek(0)
+        cur.copy_from(buf, table, columns=columns, sep="\t", null="\\N")
+        cur.connection.commit()
+        done = min(off + chunk_size, total)
+        if done % 500_000 == 0 or done == total:
+            print(
+                f"[ingest]   ... {table}{tag} copy-inserted {done}/{total} rows "
+                f"(elapsed_s={time.perf_counter() - t0:.1f}) +commit",
+                flush=True,
+            )
+
+
 def _bulk_insert(cur, table: str, columns: Tuple[str, ...], rows: Iterable[Tuple]):
     rows = list(rows)
     if not rows:
@@ -100,6 +162,44 @@ def _bulk_insert(cur, table: str, columns: Tuple[str, ...], rows: Iterable[Tuple
     cols_sql = ", ".join(columns)
     sql = f"INSERT INTO {table} ({cols_sql}) VALUES %s"
     execute_values(cur, sql, rows, page_size=1000)
+
+
+def _bulk_insert_chunked(
+    cur,
+    table: str,
+    columns: Tuple[str, ...],
+    rows: List[Tuple],
+    *,
+    chunk_size: int = 100_000,
+    label: str = "",
+    commit_each_chunk: bool = False,
+) -> None:
+    """Large inserts in slices so the DB client stays responsive; logs progress.
+
+    If commit_each_chunk is True, commits after each slice. Use for huge tables
+    (e.g. stop_times): one multi-million-row transaction can stall for minutes
+    when WAL/checkpoint pressure spikes; smaller commits keep throughput steadier.
+    """
+    if not rows:
+        return
+    total = len(rows)
+    cols_sql = ", ".join(columns)
+    sql = f"INSERT INTO {table} ({cols_sql}) VALUES %s"
+    t0 = time.perf_counter()
+    tag = f" ({label})" if label else ""
+    for off in range(0, total, chunk_size):
+        chunk = rows[off : off + chunk_size]
+        execute_values(cur, sql, chunk, page_size=1000)
+        if commit_each_chunk:
+            cur.connection.commit()
+        done = min(off + chunk_size, total)
+        if done % 500_000 == 0 or done == total:
+            cmt = " +commit" if commit_each_chunk else ""
+            print(
+                f"[ingest]   ... {table}{tag} inserted {done}/{total} rows "
+                f"(elapsed_s={time.perf_counter() - t0:.1f}){cmt}",
+                flush=True,
+            )
 
 
 def _log_lock_diagnostics(database_url: str, phase: str) -> None:
@@ -395,6 +495,14 @@ def ingest_gtfs(
                     "ingest",
                     f"phase=load_trips done rows={len(trips_rows)} elapsed_s={time.perf_counter() - t_trips:.2f}",
                 )
+                # End the mega-txn before stop_times: millions of rows + indexes in one
+                # open transaction often trigger long checkpoint/WAL stalls mid-load.
+                cur.connection.commit()
+                print(
+                    "[ingest] committed feed_versions..trips before stop_times "
+                    "(avoids single huge transaction through stop_times)",
+                    flush=True,
+                )
 
                 # stop_times.txt
                 print("[ingest] Loading stop_times.txt ...", flush=True)
@@ -423,7 +531,22 @@ def ingest_gtfs(
                             dist_f,
                         )
                     )
-                _bulk_insert(
+                    n = len(stop_time_rows)
+                    if n % _STOP_TIMES_CSV_LOG_EVERY == 0:
+                        print(
+                            f"[ingest]   ... stop_times.txt parsed {n} rows "
+                            f"(elapsed_s={time.perf_counter() - t_stop_times:.1f})",
+                            flush=True,
+                        )
+                print(
+                    f"[ingest]   ... stop_times.txt parse complete rows={len(stop_time_rows)}, "
+                    "COPY bulk inserting ...",
+                    flush=True,
+                )
+                # COPY + per-chunk commit is much faster than execute_values; synchronous_commit
+                # off reduces fsync spikes that otherwise stall inserts for many minutes mid-load.
+                cur.execute("SET LOCAL synchronous_commit = OFF")
+                _bulk_insert_stop_times_via_copy(
                     cur,
                     "stop_times",
                     (
@@ -438,6 +561,7 @@ def ingest_gtfs(
                         "shape_dist_traveled",
                     ),
                     stop_time_rows,
+                    label="bulk",
                 )
                 log(
                     "ingest",
