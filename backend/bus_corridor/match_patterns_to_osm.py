@@ -12,6 +12,7 @@ from backend.domain.detour_physical.edge_matcher import (
     trace_pattern_split_to_legs,
 )
 from backend.infra import db_access as db
+from backend.infra import pipeline_skip as ps
 from backend.infra.osm_import_db import IMPORT_SOURCE_V3
 
 from .trace_segment_resolve import (
@@ -61,33 +62,53 @@ def _confidence_from_flat_edges(shape_line: LineString, flat_edges: List[Dict[st
     return float(min(1.0, max(0.0, (score.total + 5.0) / 15.0)))
 
 
-def match_single_pattern_to_osm(
+def _build_match_fingerprint(
+    conn,
+    feed_id: int,
+    pattern_id: str,
+    *,
+    costing: str,
+    densify_m: float,
+    full_trace_max_km: float,
+    chunk_legs: int,
+    chunk_overlap: int,
+    repr_trip_id: Optional[str],
+    repr_shape_id: Optional[str],
+) -> str:
+    pattern_sig = db.get_pattern_signature(feed_id, pattern_id, conn=conn)
+    if not pattern_sig:
+        pattern_sig = db.compute_pattern_signature(
+            feed_id,
+            pattern_id,
+            repr_trip_id=repr_trip_id,
+            repr_shape_id=repr_shape_id,
+            conn=conn,
+        )
+    osm_fp = ps.get_latest_osm_dataset_fingerprint(conn) or ""
+    return ps.build_pattern_osm_match_fingerprint(
+        pattern_signature=pattern_sig,
+        osm_dataset_fingerprint=osm_fp,
+        costing=costing,
+        densify_m=densify_m,
+        full_trace_max_km=full_trace_max_km,
+        chunk_legs=chunk_legs,
+        chunk_overlap=chunk_overlap,
+    )
+
+
+def _do_match_write(
     conn,
     *,
     feed_id: int,
-    pattern_id: str,
+    pid: str,
     repr_trip_id: Optional[str],
     repr_shape_id: Optional[str],
-    full_trace_max_km: float = 10.0,
-    chunk_legs: int = 11,
-    chunk_overlap: int = 1,
-    costing: str = "bus",
-    densify_m: float = 15.0,
-    force_refresh: bool = False,
+    full_trace_max_km: float,
+    chunk_legs: int,
+    chunk_overlap: int,
+    costing: str,
+    densify_m: float,
 ) -> PatternOsmMatchResult:
-    """
-    Trace representative shape → Valhalla edges → ``osm_road_segments.segment_id`` chain;
-    REPLACE rows in ``pattern_osm_segments`` for this pattern.
-
-    Caller should commit ``conn``.
-    """
-    pid = str(pattern_id)
-    if (
-        not force_refresh
-        and db.count_pattern_osm_segments(feed_id=feed_id, pattern_id=pid, conn=conn) > 0
-    ):
-        return PatternOsmMatchResult(pid, "skipped_exists", 0)
-
     shape_line = _shape_line_for_pattern(conn, feed_id, repr_shape_id)
     if shape_line is None or shape_line.is_empty:
         return PatternOsmMatchResult(pid, "skipped_no_shape", 0, message="no representative shape")
@@ -142,6 +163,119 @@ def match_single_pattern_to_osm(
     db.replace_pattern_osm_segments(feed_id=feed_id, pattern_id=pid, rows=rows, conn=conn)
 
     return PatternOsmMatchResult(pid, "written", len(ids), trace_notes=nt)
+
+
+def match_single_pattern_to_osm(
+    conn,
+    *,
+    feed_id: int,
+    pattern_id: str,
+    repr_trip_id: Optional[str],
+    repr_shape_id: Optional[str],
+    full_trace_max_km: float = 10.0,
+    chunk_legs: int = 11,
+    chunk_overlap: int = 1,
+    costing: str = "bus",
+    densify_m: float = 15.0,
+    force_refresh: bool = False,
+) -> PatternOsmMatchResult:
+    """
+    Trace representative shape → Valhalla edges → ``osm_road_segments.segment_id`` chain;
+    REPLACE rows in ``pattern_osm_segments`` for this pattern.
+
+    Skip authorization uses content fingerprint + succeeded status only (never row counts).
+    Caller should commit ``conn`` after a ``written`` result.
+    """
+    pid = str(pattern_id)
+    current_fp = _build_match_fingerprint(
+        conn,
+        feed_id,
+        pid,
+        costing=costing,
+        densify_m=densify_m,
+        full_trace_max_km=full_trace_max_km,
+        chunk_legs=chunk_legs,
+        chunk_overlap=chunk_overlap,
+        repr_trip_id=repr_trip_id,
+        repr_shape_id=repr_shape_id,
+    )
+
+    def _last_fp() -> Optional[str]:
+        fp, _ = ps.get_pattern_osm_match_success_fingerprint(conn, feed_id, pid)
+        return fp
+
+    def _last_outcome() -> Optional[str]:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT outcome FROM pattern_osm_match_status
+                WHERE feed_id = %s AND pattern_id = %s
+                """,
+                (feed_id, pid),
+            )
+            row = cur.fetchone()
+        return row.get("outcome") if row else None
+
+    if ps.fast_path_may_skip(_last_fp, _last_outcome, current_fp, force=force_refresh):
+        return PatternOsmMatchResult(pid, "skipped_fingerprint", 0, message="fingerprint unchanged")
+
+    if not repr_trip_id:
+        return PatternOsmMatchResult(pid, "skipped_no_trip", 0, message="no repr_trip_id")
+    shape_line = _shape_line_for_pattern(conn, feed_id, repr_shape_id)
+    if shape_line is None or shape_line.is_empty:
+        return PatternOsmMatchResult(pid, "skipped_no_shape", 0, message="no representative shape")
+    stops = _stop_times_for_trip(conn, feed_id, str(repr_trip_id))
+    if len(stops) < 2:
+        return PatternOsmMatchResult(pid, "skipped_no_stops", 0, message="fewer than 2 stop_times rows")
+
+    unit = ps.UnitLockKey(
+        stage_name=ps.StageName.PATTERN_OSM_MATCH.value,
+        feed_id=feed_id,
+        pattern_id=pid,
+    )
+
+    prev_autocommit = conn.autocommit
+    conn.autocommit = False
+    try:
+        with ps.rebuild_unit(
+            conn,
+            unit,
+            current_fp,
+            force=force_refresh,
+            get_last_success_fp=_last_fp,
+            get_last_outcome=_last_outcome,
+            mark_running=lambda: ps.upsert_pattern_osm_match_status(
+                conn, feed_id, pid, input_fingerprint=current_fp, outcome=ps.OUTCOME_RUNNING
+            ),
+            mark_succeeded=lambda: ps.upsert_pattern_osm_match_status(
+                conn, feed_id, pid, input_fingerprint=current_fp, outcome=ps.OUTCOME_SUCCEEDED
+            ),
+            mark_failed=lambda: ps.upsert_pattern_osm_match_status(
+                conn, feed_id, pid, input_fingerprint=current_fp, outcome=ps.OUTCOME_FAILED
+            ),
+            log_prefix="match_patterns_to_osm",
+        ) as ry:
+            if ry.skipped_after_lock:
+                return PatternOsmMatchResult(
+                    pid, "skipped_fingerprint", 0, message="skipped_after_lock"
+                )
+            res = _do_match_write(
+                conn,
+                feed_id=feed_id,
+                pid=pid,
+                repr_trip_id=repr_trip_id,
+                repr_shape_id=repr_shape_id,
+                full_trace_max_km=full_trace_max_km,
+                chunk_legs=chunk_legs,
+                chunk_overlap=chunk_overlap,
+                costing=costing,
+                densify_m=densify_m,
+            )
+            if res.status != "written":
+                raise RuntimeError(f"match failed status={res.status} message={res.message}")
+            return res
+    finally:
+        conn.autocommit = prev_autocommit
 
 
 def match_patterns_to_osm(

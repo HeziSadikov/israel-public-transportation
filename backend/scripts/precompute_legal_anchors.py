@@ -29,6 +29,7 @@ from backend.domain.detour_physical.legal_anchor_index import (
     merge_and_rank_records,
 )
 from backend.infra import db_access as db
+from backend.infra import pipeline_skip as ps
 from backend.infra.config import LEGAL_ANCHOR_INDEX_ANCHOR_VERSION
 from backend.infra.logging_utils import ensure_cli_action_logging, log
 
@@ -291,22 +292,37 @@ def _process_one_pattern(
         acc[name] = now - t0
         t0 = now
 
-    if not force:
-        st = db.fetch_pattern_legal_anchor_pattern_status(
-            feed_version, pattern_id, ANCHOR_VERSION, conn=conn
+    pattern_sig = db.get_pattern_signature(feed_id, pattern_id, conn=conn)
+    if not pattern_sig:
+        pattern_sig = db.compute_pattern_signature(
+            feed_id, pattern_id, repr_shape_id=repr_shape_id, repr_trip_id=repr_trip_id, conn=conn
         )
-        if st:
+    current_fp = ps.build_legal_anchors_fingerprint(
+        pattern_signature=pattern_sig,
+        anchor_version=ANCHOR_VERSION,
+        trace_cache_version=TRACE_CACHE_VERSION,
+        valhalla_base_url=valhalla_base_url,
+    )
+    if not force:
+        last_fp = ps.get_legal_anchor_pipeline_success_fingerprint(
+            conn, feed_version, pattern_id, ANCHOR_VERSION
+        )
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT pipeline_outcome FROM pattern_legal_anchor_pattern_status
+                WHERE feed_version = %s AND pattern_id = %s AND anchor_version = %s
+                """,
+                (feed_version, pattern_id, ANCHOR_VERSION),
+            )
+            prow = cur.fetchone()
+        last_po = prow.get("pipeline_outcome") if prow else None
+        if ps.may_skip(current_fp, last_fp, force=False, last_outcome=last_po):
             log(
                 "precompute-legal-anchors",
-                f"pattern_id={pattern_id} skipped_cached_status outcome={st.get('outcome')}",
+                f"pattern_id={pattern_id} skipped_fingerprint",
             )
-            return "skipped_cached_status"
-        n_existing = db.count_pattern_legal_anchor_candidates(
-            feed_version, pattern_id, ANCHOR_VERSION, conn=conn
-        )
-        if n_existing > 0:
-            log("precompute-legal-anchors", f"pattern_id={pattern_id} skipped_existing_rows n={n_existing}")
-            return "skipped_existing_rows"
+            return "skipped_fingerprint"
 
     if not repr_shape_id:
         db.upsert_pattern_legal_anchor_pattern_status(
@@ -442,6 +458,16 @@ def _process_one_pattern(
         row_count=len(rows_db),
         conn=conn,
     )
+    ps.upsert_legal_anchor_pipeline_status(
+        conn,
+        feed_version,
+        pattern_id,
+        ANCHOR_VERSION,
+        input_fingerprint=current_fp,
+        pipeline_outcome=ps.OUTCOME_SUCCEEDED,
+        business_outcome="ok",
+        row_count=len(rows_db),
+    )
     _mark("db_write")
     conn.commit()
     if timings_out is not None:
@@ -511,6 +537,7 @@ def main() -> None:
         conn = db._get_conn()
         try:
             db.ensure_pattern_legal_anchor_schema(conn=conn)
+            ps.ensure_pipeline_schema(conn)
             feed_id = db.get_active_feed_id(conn)
             feed_version = db.get_active_feed_version_key(conn)
             patterns = _list_patterns(conn, limit=args.limit, pattern_id=args.pattern_id, sql_prefilter_shapes=sql_prefilter)
@@ -552,6 +579,7 @@ def main() -> None:
     main_conn = db._get_conn()
     try:
         db.ensure_pattern_legal_anchor_schema(conn=main_conn)
+        ps.ensure_pipeline_schema(main_conn)
         feed_id = db.get_active_feed_id(main_conn)
         feed_version = db.get_active_feed_version_key(main_conn)
         patterns = _list_patterns(

@@ -1,24 +1,35 @@
 """
 Run the full PostGIS data pipeline in one go:
 
-  1. (Optional) GTFS ingest — same defaults as backend.scripts.ingest_gtfs_postgis.
-     Ingest builds shapes_lines and populates gtfs_bus_way_evidence (GTFS shapes → OSM ways,
-     used by detour v2); skipping ingest leaves that table unchanged unless you add step 2b.
-  2. Build route patterns + ride network — same defaults as build_patterns_postgis (auto date)
-  2b. (Optional) Rebuild gtfs_bus_way_evidence — see --rebuild-gtfs-bus-way-evidence
-  3. Precompute route graphs + route previews — same as scripts.precompute_graphs_postgis
-     (`--workers` for graph build; pattern OSM match uses `--pattern-osm-workers` or the same value.)
-  4. (Optional) Detour v3 layers: `--with-osm-import`, `--with-segment-turns` (rebuild ``osm_segment_turns``;
-     redundant if import already used ``--with-turns`` in ``--osm-import-extra``), ``--with-pattern-osm-match`` (needs Valhalla for
-     trace_attributes offline unless you pass skip flags in ``--pattern-osm-extra``), ``--with-bus-evidence``.
+  1. (Optional) GTFS ingest - ``backend.scripts.ingest_gtfs_postgis`` (checksum skip when zip unchanged).
+  2. Build route patterns - ``build_patterns_postgis`` (``patterns_built_checksum`` skip when zip unchanged).
+  2b. (Optional) ``--rebuild-gtfs-bus-way-evidence``
+  3. Graph precompute - ``scripts.precompute_graphs_postgis`` (cache + route signatures skip redundant routes).
+  4. (Optional) Detour v3: OSM import, segment turns, pattern-to-OSM match, bus evidence.
 
-From the repository root:
+Recommended full Detour v3 command (copy-paste from repo root; in PowerShell use line continuation ``^`` or a single line; use ``=`` for args whose values start with ``-``)::
 
-    python -m scripts.precompute_all_postgis
-    python -m scripts.precompute_all_postgis --with-ingest --workers 4
-    python -m scripts.precompute_all_postgis --with-ingest --ingest-fetch-always --workers 4
-    python -m scripts.precompute_all_postgis --skip-graphs --with-osm-import --with-segment-turns --with-pattern-osm-match --with-bus-evidence
-    python -m scripts.precompute_all_postgis --rebuild-gtfs-bus-way-evidence --workers 4
+    python -m scripts.precompute_all_postgis \\
+      --with-ingest --ingest-fetch-if-newer --workers 4 \\
+      --with-osm-import --osm-import-extra=--with-segments,--with-turns \\
+      --with-segment-turns --with-pattern-osm-match --with-bus-evidence
+
+Optional conveniences on this orchestrator (same script)::
+
+    --osm-pbf-fetch-if-newer   prepend ``--fetch-if-newer`` to ``import_osm_pbf`` argv (PBF only when remote newer)
+    --pattern-osm-all          append ``--all-patterns,--limit,200`` to ``match_patterns_to_osm`` (full-feed match; heavy)
+
+Content-addressed skip: each subprocess skips only when ``input_fingerprint`` matches a prior
+``outcome=succeeded`` run (see ``backend/infra/pipeline_skip.py``). Use ``--force-all`` to rebuild anyway.
+
+Incremental examples (omit ``--with-ingest`` when GTFS is already loaded; fingerprint skips apply inside each subprocess)::
+
+    python -m scripts.precompute_all_postgis --skip-patterns --skip-graphs \\
+      --with-osm-import --osm-import-extra=--with-segments,--with-turns --with-segment-turns \\
+      --with-pattern-osm-match --with-bus-evidence
+
+    python -m scripts.precompute_all_postgis --with-ingest --ingest-fetch-if-newer --workers 4 \\
+      --pattern-osm-all --pattern-osm-workers 4
 """
 
 from __future__ import annotations
@@ -68,7 +79,9 @@ def main() -> None:
     ap = argparse.ArgumentParser(
         description=(
             "One command: optional ingest, build_patterns_postgis, optional gtfs_bus_way_evidence "
-            "rebuild, optional detour v3 OSM/pattern/evidence layers, precompute_graphs_postgis."
+            "rebuild, optional detour v3 OSM/pattern/evidence layers, precompute_graphs_postgis. "
+            "See module docstring for the recommended full Detour v3 argv; shorthands: "
+            "--osm-pbf-fetch-if-newer, --pattern-osm-all, --pattern-osm-workers."
         ),
     )
     ap.add_argument(
@@ -83,6 +96,14 @@ def main() -> None:
         help=(
             "Run ingest_gtfs_postgis first (default zip + MOT source URL from ingest script). "
             "Also builds gtfs_bus_way_evidence for detour v2."
+        ),
+    )
+    ap.add_argument(
+        "--force-all",
+        action="store_true",
+        help=(
+            "Pass --force / --force-refresh / --force-signatures to subprocesses that support "
+            "content-addressed skip overrides."
         ),
     )
     ap.add_argument(
@@ -113,7 +134,7 @@ def main() -> None:
         action="store_true",
         help=(
             "After pattern build: run backend.scripts.build_gtfs_bus_way_evidence "
-            "(GTFS shapes → OSM ways for detour v2; ingest already does this when --with-ingest is used)."
+            "(GTFS shapes to OSM ways for detour v2; ingest already does this when --with-ingest is used)."
         ),
     )
     ap.add_argument(
@@ -205,6 +226,14 @@ def main() -> None:
         ),
     )
     ap.add_argument(
+        "--osm-pbf-fetch-if-newer",
+        action="store_true",
+        help=(
+            "With --with-osm-import: prepend --fetch-if-newer to import_osm_pbf "
+            "(download PBF only when remote metadata says newer)."
+        ),
+    )
+    ap.add_argument(
         "--with-pattern-osm-match",
         action="store_true",
         help="After optional OSM import: run backend.scripts.match_patterns_to_osm (Valhalla + pattern_osm_segments).",
@@ -216,6 +245,14 @@ def main() -> None:
         help=(
             "Comma-separated tokens for match_patterns_to_osm. "
             "If any token starts with -, use --pattern-osm-extra=--limit,10 style."
+        ),
+    )
+    ap.add_argument(
+        "--pattern-osm-all",
+        action="store_true",
+        help=(
+            "With --with-pattern-osm-match: append --all-patterns,--limit,200 to match argv "
+            "(full-feed Valhalla map-match; combine with --pattern-osm-workers)."
         ),
     )
     ap.add_argument(
@@ -241,6 +278,11 @@ def main() -> None:
     args = ap.parse_args()
     db = args.database_url
 
+    if args.pattern_osm_all and not args.with_pattern_osm_match:
+        ap.error("--pattern-osm-all requires --with-pattern-osm-match")
+    if args.osm_pbf_fetch_if_newer and not args.with_osm_import:
+        ap.error("--osm-pbf-fetch-if-newer requires --with-osm-import")
+
     if int(args.workers) > 1 or (
         args.pattern_osm_workers is not None and int(args.pattern_osm_workers) > 1
     ):
@@ -262,10 +304,12 @@ def main() -> None:
             "Use only one of --ingest-fetch, --ingest-fetch-always, and --ingest-fetch-if-newer"
         )
 
+    force_all = bool(args.force_all)
+
     if args.with_ingest:
         log("precompute-all", "phase=ingest_pipeline start")
         ingest_extra: list[str] = []
-        if args.ingest_force:
+        if args.ingest_force or force_all:
             ingest_extra.append("--force")
         if args.ingest_fetch_always:
             ingest_extra.append("--fetch-always")
@@ -281,7 +325,7 @@ def main() -> None:
         pat_extra: list[str] = []
         if args.pattern_date:
             pat_extra.extend(["--date", args.pattern_date])
-        if args.force_patterns:
+        if args.force_patterns or force_all:
             pat_extra.append("--force")
         if args.ignore_calendar:
             pat_extra.append("--ignore-calendar")
@@ -292,12 +336,19 @@ def main() -> None:
 
     if args.rebuild_gtfs_bus_way_evidence:
         log("precompute-all", "phase=gtfs_bus_way_evidence start")
-        _run_py_module("backend.scripts.build_gtfs_bus_way_evidence", [], db)
+        gbwe_extra = ["--force"] if force_all else []
+        _run_py_module("backend.scripts.build_gtfs_bus_way_evidence", gbwe_extra, db)
         log("precompute-all", "phase=gtfs_bus_way_evidence done")
 
     if args.with_osm_import:
         log("precompute-all", "phase=osm_import start")
         extra_toks = [t.strip() for t in str(args.osm_import_extra).split(",") if t.strip()]
+        if args.osm_pbf_fetch_if_newer and not any(
+            t == "--fetch-if-newer" or t.startswith("--fetch-if-newer=") for t in extra_toks
+        ):
+            extra_toks = ["--fetch-if-newer", *extra_toks]
+        if force_all and not any(t == "--force" or t.startswith("--force=") for t in extra_toks):
+            extra_toks = ["--force", *extra_toks]
         _run_py_module("backend.scripts.import_osm_pbf", extra_toks, db)
         log("precompute-all", "phase=osm_import done")
 
@@ -306,12 +357,18 @@ def main() -> None:
         st_extra: list[str] = []
         if args.segment_turns_import_run_id is not None:
             st_extra.extend(["--import-run-id", str(int(args.segment_turns_import_run_id))])
+        if force_all:
+            st_extra.append("--force")
         _run_py_module("backend.scripts.build_segment_turns", st_extra, db)
         log("precompute-all", "phase=segment_turns done")
 
     if args.with_pattern_osm_match:
         log("precompute-all", "phase=pattern_osm_match start")
         pom_extra = [t.strip() for t in str(args.pattern_osm_extra).split(",") if t.strip()]
+        if force_all and not any(t == "--force-refresh" or t.startswith("--force-refresh=") for t in pom_extra):
+            pom_extra.append("--force-refresh")
+        if args.pattern_osm_all and "--all-patterns" not in pom_extra:
+            pom_extra.extend(["--all-patterns", "--limit", "200"])
         pom_workers = (
             int(args.pattern_osm_workers)
             if args.pattern_osm_workers is not None
@@ -325,7 +382,8 @@ def main() -> None:
 
     if args.with_bus_evidence:
         log("precompute-all", "phase=bus_evidence start")
-        _run_py_module("backend.scripts.build_bus_evidence", [], db)
+        be_extra = ["--force"] if force_all else []
+        _run_py_module("backend.scripts.build_bus_evidence", be_extra, db)
         log("precompute-all", "phase=bus_evidence done")
 
     if not args.skip_graphs:
@@ -340,6 +398,8 @@ def main() -> None:
         ]
         if args.with_pretty_osm:
             graph_extra.append("--with-pretty-osm")
+        if force_all:
+            graph_extra.append("--force-signatures")
         _run_py_module("scripts.precompute_graphs_postgis", graph_extra, db)
         log("precompute-all", "phase=graphs_pipeline done")
 

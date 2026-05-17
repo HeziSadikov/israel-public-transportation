@@ -170,6 +170,11 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-import even when osm_dataset_fingerprint matches the last successful run.",
+    )
+    parser.add_argument(
         "--skip-import",
         action="store_true",
         help=(
@@ -350,6 +355,15 @@ def main(argv: Optional[list[str]] = None) -> int:
         # ---- Phase 1: migration ------------------------------------------
         t_mig = time.perf_counter()
         ensure_detour_v3_layer(conn)
+        from backend.infra.pipeline_skip import (
+            build_osm_dataset_fingerprint,
+            ensure_pipeline_schema,
+            find_successful_osm_import_by_dataset_fingerprint,
+            sha256_file,
+            OSM_IMPORT_ALGORITHM_VERSION,
+        )
+
+        ensure_pipeline_schema(conn)
         log(
             "import-osm-pbf",
             f"migration applied elapsed_s={time.perf_counter() - t_mig:.2f}",
@@ -387,6 +401,40 @@ def main(argv: Optional[list[str]] = None) -> int:
             "pbf_size_bytes": None,
             "pbf_modified_at": None,
         }
+
+        osm_cli = {
+            "verify": bool(args.verify),
+            "with_segments": bool(args.with_segments),
+            "with_turns": bool(args.with_turns),
+            "segment_import_run_id": args.segment_import_run_id,
+            "skip_import": bool(args.skip_import),
+            "reset_osm_import": bool(args.reset_osm_import),
+        }
+        pbf_sha = sha256_file(pbf_path) if pbf_path.exists() else ""
+        osm_dataset_fp = build_osm_dataset_fingerprint(pbf_sha256=pbf_sha, cli=osm_cli)
+        existing_run = (
+            find_successful_osm_import_by_dataset_fingerprint(conn, osm_dataset_fp)
+            if do_import and not args.verify and not args.force and not args.reset_osm_import
+            else None
+        )
+        if existing_run:
+            log(
+                "import-osm-pbf",
+                f"Skip: osm_dataset_fingerprint unchanged (run_id={existing_run})",
+            )
+            print(
+                json.dumps(
+                    {
+                        "skipped": True,
+                        "reason": "osm_dataset_fingerprint_unchanged",
+                        "osm_dataset_fingerprint": osm_dataset_fp,
+                        "existing_run_id": existing_run,
+                    },
+                    indent=2,
+                ),
+                flush=True,
+            )
+            return 0
 
         # ---- Phase 4: create osm_import_runs row -------------------------
         run_id = start_osm_import_run(
@@ -519,12 +567,29 @@ def main(argv: Optional[list[str]] = None) -> int:
 
         # ---- Phase 7: finalize osm_import_runs ---------------------------
         final_status = "verify_only" if args.verify else "success"
+        from backend.infra.pipeline_skip import (
+            mark_osm_succeeded,
+            set_osm_import_dataset_fingerprint,
+            StageName,
+        )
+
+        set_osm_import_dataset_fingerprint(conn, run_id, osm_dataset_fp)
+        conn.commit()
         finish_osm_import_run(
             conn,
             run_id,
             status=final_status,
             stats=combined_stats,
         )
+        if final_status == "success":
+            mark_osm_succeeded(
+                conn,
+                run_id,
+                StageName.OSM_IMPORT.value,
+                osm_dataset_fp,
+                stats={"algorithm_version": OSM_IMPORT_ALGORITHM_VERSION},
+            )
+            conn.commit()
         log(
             "import-osm-pbf",
             f"run id={run_id} status={final_status} ok",

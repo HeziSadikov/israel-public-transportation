@@ -125,7 +125,7 @@ def _process_rows_sequential(
             if res.status == "written":
                 conn.commit()
                 written += 1
-            elif res.status.startswith("skipped"):
+            elif res.status.startswith("skipped") or res.status == "skipped_fingerprint":
                 conn.rollback()
                 skipped += 1
                 if verbose:
@@ -199,7 +199,7 @@ def _process_rows_parallel_page(
                 if res.status == "written":
                     conn.commit()
                     return "written", pid
-                if res.status.startswith("skipped"):
+                if res.status.startswith("skipped") or res.status == "skipped_fingerprint":
                     conn.rollback()
                     return "skipped", pid
                 conn.rollback()
@@ -319,6 +319,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         db.ensure_pattern_physical_layer_schema(conn=conn)
         ensure_detour_v3_layer(conn)
+        from backend.infra.pipeline_skip import ensure_pipeline_schema
+
+        ensure_pipeline_schema(conn)
         feed_id = int(db.get_active_feed_id(conn))
     finally:
         conn.close()

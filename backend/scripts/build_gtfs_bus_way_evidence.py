@@ -21,6 +21,7 @@ import psycopg2
 from psycopg2.extras import DictCursor
 
 from backend.infra import db_access as db
+from backend.infra import pipeline_skip as ps
 from backend.infra.logging_utils import ensure_cli_action_logging, log
 
 
@@ -51,6 +52,11 @@ def main(argv: list[str] | None = None) -> int:
         "--skip-shapes-lines",
         action="store_true",
         help="Do not refresh shapes_lines from shapes (faster if shapes_lines is already current).",
+    )
+    ap.add_argument(
+        "--force",
+        action="store_true",
+        help="Rebuild even when fingerprint matches last successful run.",
     )
     args = ap.parse_args(argv)
 
@@ -89,6 +95,24 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 1
 
+        ps.ensure_pipeline_schema(conn)
+        with conn.cursor() as cur:
+            cur.execute("SELECT checksum FROM feed_versions WHERE id = %s", (feed_id,))
+            fv = cur.fetchone()
+        zip_ck = fv["checksum"] if fv else ""
+        osm_fp = ps.get_latest_osm_dataset_fingerprint(conn)
+        current_fp = ps.build_gtfs_bus_way_evidence_fingerprint(
+            gtfs_zip_checksum=zip_ck or "",
+            osm_dataset_fingerprint=osm_fp,
+            skip_shapes_lines=bool(args.skip_shapes_lines),
+        )
+        if not args.force and ps.feed_stage_may_skip(
+            conn, feed_id, ps.StageName.GTFS_BUS_WAY_EVIDENCE.value, current_fp, force=False
+        ):
+            log("gtfs-bus-way-evidence", f"Skip: fingerprint unchanged feed_id={feed_id}")
+            print(f"[build-gtfs-bus-way-evidence] Skip: fingerprint unchanged feed_id={feed_id}", flush=True)
+            return 0
+
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT COUNT(*)::bigint AS n FROM gtfs_bus_way_evidence WHERE feed_id = %s",
@@ -96,6 +120,8 @@ def main(argv: list[str] | None = None) -> int:
             )
             before = int(cur.fetchone()["n"] or 0)
 
+        ps.mark_feed_running(conn, feed_id, ps.StageName.GTFS_BUS_WAY_EVIDENCE.value, current_fp)
+        conn.commit()
         t0 = time.perf_counter()
         with conn.cursor() as cur:
             if not args.skip_shapes_lines:
@@ -113,6 +139,13 @@ def main(argv: list[str] | None = None) -> int:
                 "gtfs-bus-way-evidence",
                 f"phase=rebuild_gtfs_bus_way_evidence done feed_id={feed_id} elapsed_s={time.perf_counter() - t_ev:.2f}",
             )
+        ps.mark_feed_succeeded(
+            conn,
+            feed_id,
+            ps.StageName.GTFS_BUS_WAY_EVIDENCE.value,
+            current_fp,
+            stats={"rows_before": before},
+        )
         conn.commit()
 
         with conn.cursor() as cur:

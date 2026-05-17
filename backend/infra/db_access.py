@@ -7018,3 +7018,139 @@ def upsert_pattern_trace_valhalla_cache(
     finally:
         if close:
             conn.close()
+
+
+def compute_pattern_signature(
+    feed_id: int,
+    pattern_id: str,
+    *,
+    repr_trip_id: Optional[str] = None,
+    repr_shape_id: Optional[str] = None,
+    conn=None,
+) -> str:
+    """
+    Stable hash for a pattern's representative trip/shape/stop_times content.
+    """
+    close = False
+    if conn is None:
+        conn = _get_conn()
+        close = True
+    try:
+        with conn.cursor() as cur:
+            if repr_trip_id is None or repr_shape_id is None:
+                cur.execute(
+                    """
+                    SELECT repr_trip_id, repr_shape_id
+                    FROM patterns
+                    WHERE feed_id = %s AND pattern_id = %s
+                    """,
+                    (feed_id, pattern_id),
+                )
+                prow = cur.fetchone()
+                if not prow:
+                    return _fingerprint_sha256_empty_pattern(feed_id, pattern_id)
+                repr_trip_id = repr_trip_id or prow.get("repr_trip_id")
+                repr_shape_id = repr_shape_id or prow.get("repr_shape_id")
+
+            stop_times: List[Dict] = []
+            if repr_trip_id:
+                cur.execute(
+                    """
+                    SELECT stop_id, stop_sequence, shape_dist_traveled
+                    FROM stop_times
+                    WHERE feed_id = %s AND trip_id = %s
+                    ORDER BY stop_sequence
+                    """,
+                    (feed_id, repr_trip_id),
+                )
+                stop_times = [dict(r) for r in cur.fetchall()]
+
+            shapes: List[Dict] = []
+            if repr_shape_id:
+                cur.execute(
+                    """
+                    SELECT shape_id, seq, lat, lon
+                    FROM shapes
+                    WHERE feed_id = %s AND shape_id = %s
+                    ORDER BY seq
+                    """,
+                    (feed_id, repr_shape_id),
+                )
+                shapes = [dict(r) for r in cur.fetchall()]
+
+        payload = {
+            "pattern_id": str(pattern_id),
+            "repr_trip_id": repr_trip_id,
+            "repr_shape_id": repr_shape_id,
+            "stop_times": stop_times,
+            "shapes": shapes,
+        }
+        raw = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+        return hashlib.sha256(raw).hexdigest()
+    finally:
+        if close:
+            conn.close()
+
+
+def _fingerprint_sha256_empty_pattern(feed_id: int, pattern_id: str) -> str:
+    raw = json.dumps(
+        {"feed_id": feed_id, "pattern_id": pattern_id, "missing": True},
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def upsert_pattern_signature(
+    feed_id: int,
+    pattern_id: str,
+    sig_hash: str,
+    conn=None,
+) -> None:
+    close = False
+    if conn is None:
+        conn = _get_conn()
+        close = True
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO pattern_signatures (feed_id, pattern_id, sig_hash)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (feed_id, pattern_id) DO UPDATE SET sig_hash = EXCLUDED.sig_hash
+                """,
+                (feed_id, pattern_id, sig_hash),
+            )
+            if close:
+                conn.commit()
+    except Exception:
+        if close:
+            conn.rollback()
+        raise
+    finally:
+        if close:
+            conn.close()
+
+
+def get_pattern_signature(
+    feed_id: int,
+    pattern_id: str,
+    conn=None,
+) -> Optional[str]:
+    close = False
+    if conn is None:
+        conn = _get_conn()
+        close = True
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT sig_hash FROM pattern_signatures
+                WHERE feed_id = %s AND pattern_id = %s
+                """,
+                (feed_id, pattern_id),
+            )
+            row = cur.fetchone()
+            return row["sig_hash"] if row else None
+    finally:
+        if close:
+            conn.close()

@@ -53,11 +53,17 @@ _MIGRATION_PATH = (
     / "migrations"
     / "ensure_detour_v3_layer.sql"
 )
+_PIPELINE_MIGRATION_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "sql"
+    / "migrations"
+    / "ensure_content_addressed_pipeline.sql"
+)
 
 
 def ensure_detour_v3_layer(conn) -> None:
     """
-    Apply ``ensure_detour_v3_layer.sql`` against ``conn``.
+    Apply ``ensure_detour_v3_layer.sql`` and content-addressed pipeline migration.
 
     Idempotent: the migration uses ``CREATE TABLE IF NOT EXISTS`` /
     ``ADD COLUMN IF NOT EXISTS``. Caller owns the transaction; this function
@@ -68,6 +74,10 @@ def ensure_detour_v3_layer(conn) -> None:
     sql = _MIGRATION_PATH.read_text(encoding="utf-8")
     with conn.cursor() as cur:
         cur.execute(sql)
+    if _PIPELINE_MIGRATION_PATH.exists():
+        pipe_sql = _PIPELINE_MIGRATION_PATH.read_text(encoding="utf-8")
+        with conn.cursor() as cur:
+            cur.execute(pipe_sql)
     conn.commit()
     log("osm-import-db", f"applied migration {_MIGRATION_PATH.name}")
 

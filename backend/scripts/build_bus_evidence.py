@@ -8,6 +8,7 @@ from typing import Optional
 
 from backend.bus_corridor.build_bus_evidence import build_bus_evidence
 from backend.infra import db_access as db
+from backend.infra import pipeline_skip as ps
 from backend.infra.logging_utils import ensure_cli_action_logging, log
 from backend.infra.osm_import_db import ensure_detour_v3_layer
 
@@ -31,6 +32,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         default=None,
         help="Feed version id (default: active feed from feed_versions).",
     )
+    ap.add_argument(
+        "--force",
+        action="store_true",
+        help="Rebuild even when bus_evidence fingerprint matches last successful run.",
+    )
     args = ap.parse_args(argv)
 
     db_url = args.database_url or db.DB_URL
@@ -38,7 +44,27 @@ def main(argv: Optional[list[str]] = None) -> int:
     try:
         db.ensure_pattern_physical_layer_schema(conn=conn)
         ensure_detour_v3_layer(conn)
-        out = build_bus_evidence(conn, feed_id=args.feed_id, commit=True)
+        ps.ensure_pipeline_schema(conn)
+        feed_id = int(args.feed_id) if args.feed_id is not None else int(db.get_active_feed_id(conn))
+        with conn.cursor() as cur:
+            cur.execute("SELECT checksum FROM feed_versions WHERE id = %s", (feed_id,))
+            row = cur.fetchone()
+        zip_ck = row["checksum"] if row else ""
+        osm_fp = ps.get_latest_osm_dataset_fingerprint(conn)
+        current_fp = ps.build_bus_evidence_fingerprint(
+            gtfs_zip_checksum=zip_ck or "",
+            osm_dataset_fingerprint=osm_fp,
+        )
+        if not args.force and ps.feed_stage_may_skip(
+            conn, feed_id, ps.StageName.BUS_EVIDENCE.value, current_fp, force=False
+        ):
+            log("build_bus_evidence", f"Skip: fingerprint unchanged feed_id={feed_id}")
+            return 0
+        ps.mark_feed_running(conn, feed_id, ps.StageName.BUS_EVIDENCE.value, current_fp)
+        conn.commit()
+        out = build_bus_evidence(conn, feed_id=feed_id, commit=True)
+        ps.mark_feed_succeeded(conn, feed_id, ps.StageName.BUS_EVIDENCE.value, current_fp, stats=out)
+        conn.commit()
         log("build_bus_evidence", f"done {out!r}")
         return 0
     except Exception as e:

@@ -755,6 +755,19 @@ def ingest_gtfs(
         log("ingest", f"phase=transaction_commit done elapsed_s={time.perf_counter() - t_commit:.2f}")
         print(f"[ingest] Completed successfully for feed_id={feed_id}")
 
+        try:
+            from backend.infra.pipeline_skip import (
+                ensure_pipeline_schema,
+                mark_feed_succeeded,
+                StageName,
+            )
+
+            ensure_pipeline_schema(conn)
+            mark_feed_succeeded(conn, feed_id, StageName.INGEST.value, zip_checksum)
+            conn.commit()
+        except Exception as e:
+            log("ingest", f"phase=pipeline_stage_mark warning={e!s}")
+
         # Bulk INSERT leaves statistics stale; bad plans can make /area/routes and spatial joins slow.
         try:
             t_an = time.perf_counter()

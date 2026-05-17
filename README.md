@@ -202,6 +202,17 @@ Benchmark helper:
 For realistic latency checks, avoid `--reload`:
 - `py -m uvicorn app:app --port 8000 --log-config uvicorn_logging.json`
 
+### Content-addressed pipeline
+
+Ingest and precompute scripts use **content fingerprints** (data + CLI + algorithm version), not row counts or file existence, to decide whether work can be skipped.
+
+- **Skip when:** `outcome=succeeded` on the stored stage/unit, `input_fingerprint` matches the current fingerprint, and `--force` was not passed.
+- **After lock:** parallel workers re-check `may_skip` inside the rebuild transaction (`skipped_after_lock`).
+- **Helpers:** `backend/infra/pipeline_skip.py`; stage tables: `feed_pipeline_stages`, `osm_pipeline_stages`, `pattern_signatures`, `pattern_osm_match_status`, etc. (migration `backend/sql/migrations/ensure_content_addressed_pipeline.sql`).
+- **Orchestrator:** `python -m scripts.precompute_all_postgis --force-all` forwards force flags to subprocesses.
+
+Existence/count checks are allowed only as sanity checks **after** fingerprint validation, never as skip authorization.
+
 **Manage / CI**
 
 - Schema: `backend/sql/schema/db_postgis_schema.sql`
@@ -258,7 +269,11 @@ Production detours historically used **detour v2** (GTFS anchors + Valhalla road
 
 **CLI (detour v3 layers):** `python -m backend.scripts.import_osm_pbf --with-segments --with-turns`, `python -m backend.scripts.build_segment_turns` (rebuild turns only), `python -m backend.scripts.match_patterns_to_osm`, `python -m backend.scripts.build_bus_evidence`.
 
-**Offline precompute (flags on `scripts/precompute_all_postgis.py`):** ``--with-osm-import``, ``--with-segment-turns`` (optional rebuild of ``osm_segment_turns``), ``--with-pattern-osm-match``, ``--with-bus-evidence``; import extras via ``--osm-import-extra=--with-segments,--with-turns`` (use ``=`` when values start with ``-``; avoids argparse/PowerShell eating the next token) / pattern match via ``--pattern-osm-extra``; optional ``--segment-turns-import-run-id`` (forwards to ``build_segment_turns --import-run-id``). Valhalla ``trace_attributes`` is only required for **`match_patterns_to_osm`**, not for runtime v3 routing.
+**Offline precompute (``scripts/precompute_all_postgis.py``):** one-liner (use ``=`` for args whose values start with ``-``; PowerShell-friendly):
+
+``python -m scripts.precompute_all_postgis --with-ingest --ingest-fetch-if-newer --workers 4 --with-osm-import --osm-import-extra=--with-segments,--with-turns --with-segment-turns --with-pattern-osm-match --with-bus-evidence``
+
+Shorthands on the same script: ``--osm-pbf-fetch-if-newer`` (prepend ``--fetch-if-newer`` to ``import_osm_pbf``), ``--pattern-osm-all`` (append ``--all-patterns,--limit,200`` for full-feed map-match), ``--pattern-osm-workers N`` (Valhalla thread pool; default ``--workers``). Also ``--skip-patterns``, ``--skip-graphs``, ``--pattern-osm-extra``, ``--segment-turns-import-run-id``. Ingest / patterns / graphs subprocesses still skip redundant work via checksums and route signatures when unchanged. Valhalla ``trace_attributes`` is only required for **`match_patterns_to_osm`**, not for runtime v3 routing.
 
 **Frontend:** optional `VITE_DETOUR_COMPUTE_ENGINE=v3` merges into requests when the UI does not set `compute_engine`.
 

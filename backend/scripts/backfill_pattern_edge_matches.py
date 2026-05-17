@@ -29,6 +29,7 @@ from backend.domain.detour_physical.pattern_trace_split import (
     slice_shape_between_stop_indices,
 )
 from backend.infra import db_access as db
+from backend.infra import pipeline_skip as ps
 from backend.infra.config import VALHALLA_TRACE_ATTRIBUTES_ENABLED, VALHALLA_URL
 from backend.infra.logging_utils import ensure_cli_action_logging, log
 
@@ -201,6 +202,39 @@ def _backfill_pattern_impl(
     expected = _expected_leg_pairs(stop_rows)
     n_legs = len(expected)
 
+    pattern_sig = db.get_pattern_signature(feed_id, pattern_id, conn=conn)
+    if not pattern_sig:
+        pattern_sig = db.compute_pattern_signature(
+            feed_id,
+            pattern_id,
+            repr_trip_id=repr_trip_id,
+            repr_shape_id=repr_shape_id,
+            conn=conn,
+        )
+    current_fp = ps.build_pattern_edge_match_fingerprint(
+        pattern_signature=pattern_sig,
+        match_version=match_version,
+        full_trace_max_km=full_trace_max_km,
+        chunk_legs=chunk_legs,
+        chunk_overlap=chunk_overlap,
+    )
+    if not force_refresh:
+        last_fp = ps.get_pattern_edge_match_success_fingerprint(
+            conn, feed_id, pattern_id, match_version
+        )
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT outcome FROM pattern_edge_match_status
+                WHERE feed_id = %s AND pattern_id = %s AND match_version = %s
+                """,
+                (feed_id, pattern_id, match_version),
+            )
+            erow = cur.fetchone()
+        last_outcome = erow.get("outcome") if erow else None
+        if ps.may_skip(current_fp, last_fp, force=False, last_outcome=last_outcome):
+            return 0, 0, 0, "skipped_fingerprint"
+
     if not force_refresh:
         have = db.list_pattern_edge_pairs_with_match_version(
             conn,
@@ -209,14 +243,21 @@ def _backfill_pattern_impl(
             match_version,
             accept_ambiguous=accept_ambiguous,
         )
-        if have == expected:
-            return 0, 0, 0, "skipped_already_complete"
         legs_to_do = expected - have
     else:
         legs_to_do = set(expected)
 
     if not legs_to_do:
-        return 0, 0, 0, "skipped_already_complete"
+        ps.upsert_pattern_edge_match_status(
+            conn,
+            feed_id,
+            pattern_id,
+            match_version,
+            input_fingerprint=current_fp,
+            outcome=ps.OUTCOME_SUCCEEDED,
+        )
+        conn.commit()
+        return 0, 0, 0, "skipped_fingerprint"
 
     shape_line = _shape_line_for_pattern(conn, feed_id, repr_shape_id)
     if shape_line is None:
@@ -425,6 +466,14 @@ def _backfill_pattern_impl(
 
     db.bulk_delete_and_insert_pattern_edge_matches(match_flat, conn=conn)
     db.bulk_upsert_pattern_edge_match_summaries(summary_rows, conn=conn)
+    ps.upsert_pattern_edge_match_status(
+        conn,
+        feed_id,
+        pattern_id,
+        match_version,
+        input_fingerprint=current_fp,
+        outcome=ps.OUTCOME_SUCCEEDED,
+    )
     conn.commit()
     return ok, amb, fail, "done"
 
@@ -452,6 +501,7 @@ def _run_one_pattern(args_tuple: Tuple[Any, ...]) -> Tuple[str, int, int, int, s
     conn = _connect(database_url)
     try:
         db.ensure_pattern_physical_layer_schema(conn=conn)
+        ps.ensure_pipeline_schema(conn)
         feed_id = db.get_active_feed_id(conn)
         fv = _feed_version_key(conn)
         pid = str(row["pattern_id"])
@@ -522,6 +572,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     conn = _connect(db_url)
     try:
         db.ensure_pattern_physical_layer_schema(conn=conn)
+        ps.ensure_pipeline_schema(conn)
         feed_id = db.get_active_feed_id(conn)
         q = """
             SELECT pattern_id, route_id, direction_id, repr_trip_id, repr_shape_id
@@ -592,7 +643,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     total_ok += o
                     total_amb += a
                     total_fail += f
-                    if st == "skipped_already_complete":
+                    if st in ("skipped_already_complete", "skipped_fingerprint"):
                         skipped += 1
             finally:
                 conn.close()
@@ -604,7 +655,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     total_ok += o
                     total_amb += a
                     total_fail += f
-                    if st == "skipped_already_complete":
+                    if st in ("skipped_already_complete", "skipped_fingerprint"):
                         skipped += 1
 
         log(

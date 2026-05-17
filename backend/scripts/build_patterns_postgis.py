@@ -38,6 +38,7 @@ from psycopg2 import errors as pg_errors
 from psycopg2.extras import DictCursor
 
 from backend.infra.logging_utils import ensure_cli_action_logging, log
+from backend.infra import pipeline_skip as ps
 
 _ROUTE_PROGRESS_EVERY = 25
 _RIDE_NETWORK_PROGRESS_EVERY = 25
@@ -47,8 +48,10 @@ from backend.infra.db_access import (
   get_active_feed_id,
   DB_URL as DEFAULT_DB_URL,
   compute_route_signature,
+  compute_pattern_signature,
   get_route_signature,
   upsert_route_signature,
+  upsert_pattern_signature,
   PatternMeta,
   get_pattern_stops_bulk,
   get_stop_times_bulk,
@@ -458,6 +461,26 @@ def _upsert_patterns_for_feed(
               """,
               (feed_id, old_feed_id, old_feed_id, route_id, int(dir_id) if dir_id is not None else None),
             )
+            cur.execute(
+              """
+              INSERT INTO pattern_signatures (feed_id, pattern_id, sig_hash)
+              SELECT %s, psig.pattern_id, psig.sig_hash
+              FROM pattern_signatures psig
+              JOIN patterns p
+                ON p.feed_id = psig.feed_id AND p.pattern_id = psig.pattern_id
+              WHERE psig.feed_id = %s
+                AND p.route_id = %s
+                AND COALESCE(p.direction_id, -1) = COALESCE(%s::int, -1)
+              ON CONFLICT (feed_id, pattern_id) DO UPDATE SET
+                sig_hash = EXCLUDED.sig_hash
+              """,
+              (
+                feed_id,
+                old_feed_id,
+                route_id,
+                int(dir_id) if dir_id is not None else None,
+              ),
+            )
             reused = True
 
         if not reused:
@@ -811,6 +834,15 @@ def _insert_pattern(cur, feed_id: int, pat: RoutePattern) -> None:
     ),
   )
 
+  sig = compute_pattern_signature(
+    feed_id,
+    pat.pattern_id,
+    repr_trip_id=pat.representative_trip_id,
+    repr_shape_id=pat.representative_shape_id,
+    conn=cur.connection,
+  )
+  upsert_pattern_signature(feed_id, pat.pattern_id, sig, conn=cur.connection)
+
   # Insert ordered stops into pattern_stops
   stop_rows = []
   for seq, sid in enumerate(pat.stop_ids):
@@ -910,8 +942,27 @@ def build_patterns(
   conn = _connect(database_url)
   conn.autocommit = False
   try:
+    ps.ensure_pipeline_schema(conn)
     _ensure_patterns_built_checksum_column(conn)
     feed_id = get_active_feed_id(conn)
+
+    with conn.cursor() as cur:
+      cur.execute(
+        "SELECT checksum FROM feed_versions WHERE id = %s",
+        (feed_id,),
+      )
+      fv = cur.fetchone()
+      if date_ymd is None:
+        date_ymd = pick_default_pattern_build_date(cur, feed_id)
+    zip_ck = fv["checksum"] if fv else None
+    patterns_fp = ps.build_patterns_stage_fingerprint(
+      gtfs_zip_checksum=zip_ck or "",
+      cli={
+        "date_ymd": date_ymd,
+        "ignore_calendar": ignore_calendar,
+        "route_batch_size": route_batch_size,
+      },
+    )
 
     if not force:
       with conn.cursor() as cur:
@@ -926,6 +977,23 @@ def build_patterns(
         fv = cur.fetchone()
       zip_ck = fv["checksum"] if fv else None
       pat_ck = fv["patterns_built_checksum"] if fv else None
+      if ps.feed_stage_may_skip(conn, feed_id, ps.StageName.PATTERNS.value, patterns_fp, force=False):
+        with conn.cursor() as cur:
+          ref_date = (
+            date_ymd
+            if date_ymd is not None
+            else pick_default_pattern_build_date(cur, feed_id)
+          )
+        conn.rollback()
+        log(
+          "patterns",
+          f"Skip: patterns stage fingerprint unchanged (feed_id={feed_id})",
+        )
+        log(
+          "patterns",
+          f"phase=checksum_gate done skip=true feed_id={feed_id} elapsed_s={time.perf_counter() - t_gate:.2f}",
+        )
+        return ref_date
       if zip_ck and pat_ck and zip_ck == pat_ck:
         with conn.cursor() as cur:
           ref_date = (
@@ -994,6 +1062,12 @@ def build_patterns(
           WHERE id = %s
           """,
           (feed_id,),
+        )
+        ps.mark_feed_succeeded(
+          conn,
+          feed_id,
+          ps.StageName.PATTERNS.value,
+          patterns_fp,
         )
     log("patterns", "Patterns and pattern_stops populated successfully.")
     return date_ymd

@@ -768,3 +768,59 @@ EXCEPTION
 END
 $upgrade_route_cache_pk$;
 
+-- Content-addressed pipeline (see ensure_content_addressed_pipeline.sql)
+CREATE TABLE IF NOT EXISTS feed_pipeline_stages (
+    feed_id           INT NOT NULL REFERENCES feed_versions(id) ON DELETE CASCADE,
+    stage_name        TEXT NOT NULL,
+    input_fingerprint TEXT NOT NULL,
+    outcome           TEXT NOT NULL CHECK (outcome IN ('running', 'succeeded', 'failed')),
+    completed_at      TIMESTAMPTZ,
+    stats_json        JSONB,
+    PRIMARY KEY (feed_id, stage_name)
+);
+
+CREATE TABLE IF NOT EXISTS osm_pipeline_stages (
+    osm_import_run_id BIGINT NOT NULL REFERENCES osm_import_runs(id) ON DELETE CASCADE,
+    stage_name        TEXT NOT NULL,
+    input_fingerprint TEXT NOT NULL,
+    outcome           TEXT NOT NULL CHECK (outcome IN ('running', 'succeeded', 'failed')),
+    completed_at      TIMESTAMPTZ,
+    stats_json        JSONB,
+    PRIMARY KEY (osm_import_run_id, stage_name)
+);
+
+CREATE TABLE IF NOT EXISTS pattern_signatures (
+    feed_id     INT NOT NULL REFERENCES feed_versions(id) ON DELETE CASCADE,
+    pattern_id  TEXT NOT NULL,
+    sig_hash    TEXT NOT NULL,
+    PRIMARY KEY (feed_id, pattern_id)
+);
+
+CREATE TABLE IF NOT EXISTS pattern_osm_match_status (
+    feed_id           INT NOT NULL REFERENCES feed_versions(id) ON DELETE CASCADE,
+    pattern_id        TEXT NOT NULL,
+    input_fingerprint TEXT NOT NULL,
+    outcome           TEXT NOT NULL CHECK (outcome IN ('running', 'succeeded', 'failed')),
+    completed_at      TIMESTAMPTZ,
+    stats_json        JSONB,
+    PRIMARY KEY (feed_id, pattern_id)
+);
+
+CREATE TABLE IF NOT EXISTS pattern_edge_match_status (
+    feed_id           INT NOT NULL,
+    pattern_id        TEXT NOT NULL,
+    match_version     TEXT NOT NULL,
+    input_fingerprint TEXT NOT NULL,
+    outcome           TEXT NOT NULL CHECK (outcome IN ('running', 'succeeded', 'failed')),
+    completed_at      TIMESTAMPTZ,
+    stats_json        JSONB,
+    PRIMARY KEY (feed_id, pattern_id, match_version)
+);
+
+ALTER TABLE osm_import_runs ADD COLUMN IF NOT EXISTS osm_dataset_fingerprint TEXT;
+
+ALTER TABLE pattern_legal_anchor_pattern_status
+    ADD COLUMN IF NOT EXISTS input_fingerprint TEXT;
+ALTER TABLE pattern_legal_anchor_pattern_status
+    ADD COLUMN IF NOT EXISTS pipeline_outcome TEXT;
+
