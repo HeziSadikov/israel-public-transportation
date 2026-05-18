@@ -157,6 +157,37 @@ def extract_edges_for_shape_fractions(
     return full_edges[lo : hi + 1]
 
 
+def chunk_leg_ranges_by_distance(
+    n_legs: int,
+    cum: List[float],
+    *,
+    max_span_m: float,
+    max_legs_per_chunk: int = 11,
+    overlap: int = 1,
+) -> List[Tuple[int, int]]:
+    """Inclusive leg ranges whose stop span along the shape is at most ``max_span_m``."""
+    if n_legs <= 0:
+        return []
+    max_legs = max(1, int(max_legs_per_chunk))
+    ov = max(0, int(overlap))
+    out: List[Tuple[int, int]] = []
+    lo = 0
+    while lo < n_legs:
+        hi = lo
+        while hi < n_legs - 1:
+            nxt = hi + 1
+            span = float(cum[nxt + 1]) - float(cum[lo])
+            legs = nxt - lo + 1
+            if span > max_span_m or legs >= max_legs:
+                break
+            hi = nxt
+        out.append((lo, hi))
+        if hi >= n_legs - 1:
+            break
+        lo = max(lo + 1, hi - ov + 1)
+    return out
+
+
 def chunk_leg_ranges(
     n_legs: int,
     *,

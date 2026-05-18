@@ -19,6 +19,7 @@ from .trace_segment_resolve import (
     dedupe_consecutive_trace_edges,
     flatten_per_leg_trace_edges,
     resolve_trace_edges_to_segment_ids,
+    trace_edge_has_osm_endpoint_ids,
     trace_edge_resolution_triple,
 )
 
@@ -139,8 +140,21 @@ def _do_match_write(
 
     triples = [trace_edge_resolution_triple(e, i) for i, e in enumerate(flat)]
     triple_map = db.fetch_osm_road_segments_by_way_endpoint_triples(triples, conn=conn)
+    way_ids = sorted(
+        {
+            int(e.get("way_id") or 0)
+            for e in flat
+            if not trace_edge_has_osm_endpoint_ids(e) and int(e.get("way_id") or 0) > 0
+        }
+    )
+    way_map = db.fetch_osm_road_segments_by_way_ids(way_ids, conn=conn) if way_ids else {}
 
-    ids, unresolved = resolve_trace_edges_to_segment_ids(flat, triple_map, v3_import_source=IMPORT_SOURCE_V3)
+    ids, unresolved = resolve_trace_edges_to_segment_ids(
+        flat,
+        triple_map,
+        v3_import_source=IMPORT_SOURCE_V3,
+        way_to_rows=way_map,
+    )
     if ids is None or not ids:
         return PatternOsmMatchResult(
             pid,
@@ -234,6 +248,8 @@ def match_single_pattern_to_osm(
         pattern_id=pid,
     )
 
+    # Fingerprint / shape reads above may have opened an implicit transaction (autocommit off).
+    ps.commit_if_in_transaction(conn)
     prev_autocommit = conn.autocommit
     conn.autocommit = False
     try:
@@ -272,7 +288,7 @@ def match_single_pattern_to_osm(
                 densify_m=densify_m,
             )
             if res.status != "written":
-                raise RuntimeError(f"match failed status={res.status} message={res.message}")
+                ry.failed_outcome = True
             return res
     finally:
         conn.autocommit = prev_autocommit

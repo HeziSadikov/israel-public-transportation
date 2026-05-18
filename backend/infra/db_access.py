@@ -11,11 +11,28 @@ It assumes the schema defined in backend/sql/schema/db_postgis_schema.sql and th
 feed_versions.active indicates the current GTFS feed.
 """
 
+from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 # Optional[str] for direction_id in tuple keys (route_id, direction_id)
 RouteDirKey = Tuple[str, Optional[str]]
+
+# route_signatures / route_graph_cache PK columns cannot store SQL NULL for direction_id.
+_DIRECTION_ID_NULL_DB = -1
+
+
+def direction_id_db_value(direction_id: Optional[str]) -> int:
+    """Map logical direction_id to DB column value (use -1 when GTFS direction is absent)."""
+    if direction_id is None or direction_id == "":
+        return _DIRECTION_ID_NULL_DB
+    return int(direction_id)
+
+
+def direction_id_from_db(value: Optional[int]) -> Optional[str]:
+    if value is None or int(value) == _DIRECTION_ID_NULL_DB:
+        return None
+    return str(int(value))
 
 import os
 import hashlib
@@ -1896,12 +1913,17 @@ def get_route_signature(
                 FROM route_signatures
                 WHERE feed_id = %s
                   AND route_id = %s
-                  AND COALESCE(direction_id, -1) = COALESCE(%s::int, -1)
+                  AND direction_id = %s
                 """,
-                (feed_id, route_id, int(direction_id) if direction_id is not None else None),
+                (feed_id, route_id, direction_id_db_value(direction_id)),
             )
             row = cur.fetchone()
-            return row["sig_hash"] if row else None
+            if not row:
+                return None
+            try:
+                return row["sig_hash"]
+            except (TypeError, KeyError):
+                return row[0]
     finally:
         if close:
             conn.close()
@@ -1927,9 +1949,10 @@ def upsert_route_signature(
                 ON CONFLICT (feed_id, route_id, direction_id)
                 DO UPDATE SET sig_hash = EXCLUDED.sig_hash
                 """,
-                (feed_id, route_id, int(direction_id) if direction_id is not None else None, sig_hash),
+                (feed_id, route_id, direction_id_db_value(direction_id), sig_hash),
             )
-            conn.commit()
+            if close:
+                conn.commit()
     finally:
         if close:
             conn.close()
@@ -1981,11 +2004,16 @@ def get_route_signatures_bulk(
             )
             out: Dict[RouteDirKey, str] = {}
             for row in cur.fetchall():
-                key: RouteDirKey = (
-                    str(row["route_id"]),
-                    None if row["direction_id"] is None else str(row["direction_id"]),
-                )
-                out[key] = row["sig_hash"]
+                try:
+                    route_id = str(row["route_id"])
+                    dir_val = row["direction_id"]
+                    sig_hash = row["sig_hash"]
+                except (TypeError, KeyError):
+                    route_id = str(row[0])
+                    dir_val = row[1]
+                    sig_hash = row[2]
+                key: RouteDirKey = (route_id, direction_id_from_db(dir_val))
+                out[key] = sig_hash
             return out
     finally:
         if close:
@@ -2025,7 +2053,7 @@ def get_cached_route_graph_pg(
                 (
                     feed_id,
                     route_id,
-                    int(direction_id) if direction_id is not None else None,
+                    direction_id_db_value(direction_id),
                     pretty_osm,
                     route_sig_hash,
                 ),
@@ -2066,7 +2094,7 @@ def get_cached_graphs_bulk(
             for row in cur.fetchall():
                 key: RouteDirKey = (
                     str(row["route_id"]),
-                    None if row["direction_id"] is None else str(row["direction_id"]),
+                    direction_id_from_db(row["direction_id"]),
                 )
                 out[key] = (row["route_sig_hash"], bytes(row["graph_blob"]))
             return out
@@ -2124,7 +2152,7 @@ def save_route_graph_pg(
                 (
                     feed_id,
                     route_id,
-                    int(direction_id) if direction_id is not None else None,
+                    direction_id_db_value(direction_id),
                     int(date_ymd) if date_ymd is not None else None,
                     pretty_osm,
                     route_sig_hash,
@@ -2278,7 +2306,7 @@ def save_route_preview_pg(
                 (
                     feed_id,
                     route_id,
-                    int(direction_id) if direction_id is not None else None,
+                    direction_id_db_value(direction_id),
                     profile_key,
                     pretty_osm,
                     route_sig_hash,
@@ -6239,6 +6267,31 @@ def bulk_upsert_pattern_edge_match_summaries(
             )
 
 
+def fetch_osm_road_segments_by_way_ids(
+    way_ids: Sequence[int],
+    conn,
+) -> Dict[int, List[Dict[str, Any]]]:
+    """Bulk-load all ``osm_road_segments`` rows per ``osm_way_id`` (for trace way-only fallback)."""
+    out: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+    uniq = sorted({int(w) for w in way_ids if int(w) > 0})
+    if not uniq:
+        return out
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT segment_id, osm_way_id, from_node_id, to_node_id,
+                   heading_start_deg, heading_end_deg, COALESCE(import_source, '') AS import_source,
+                   length_m
+            FROM osm_road_segments
+            WHERE osm_way_id = ANY(%s)
+            """,
+            (uniq,),
+        )
+        for r in cur.fetchall() or []:
+            out[int(r["osm_way_id"])].append(dict(r))
+    return out
+
+
 def fetch_osm_road_segments_by_way_endpoint_triples(
     triples: Sequence[Tuple[int, int, int]],
     conn,
@@ -6489,130 +6542,253 @@ def fetch_segment_path_geojson_feature(
     return feat
 
 
-def rebuild_gtfs_bus_corridor_evidence(*, feed_id: int, conn) -> Dict[str, int]:
+_PAT_TRIPS_TEMP = "_bus_ev_pat_trips"
+_TRIP_KEY_COUNTS_TEMP = "_bus_ev_trip_key_counts"
+
+
+def _bus_evidence_prepare_session(cur) -> None:
+    """Favor hash aggregation / parallel gather for large feed-level GROUP BYs."""
+    cur.execute("SET LOCAL work_mem = '512MB'")
+    cur.execute("SET LOCAL max_parallel_workers_per_gather = 4")
+
+
+def _bus_evidence_load_pat_trips_temp(cur, fid: int, *, exact_trip_counts: bool) -> None:
+    """
+    One trip-count row per pattern (reused for segment + turn aggregation).
+
+    ``exact_trip_counts=False`` (default): aggregate trips once by route/direction/shape,
+    then join patterns — avoids a nested loop over all trips per pattern.
+    """
+    cur.execute(f"DROP TABLE IF EXISTS {_PAT_TRIPS_TEMP}")
+    cur.execute(f"DROP TABLE IF EXISTS {_TRIP_KEY_COUNTS_TEMP}")
+    if exact_trip_counts:
+        log("bus_evidence", f"feed_id={fid} pattern trip counts (exact trips join)")
+        cur.execute(
+            f"""
+            CREATE TEMP TABLE {_PAT_TRIPS_TEMP} ON COMMIT PRESERVE ROWS AS
+            SELECT p.pattern_id, COUNT(DISTINCT t.trip_id)::int AS trip_cnt
+            FROM patterns p
+            INNER JOIN trips t
+              ON t.feed_id = p.feed_id
+             AND t.route_id = p.route_id
+             AND (t.direction_id IS NOT DISTINCT FROM p.direction_id)
+             AND (
+                  (p.repr_shape_id IS NOT NULL AND (t.shape_id IS NOT DISTINCT FROM p.repr_shape_id))
+               OR (p.repr_shape_id IS NULL)
+             )
+            WHERE p.feed_id = %s
+            GROUP BY p.pattern_id
+            """,
+            (fid,),
+        )
+    else:
+        log(
+            "bus_evidence",
+            f"feed_id={fid} pattern trip counts (fast: pre-aggregate trips by route/direction/shape)",
+        )
+        cur.execute(
+            f"""
+            CREATE TEMP TABLE {_TRIP_KEY_COUNTS_TEMP} ON COMMIT PRESERVE ROWS AS
+            SELECT
+              route_id,
+              direction_id,
+              shape_id,
+              COUNT(DISTINCT trip_id)::int AS trip_cnt
+            FROM trips
+            WHERE feed_id = %s
+            GROUP BY route_id, direction_id, shape_id
+            """,
+            (fid,),
+        )
+        cur.execute(
+            f"""
+            CREATE INDEX ON {_TRIP_KEY_COUNTS_TEMP} (route_id, direction_id, shape_id)
+            """
+        )
+        cur.execute(
+            f"""
+            CREATE TEMP TABLE {_PAT_TRIPS_TEMP} ON COMMIT PRESERVE ROWS AS
+            SELECT
+              p.pattern_id,
+              COALESCE(
+                CASE
+                  WHEN p.repr_shape_id IS NOT NULL THEN ts.trip_cnt
+                  ELSE trd.trip_cnt
+                END,
+                1
+              )::int AS trip_cnt
+            FROM patterns p
+            LEFT JOIN {_TRIP_KEY_COUNTS_TEMP} ts
+              ON p.repr_shape_id IS NOT NULL
+             AND ts.route_id = p.route_id
+             AND (ts.direction_id IS NOT DISTINCT FROM p.direction_id)
+             AND (ts.shape_id IS NOT DISTINCT FROM p.repr_shape_id)
+            LEFT JOIN (
+              SELECT route_id, direction_id, SUM(trip_cnt)::int AS trip_cnt
+              FROM {_TRIP_KEY_COUNTS_TEMP}
+              GROUP BY route_id, direction_id
+            ) trd
+              ON p.repr_shape_id IS NULL
+             AND trd.route_id = p.route_id
+             AND (trd.direction_id IS NOT DISTINCT FROM p.direction_id)
+            WHERE p.feed_id = %s
+            """,
+            (fid,),
+        )
+    cur.execute(f"CREATE INDEX ON {_PAT_TRIPS_TEMP} (pattern_id)")
+
+
+def rebuild_gtfs_bus_corridor_evidence(
+    *,
+    feed_id: int,
+    conn,
+    commit_between_steps: bool = False,
+    exact_trip_counts: bool = False,
+) -> Dict[str, int]:
     """
     Replace ``gtfs_bus_segment_evidence`` and ``gtfs_bus_turn_evidence`` for ``feed_id``
     from ``pattern_osm_segments`` + ``patterns`` + ``trips`` join keys.
-    Caller should commit.
+
+    Uses a temp pattern→trip table (computed once) and ``LEAD`` for consecutive segments
+    instead of a self-join on ~1M+ rows. When ``commit_between_steps`` is true, commits
+    after segment evidence so DDL in other sessions is not blocked for the turn step.
     """
     fid = int(feed_id)
+    t_all = time.perf_counter()
     with conn.cursor() as cur:
+        cur.execute(
+            "SELECT COUNT(*)::bigint AS n FROM pattern_osm_segments WHERE feed_id = %s",
+            (fid,),
+        )
+        row = cur.fetchone()
+        pos_rows = int(row["n"] if isinstance(row, dict) else row[0]) if row else 0
+    log(
+        "bus_evidence",
+        f"feed_id={fid} pattern_osm_segments={pos_rows:,} — rebuild starting",
+    )
+
+    with conn.cursor() as cur:
+        _bus_evidence_prepare_session(cur)
+        t0 = time.perf_counter()
+        log("bus_evidence", f"feed_id={fid} deleting prior evidence rows")
         cur.execute("DELETE FROM gtfs_bus_turn_evidence WHERE feed_id = %s", (fid,))
         turn_deleted = cur.rowcount
         cur.execute("DELETE FROM gtfs_bus_segment_evidence WHERE feed_id = %s", (fid,))
         seg_deleted = cur.rowcount
+        log(
+            "bus_evidence",
+            f"feed_id={fid} deleted turns={turn_deleted:,} segments={seg_deleted:,} "
+            f"elapsed_s={time.perf_counter() - t0:.1f}",
+        )
 
+        t0 = time.perf_counter()
+        _bus_evidence_load_pat_trips_temp(cur, fid, exact_trip_counts=exact_trip_counts)
+        log(
+            "bus_evidence",
+            f"feed_id={fid} pattern trip counts ready elapsed_s={time.perf_counter() - t0:.1f}",
+        )
+
+        t0 = time.perf_counter()
+        log(
+            "bus_evidence",
+            f"feed_id={fid} aggregating segment evidence ({pos_rows:,} pattern_osm rows)",
+        )
         cur.execute(
-            """
-            WITH pat_trips AS (
-              SELECT p.pattern_id, COUNT(DISTINCT t.trip_id)::int AS trip_cnt
-              FROM patterns p
-              INNER JOIN trips t
-                ON t.feed_id = p.feed_id
-               AND t.route_id = p.route_id
-               AND (t.direction_id IS NOT DISTINCT FROM p.direction_id)
-               AND (
-                    (p.repr_shape_id IS NOT NULL AND (t.shape_id IS NOT DISTINCT FROM p.repr_shape_id))
-                 OR (p.repr_shape_id IS NULL)
-               )
-              WHERE p.feed_id = %s
-              GROUP BY p.pattern_id
-            ),
-            seg_exp AS (
-              SELECT
-                pos.segment_id,
-                pos.pattern_id,
-                p.route_id,
-                COALESCE(pt.trip_cnt, 0) AS trip_cnt,
-                COALESCE(pos.confidence, 0.5)::double precision AS conf
-              FROM pattern_osm_segments pos
-              INNER JOIN patterns p
-                ON p.feed_id = pos.feed_id AND p.pattern_id = pos.pattern_id
-              LEFT JOIN pat_trips pt ON pt.pattern_id = p.pattern_id
-              WHERE pos.feed_id = %s
-            ),
-            seg_agg AS (
-              SELECT
-                segment_id,
-                SUM(trip_cnt)::int AS trip_count,
-                COUNT(DISTINCT pattern_id)::int AS pattern_count,
-                COUNT(DISTINCT route_id)::int AS route_count,
-                AVG(conf)::double precision AS confidence_score
-              FROM seg_exp
-              GROUP BY segment_id
-            )
+            f"""
             INSERT INTO gtfs_bus_segment_evidence (
               feed_id, segment_id, trip_count, route_count, pattern_count, confidence_score
             )
-            SELECT %s, segment_id, trip_count, route_count, pattern_count, confidence_score
-            FROM seg_agg
+            SELECT
+              %s,
+              pos.segment_id,
+              SUM(COALESCE(pt.trip_cnt, 1))::int,
+              COUNT(DISTINCT p.route_id)::int,
+              COUNT(DISTINCT pos.pattern_id)::int,
+              AVG(COALESCE(pos.confidence, 0.5))::double precision
+            FROM pattern_osm_segments pos
+            INNER JOIN patterns p
+              ON p.feed_id = pos.feed_id AND p.pattern_id = pos.pattern_id
+            LEFT JOIN {_PAT_TRIPS_TEMP} pt ON pt.pattern_id = p.pattern_id
+            WHERE pos.feed_id = %s
+            GROUP BY pos.segment_id
             """,
-            (fid, fid, fid),
+            (fid, fid),
         )
         seg_inserted = cur.rowcount
+        log(
+            "bus_evidence",
+            f"feed_id={fid} segment evidence inserted={seg_inserted:,} "
+            f"elapsed_s={time.perf_counter() - t0:.1f}",
+        )
 
+    if commit_between_steps:
+        conn.commit()
+        log("bus_evidence", f"feed_id={fid} committed segment evidence")
+
+    with conn.cursor() as cur:
+        _bus_evidence_prepare_session(cur)
+        t0 = time.perf_counter()
+        log(
+            "bus_evidence",
+            f"feed_id={fid} aggregating turn evidence (window scan)",
+        )
         cur.execute(
-            """
-            WITH pat_trips AS (
-              SELECT p.pattern_id, COUNT(DISTINCT t.trip_id)::int AS trip_cnt
-              FROM patterns p
-              INNER JOIN trips t
-                ON t.feed_id = p.feed_id
-               AND t.route_id = p.route_id
-               AND (t.direction_id IS NOT DISTINCT FROM p.direction_id)
-               AND (
-                    (p.repr_shape_id IS NOT NULL AND (t.shape_id IS NOT DISTINCT FROM p.repr_shape_id))
-                 OR (p.repr_shape_id IS NULL)
-               )
-              WHERE p.feed_id = %s
-              GROUP BY p.pattern_id
-            ),
-            turn_exp AS (
-              SELECT
-                pos.segment_id AS from_segment_id,
-                nxt.segment_id AS to_segment_id,
-                pos.pattern_id,
-                p.route_id,
-                COALESCE(pt.trip_cnt, 0) AS trip_cnt,
-                (
-                  COALESCE(pos.confidence, 0.5) + COALESCE(nxt.confidence, 0.5)
-                ) / 2.0::double precision AS conf
-              FROM pattern_osm_segments pos
-              INNER JOIN pattern_osm_segments nxt
-                ON nxt.feed_id = pos.feed_id
-               AND nxt.pattern_id = pos.pattern_id
-               AND nxt.seq = pos.seq + 1
-              INNER JOIN patterns p
-                ON p.feed_id = pos.feed_id AND p.pattern_id = pos.pattern_id
-              LEFT JOIN pat_trips pt ON pt.pattern_id = p.pattern_id
-              WHERE pos.feed_id = %s
-            ),
-            turn_agg AS (
-              SELECT
-                from_segment_id,
-                to_segment_id,
-                SUM(trip_cnt)::int AS trip_count,
-                COUNT(DISTINCT pattern_id)::int AS pattern_count,
-                COUNT(DISTINCT route_id)::int AS route_count,
-                AVG(conf)::double precision AS confidence_score
-              FROM turn_exp
-              GROUP BY from_segment_id, to_segment_id
-            )
+            f"""
             INSERT INTO gtfs_bus_turn_evidence (
               feed_id, from_segment_id, to_segment_id, trip_count, route_count, pattern_count, confidence_score
             )
-            SELECT %s, from_segment_id, to_segment_id, trip_count, route_count, pattern_count, confidence_score
-            FROM turn_agg
+            SELECT
+              %s,
+              chain.from_segment_id,
+              chain.to_segment_id,
+              SUM(COALESCE(pt.trip_cnt, 1))::int,
+              COUNT(DISTINCT chain.pattern_id)::int,
+              COUNT(DISTINCT chain.route_id)::int,
+              AVG(chain.conf)::double precision
+            FROM (
+              SELECT
+                pos.segment_id AS from_segment_id,
+                LEAD(pos.segment_id) OVER (
+                  PARTITION BY pos.pattern_id ORDER BY pos.seq
+                ) AS to_segment_id,
+                pos.pattern_id,
+                p.route_id,
+                (
+                  COALESCE(pos.confidence, 0.5) + COALESCE(
+                    LEAD(pos.confidence) OVER (PARTITION BY pos.pattern_id ORDER BY pos.seq),
+                    0.5
+                  )
+                ) / 2.0::double precision AS conf
+              FROM pattern_osm_segments pos
+              INNER JOIN patterns p
+                ON p.feed_id = pos.feed_id AND p.pattern_id = pos.pattern_id
+              WHERE pos.feed_id = %s
+            ) chain
+            LEFT JOIN {_PAT_TRIPS_TEMP} pt ON pt.pattern_id = chain.pattern_id
+            WHERE chain.to_segment_id IS NOT NULL
+            GROUP BY chain.from_segment_id, chain.to_segment_id
             """,
-            (fid, fid, fid),
+            (fid, fid),
         )
         turn_inserted = cur.rowcount
+        log(
+            "bus_evidence",
+            f"feed_id={fid} turn evidence inserted={turn_inserted:,} "
+            f"elapsed_s={time.perf_counter() - t0:.1f}",
+        )
+        cur.execute(f"DROP TABLE IF EXISTS {_PAT_TRIPS_TEMP}")
+        cur.execute(f"DROP TABLE IF EXISTS {_TRIP_KEY_COUNTS_TEMP}")
 
+    log(
+        "bus_evidence",
+        f"feed_id={fid} rebuild SQL finished total_elapsed_s={time.perf_counter() - t_all:.1f}",
+    )
     return {
         "gtfs_bus_segment_evidence_deleted_approx": int(seg_deleted),
         "gtfs_bus_turn_evidence_deleted_approx": int(turn_deleted),
         "gtfs_bus_segment_evidence_inserted": int(seg_inserted),
         "gtfs_bus_turn_evidence_inserted": int(turn_inserted),
+        "pattern_osm_segments_input": int(pos_rows),
     }
 
 

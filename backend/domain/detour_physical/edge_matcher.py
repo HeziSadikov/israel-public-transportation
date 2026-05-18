@@ -6,14 +6,17 @@ import math
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from shapely.geometry import LineString
+from shapely.ops import substring
 
 from backend.adapters.osm_detour import match_route_attributes
 
 from .edge_match_models import EdgeMatchResult, EdgeMatchScore
 from .pattern_trace_split import (
     chunk_leg_ranges,
+    chunk_leg_ranges_by_distance,
     choose_chunk_for_overlap_leg,
     cumulative_stop_meters_along_shape,
+    ensure_linestring,
     extract_edges_for_shape_fractions,
     line_length_m,
     slice_shape_between_stop_indices,
@@ -65,6 +68,42 @@ def _score_trace_edges(gtfs_line: LineString, edges: List[Dict[str, Any]]) -> Ed
         mean_heading_error_deg=0.0,
         side_switch_count=switches,
         total=total,
+    )
+
+
+def trace_linestring_with_km_cap(
+    line: LineString,
+    *,
+    max_km: float,
+    costing: str = "bus",
+    densify_m: float = 15.0,
+) -> EdgeMatchResult:
+    """Map-match ``line``, splitting into <= ``max_km`` slices when Valhalla rejects very long shapes."""
+    if line.is_empty:
+        return EdgeMatchResult(success=False, notes=["empty_line"])
+    total_m = line_length_m(line)
+    cap_m = max(1000.0, float(max_km) * 1000.0)
+    if total_m <= cap_m:
+        return match_gtfs_slice_to_osm_edges(line, costing=costing, densify_m=densify_m)
+    edges_all: List[Dict[str, Any]] = []
+    notes: List[str] = ["km_sliced_trace"]
+    start_m = 0.0
+    while start_m < total_m - 1.0:
+        end_m = min(total_m, start_m + cap_m)
+        t0, t1 = start_m / total_m, end_m / total_m
+        sub = ensure_linestring(substring(line, t0, t1, normalized=True))
+        res = match_gtfs_slice_to_osm_edges(sub, costing=costing, densify_m=densify_m)
+        if not res.success or not res.edge_records:
+            notes.append(f"subslice_fail_m={start_m:.0f}-{end_m:.0f}")
+            return EdgeMatchResult(success=False, notes=notes)
+        edges_all.extend(res.edge_records)
+        start_m = end_m
+    score = _score_trace_edges(line, edges_all) if edges_all else None
+    return EdgeMatchResult(
+        success=True,
+        edge_records=edges_all,
+        score=score,
+        notes=notes + [f"edges={len(edges_all)}"],
     )
 
 
@@ -140,7 +179,18 @@ def trace_pattern_split_to_legs(
             return full, notes
         notes.append("full_trace_failed_fallback_chunk")
 
-    ranges = chunk_leg_ranges(n_legs, chunk_legs=chunk_legs, overlap=chunk_overlap)
+    max_span_m = float(full_trace_max_km) * 1000.0
+    if shape_km > full_trace_max_km:
+        ranges = chunk_leg_ranges_by_distance(
+            n_legs,
+            cum,
+            max_span_m=max_span_m,
+            max_legs_per_chunk=chunk_legs,
+            overlap=chunk_overlap,
+        )
+        notes.append(f"distance_chunked chunks={len(ranges)}")
+    else:
+        ranges = chunk_leg_ranges(n_legs, chunk_legs=chunk_legs, overlap=chunk_overlap)
     if only_leg_indices is not None:
         need = only_leg_indices
         ranges = [(lo, hi) for (lo, hi) in ranges if any(lo <= k <= hi for k in need)]
@@ -149,7 +199,12 @@ def trace_pattern_split_to_legs(
     chunk_results: List[Tuple[Tuple[int, int], EdgeMatchResult]] = []
     for lo, hi in ranges:
         chunk_shape = slice_shape_between_stop_indices(shape_line, stop_rows, lo, hi + 1)
-        res = match_full_shape_to_osm_edges(chunk_shape, costing=costing, densify_m=densify_m)
+        res = trace_linestring_with_km_cap(
+            chunk_shape,
+            max_km=full_trace_max_km,
+            costing=costing,
+            densify_m=densify_m,
+        )
         chunk_results.append(((lo, hi), res))
         if not res.success or not res.edge_records:
             notes.append(f"chunk_fail legs={lo}-{hi}")

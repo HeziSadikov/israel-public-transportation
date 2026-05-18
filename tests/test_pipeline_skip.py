@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from unittest.mock import MagicMock
+
 from backend.infra import pipeline_skip as ps
 
 
@@ -52,6 +54,13 @@ def test_build_pattern_osm_match_fingerprint_includes_config():
         chunk_overlap=1,
     )
     assert fp1 != fp2
+
+
+def test_commit_if_in_transaction_noop_when_autocommit():
+    conn = MagicMock()
+    conn.autocommit = True
+    ps.commit_if_in_transaction(conn)
+    conn.commit.assert_not_called()
 
 
 def test_algorithm_version_bump_invalidates_fingerprint():

@@ -48,6 +48,9 @@ shape (also stored in ``osm_import_runs.stats_json``):
 
 from __future__ import annotations
 
+import shutil
+import sys
+import tempfile
 import time
 from collections import Counter
 from dataclasses import dataclass, field
@@ -140,6 +143,45 @@ def _ensure_osmium():
     return osmium
 
 
+def resolve_pbf_path_for_pyosmium(pbf_path: Path) -> Path:
+    """
+    Return a path libosmium can open.
+
+    On Windows, pyosmium fails to open PBF files when the path contains
+    non-ASCII characters (e.g. a Hebrew user profile). Stage a copy under
+    %TEMP% (ASCII short path) and reuse it while the source file is unchanged.
+    """
+    resolved = pbf_path.resolve()
+    path_str = str(resolved)
+    if sys.platform != "win32" or path_str.isascii():
+        return resolved
+
+    staging_dir = Path(tempfile.gettempdir()) / "israel_gtfs_osm"
+    staging = staging_dir / resolved.name
+    staging_dir.mkdir(parents=True, exist_ok=True)
+
+    src_stat = resolved.stat()
+    if staging.exists():
+        st = staging.stat()
+        if st.st_size == src_stat.st_size and st.st_mtime >= src_stat.st_mtime:
+            log(
+                "osm-pbf-import",
+                f"using staged PBF {staging} (non-ASCII source path)",
+            )
+            return staging
+
+    size_mb = src_stat.st_size / (1024 * 1024)
+    log(
+        "osm-pbf-import",
+        (
+            f"staging PBF to {staging} ({size_mb:.1f} MB); "
+            "pyosmium on Windows cannot read non-ASCII paths"
+        ),
+    )
+    shutil.copy2(resolved, staging)
+    return staging
+
+
 def run_pbf_import(
     conn,
     pbf_path: Path,
@@ -173,6 +215,7 @@ def run_pbf_import(
     pbf_path = Path(pbf_path)
     if not pbf_path.exists():
         raise FileNotFoundError(f"OSM PBF not found: {pbf_path}")
+    pbf_osmium = resolve_pbf_path_for_pyosmium(pbf_path)
 
     osmium = _ensure_osmium()
 
@@ -414,10 +457,10 @@ def run_pbf_import(
 
     log(
         "osm-pbf-import",
-        f"start pbf={pbf_path} run_id={import_run_id} verify={verify}",
+        f"start pbf={pbf_path} osmium_path={pbf_osmium} run_id={import_run_id} verify={verify}",
     )
     handler = _Handler()
-    handler.apply_file(str(pbf_path))
+    handler.apply_file(str(pbf_osmium))
 
     # Final flushes after the file is fully consumed.
     _flush_nodes()

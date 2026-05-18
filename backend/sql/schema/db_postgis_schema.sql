@@ -450,6 +450,7 @@ CREATE TABLE IF NOT EXISTS gtfs_bus_turn_evidence (
     to_segment_id    BIGINT NOT NULL,
     trip_count       INT NOT NULL DEFAULT 0,
     route_count      INT NOT NULL DEFAULT 0,
+    pattern_count    INT NOT NULL DEFAULT 0,
     confidence_score DOUBLE PRECISION,
     PRIMARY KEY (feed_id, from_segment_id, to_segment_id)
 );

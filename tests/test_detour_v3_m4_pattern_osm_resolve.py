@@ -7,6 +7,7 @@ from backend.bus_corridor.trace_segment_resolve import (
     flatten_per_leg_trace_edges,
     pick_segment_for_trace_edge,
     resolve_trace_edges_to_segment_ids,
+    trace_edge_has_osm_endpoint_ids,
 )
 
 
@@ -79,3 +80,107 @@ def test_resolve_fails_when_no_rows_for_triple():
     edge = {"way_id": 1, "begin_osm_node_id": 1, "end_osm_node_id": 2}
     ids, hint = resolve_trace_edges_to_segment_ids([edge], {}, v3_import_source="detour_v3_pbf_import")
     assert ids is None and hint == 1
+
+
+def test_trace_edge_has_osm_endpoint_ids():
+    assert trace_edge_has_osm_endpoint_ids(
+        {"way_id": 1, "begin_osm_node_id": 10, "end_osm_node_id": 20}
+    )
+    assert not trace_edge_has_osm_endpoint_ids({"way_id": 1})
+    assert not trace_edge_has_osm_endpoint_ids(
+        {"way_id": 1, "begin_osm_node_id": 10, "end_osm_node_id": None}
+    )
+
+
+def test_resolve_way_fallback_without_osm_node_ids():
+    edge = {"way_id": 42, "begin_heading": 90.0}
+    assert not trace_edge_has_osm_endpoint_ids(edge)
+    way_map = {
+        42: [
+            {
+                "segment_id": 500,
+                "from_node_id": 100,
+                "to_node_id": 200,
+                "heading_start_deg": 92.0,
+                "heading_end_deg": None,
+                "import_source": "detour_v3_pbf_import",
+                "length_m": 50.0,
+            }
+        ],
+    }
+    ids, unres = resolve_trace_edges_to_segment_ids(
+        [edge], {}, way_to_rows=way_map, v3_import_source="detour_v3_pbf_import"
+    )
+    assert unres == 0 and ids == [500]
+
+
+def test_resolve_prefers_way_rows_over_legacy_sentinel_triple():
+    edge = {"way_id": 99, "begin_heading": 10.0}
+    triple = (99, -99000000, -99000001)
+    triple_map = {
+        triple: [
+            {
+                "segment_id": 1,
+                "from_node_id": -99000000,
+                "to_node_id": -99000001,
+                "heading_start_deg": None,
+                "import_source": None,
+                "length_m": 1.0,
+            }
+        ],
+    }
+    way_map = {
+        99: [
+            {
+                "segment_id": 2,
+                "from_node_id": 10,
+                "to_node_id": 20,
+                "heading_start_deg": 12.0,
+                "import_source": "detour_v3_pbf_import",
+                "length_m": 1.0,
+            }
+        ],
+    }
+    ids, unres = resolve_trace_edges_to_segment_ids(
+        [edge], triple_map, way_to_rows=way_map, v3_import_source="detour_v3_pbf_import"
+    )
+    assert unres == 0 and ids == [2]
+
+
+def test_resolve_way_fallback_uses_prev_to_node_link():
+    e1 = {"way_id": 1, "begin_heading": 0.0}
+    e2 = {"way_id": 2, "begin_heading": 90.0}
+    way_map = {
+        1: [
+            {
+                "segment_id": 10,
+                "from_node_id": 1,
+                "to_node_id": 99,
+                "heading_start_deg": None,
+                "import_source": "detour_v3_pbf_import",
+                "length_m": 10.0,
+            }
+        ],
+        2: [
+            {
+                "segment_id": 20,
+                "from_node_id": 99,
+                "to_node_id": 200,
+                "heading_start_deg": 90.0,
+                "import_source": "detour_v3_pbf_import",
+                "length_m": 10.0,
+            },
+            {
+                "segment_id": 21,
+                "from_node_id": 1,
+                "to_node_id": 201,
+                "heading_start_deg": 90.0,
+                "import_source": "detour_v3_pbf_import",
+                "length_m": 10.0,
+            },
+        ],
+    }
+    ids, unres = resolve_trace_edges_to_segment_ids(
+        [e1, e2], {}, way_to_rows=way_map, v3_import_source="detour_v3_pbf_import"
+    )
+    assert unres == 0 and ids == [10, 20]

@@ -41,9 +41,69 @@ import sys
 import time
 from pathlib import Path
 
+from backend.infra.config import LOCAL_GTFS_ZIP
+from backend.infra.db_access import DB_URL
 from backend.infra.logging_utils import ensure_cli_action_logging, log
+from backend.infra.pipeline_plan import (
+    ARTIFACT_ORDER,
+    PlanRequest,
+    PlanStep,
+    compute_plan,
+    format_plan_table,
+)
+from backend.infra.pipeline_skip import (
+    find_feed_by_zip_checksum,
+    reactivate_feed,
+    sha256_file,
+)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _plan_action(plan, artifact: str) -> str:
+    for step in plan:
+        if step.artifact == artifact:
+            return step.action
+    return "skip"
+
+
+def _should_execute(plan, artifact: str) -> bool:
+    return _plan_action(plan, artifact) in ("run", "run_partial")
+
+
+def _plan_step(plan: list[PlanStep], artifact: str) -> PlanStep | None:
+    for step in plan:
+        if step.artifact == artifact:
+            return step
+    return None
+
+
+def _apply_planned_ingest_reactivation(db: str, ingest_step: PlanStep | None) -> None:
+    """When plan skips ingest via checksum reuse/reactivate, still switch active feed."""
+    if ingest_step is None or ingest_step.action != "skip":
+        return
+    reason = ingest_step.reason or ""
+    if "reactivate feed_id=" not in reason:
+        return
+    if not LOCAL_GTFS_ZIP.is_file():
+        log("precompute-all", "phase=ingest_reactivate skipped (no local GTFS zip)")
+        return
+    import psycopg2
+
+    zip_ck = sha256_file(LOCAL_GTFS_ZIP)
+    conn = psycopg2.connect(db)
+    try:
+        conn.autocommit = False
+        match = find_feed_by_zip_checksum(conn, zip_ck)
+        if match is None or match.active:
+            return
+        reactivate_feed(conn, match.feed_id, zip_ck)
+        log(
+            "precompute-all",
+            f"phase=ingest_reactivate done reused existing feed_id={match.feed_id} by checksum",
+        )
+    finally:
+        conn.close()
 
 
 def _run_py_module(module: str, extra: list[str], database_url: str | None) -> None:
@@ -95,8 +155,39 @@ def main() -> None:
         action="store_true",
         help=(
             "Run ingest_gtfs_postgis first (default zip + MOT source URL from ingest script). "
-            "Also builds gtfs_bus_way_evidence for detour v2."
+            "Does not build gtfs_bus_way_evidence (use --rebuild-gtfs-bus-way-evidence)."
         ),
+    )
+    ap.add_argument(
+        "--plan-only",
+        action="store_true",
+        help="Print pipeline plan and exit (read-only: no downloads, ingest, or stage writes).",
+    )
+    ap.add_argument(
+        "--explain-skips",
+        action="store_true",
+        help="Verbose skip reasons in plan output.",
+    )
+    ap.add_argument(
+        "--from-stage",
+        type=str,
+        default=None,
+        choices=ARTIFACT_ORDER,
+        help="Plan/execute from this artifact onward.",
+    )
+    ap.add_argument(
+        "--to-stage",
+        type=str,
+        default=None,
+        choices=ARTIFACT_ORDER,
+        help="Plan/execute through this artifact.",
+    )
+    ap.add_argument(
+        "--force-artifact",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help=f"Force rebuild for artifact ({', '.join(ARTIFACT_ORDER)}). Repeatable.",
     )
     ap.add_argument(
         "--force-all",
@@ -209,6 +300,11 @@ def main() -> None:
         help="Forward to graph precompute: run OSRM map-match and pretty_osm cache rows (slow).",
     )
     ap.add_argument(
+        "--full-edge-preview-geojson",
+        action="store_true",
+        help="Forward to graph precompute: slow full-edge preview GeoJSON (default is fast preview).",
+    )
+    ap.add_argument(
         "--with-osm-import",
         action="store_true",
         help="After patterns: run backend.scripts.import_osm_pbf (pass extra args via --osm-import-extra).",
@@ -276,7 +372,45 @@ def main() -> None:
         help="Forward to build_segment_turns: only adjacency from segments with this import_run_id.",
     )
     args = ap.parse_args()
-    db = args.database_url
+    db = args.database_url or DB_URL
+    profiles = [p.strip() for p in str(args.profiles).split(",") if p.strip()]
+    force_artifacts = {str(a).strip() for a in (args.force_artifact or []) if str(a).strip()}
+
+    plan_req = PlanRequest(
+        with_ingest=bool(args.with_ingest),
+        skip_patterns=bool(args.skip_patterns),
+        skip_graphs=bool(args.skip_graphs),
+        rebuild_gtfs_bus_way_evidence=bool(args.rebuild_gtfs_bus_way_evidence),
+        with_osm_import=bool(args.with_osm_import),
+        with_segment_turns=bool(args.with_segment_turns),
+        with_pattern_osm_match=bool(args.with_pattern_osm_match),
+        with_bus_evidence=bool(args.with_bus_evidence),
+        ingest_force=bool(args.ingest_force),
+        force_all=bool(args.force_all),
+        force_patterns=bool(args.force_patterns),
+        force_artifacts=force_artifacts,
+        profiles=profiles or ["weekday", "friday", "saturday", "sunday"],
+        with_pretty_osm=bool(args.with_pretty_osm),
+        fast_preview_geojson=not bool(args.full_edge_preview_geojson),
+        gtfs_zip_path=LOCAL_GTFS_ZIP,
+        from_stage=args.from_stage,
+        to_stage=args.to_stage,
+        explain_skips=bool(args.explain_skips),
+    )
+
+    import psycopg2
+
+    plan_conn = psycopg2.connect(db)
+    try:
+        plan = compute_plan(plan_conn, plan_req)
+    finally:
+        plan_conn.close()
+
+    print("[precompute-all] Pipeline plan:", flush=True)
+    print(format_plan_table(plan), flush=True)
+    if args.plan_only:
+        log("precompute-all", "phase=plan_only done")
+        return
 
     if args.pattern_osm_all and not args.with_pattern_osm_match:
         ap.error("--pattern-osm-all requires --with-pattern-osm-match")
@@ -306,7 +440,7 @@ def main() -> None:
 
     force_all = bool(args.force_all)
 
-    if args.with_ingest:
+    if args.with_ingest and _should_execute(plan, "ingest"):
         log("precompute-all", "phase=ingest_pipeline start")
         ingest_extra: list[str] = []
         if args.ingest_force or force_all:
@@ -319,8 +453,11 @@ def main() -> None:
             ingest_extra.append("--fetch")
         _run_py_module("backend.scripts.ingest_gtfs_postgis", ingest_extra, db)
         log("precompute-all", "phase=ingest_pipeline done")
+    elif args.with_ingest:
+        _apply_planned_ingest_reactivation(db, _plan_step(plan, "ingest"))
+        log("precompute-all", "phase=ingest_pipeline skipped per plan")
 
-    if not args.skip_patterns:
+    if not args.skip_patterns and _should_execute(plan, "patterns"):
         log("precompute-all", "phase=patterns_pipeline start")
         pat_extra: list[str] = []
         if args.pattern_date:
@@ -333,14 +470,18 @@ def main() -> None:
             pat_extra.extend(["--route-batch-size", str(args.route_batch_size)])
         _run_py_module("backend.scripts.build_patterns_postgis", pat_extra, db)
         log("precompute-all", "phase=patterns_pipeline done")
+    elif not args.skip_patterns:
+        log("precompute-all", "phase=patterns_pipeline skipped per plan")
 
-    if args.rebuild_gtfs_bus_way_evidence:
+    if args.rebuild_gtfs_bus_way_evidence and _should_execute(plan, "gtfs_bus_way_evidence"):
         log("precompute-all", "phase=gtfs_bus_way_evidence start")
         gbwe_extra = ["--force"] if force_all else []
         _run_py_module("backend.scripts.build_gtfs_bus_way_evidence", gbwe_extra, db)
         log("precompute-all", "phase=gtfs_bus_way_evidence done")
+    elif args.rebuild_gtfs_bus_way_evidence:
+        log("precompute-all", "phase=gtfs_bus_way_evidence skipped per plan")
 
-    if args.with_osm_import:
+    if args.with_osm_import and _should_execute(plan, "osm_import"):
         log("precompute-all", "phase=osm_import start")
         extra_toks = [t.strip() for t in str(args.osm_import_extra).split(",") if t.strip()]
         if args.osm_pbf_fetch_if_newer and not any(
@@ -351,8 +492,10 @@ def main() -> None:
             extra_toks = ["--force", *extra_toks]
         _run_py_module("backend.scripts.import_osm_pbf", extra_toks, db)
         log("precompute-all", "phase=osm_import done")
+    elif args.with_osm_import:
+        log("precompute-all", "phase=osm_import skipped per plan")
 
-    if args.with_segment_turns:
+    if args.with_segment_turns and _should_execute(plan, "segment_turns"):
         log("precompute-all", "phase=segment_turns start")
         st_extra: list[str] = []
         if args.segment_turns_import_run_id is not None:
@@ -361,8 +504,10 @@ def main() -> None:
             st_extra.append("--force")
         _run_py_module("backend.scripts.build_segment_turns", st_extra, db)
         log("precompute-all", "phase=segment_turns done")
+    elif args.with_segment_turns:
+        log("precompute-all", "phase=segment_turns skipped per plan")
 
-    if args.with_pattern_osm_match:
+    if args.with_pattern_osm_match and _should_execute(plan, "pattern_osm_match"):
         log("precompute-all", "phase=pattern_osm_match start")
         pom_extra = [t.strip() for t in str(args.pattern_osm_extra).split(",") if t.strip()]
         if force_all and not any(t == "--force-refresh" or t.startswith("--force-refresh=") for t in pom_extra):
@@ -379,14 +524,18 @@ def main() -> None:
             pom_extra.extend(["--workers", str(pom_workers)])
         _run_py_module("backend.scripts.match_patterns_to_osm", pom_extra, db)
         log("precompute-all", "phase=pattern_osm_match done")
+    elif args.with_pattern_osm_match:
+        log("precompute-all", "phase=pattern_osm_match skipped per plan")
 
-    if args.with_bus_evidence:
+    if args.with_bus_evidence and _should_execute(plan, "bus_evidence"):
         log("precompute-all", "phase=bus_evidence start")
         be_extra = ["--force"] if force_all else []
         _run_py_module("backend.scripts.build_bus_evidence", be_extra, db)
         log("precompute-all", "phase=bus_evidence done")
+    elif args.with_bus_evidence:
+        log("precompute-all", "phase=bus_evidence skipped per plan")
 
-    if not args.skip_graphs:
+    if not args.skip_graphs and _should_execute(plan, "graphs"):
         log("precompute-all", "phase=graphs_pipeline start")
         graph_extra = [
             "--profiles",
@@ -398,10 +547,14 @@ def main() -> None:
         ]
         if args.with_pretty_osm:
             graph_extra.append("--with-pretty-osm")
+        if args.full_edge_preview_geojson:
+            graph_extra.append("--full-edge-preview-geojson")
         if force_all:
             graph_extra.append("--force-signatures")
         _run_py_module("scripts.precompute_graphs_postgis", graph_extra, db)
         log("precompute-all", "phase=graphs_pipeline done")
+    elif not args.skip_graphs:
+        log("precompute-all", "phase=graphs_pipeline skipped per plan")
 
     print("[precompute-all] Done.", flush=True)
     log("precompute-all", "phase=main done")

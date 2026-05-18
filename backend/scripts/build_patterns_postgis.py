@@ -94,42 +94,37 @@ def _merge_pattern_corridor_wkt(edge_wkts: List[str]) -> Optional[str]:
 
 def _ensure_patterns_built_checksum_column(conn) -> None:
   """Idempotent DDL for databases created before patterns_built_checksum was added."""
-  prev = conn.autocommit
-  conn.autocommit = True
-  try:
-    with conn.cursor() as cur:
-      cur.execute("SET lock_timeout = '5s'")
-      try:
-        cur.execute(
-          "ALTER TABLE feed_versions ADD COLUMN IF NOT EXISTS patterns_built_checksum TEXT"
+  with conn.cursor() as cur:
+    cur.execute("SET LOCAL lock_timeout = '5s'")
+    try:
+      cur.execute(
+        "ALTER TABLE feed_versions ADD COLUMN IF NOT EXISTS patterns_built_checksum TEXT"
+      )
+      log("patterns", "phase=ensure_patterns_built_checksum_column done")
+    except (pg_errors.LockNotAvailable, pg_errors.QueryCanceled) as e:
+      # If another session holds DDL-sensitive locks, avoid hanging here.
+      # Continue only when the column already exists.
+      cur.execute(
+        """
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'feed_versions'
+          AND column_name = 'patterns_built_checksum'
+        LIMIT 1
+        """
+      )
+      exists = cur.fetchone() is not None
+      if exists:
+        log(
+          "patterns",
+          (
+            "phase=ensure_patterns_built_checksum_column done "
+            f"column_exists=true ddl_skipped_reason={type(e).__name__}"
+          ),
         )
-        log("patterns", "phase=ensure_patterns_built_checksum_column done")
-      except (pg_errors.LockNotAvailable, pg_errors.QueryCanceled) as e:
-        # If another session holds DDL-sensitive locks, avoid hanging here.
-        # Continue only when the column already exists.
-        cur.execute(
-          """
-          SELECT 1
-          FROM information_schema.columns
-          WHERE table_schema = 'public'
-            AND table_name = 'feed_versions'
-            AND column_name = 'patterns_built_checksum'
-          LIMIT 1
-          """
-        )
-        exists = cur.fetchone() is not None
-        if exists:
-          log(
-            "patterns",
-            (
-              "phase=ensure_patterns_built_checksum_column done "
-              f"column_exists=true ddl_skipped_reason={type(e).__name__}"
-            ),
-          )
-        else:
-          raise
-  finally:
-    conn.autocommit = prev
+      else:
+        raise
 
 
 def _trip_row_from_db(r: Any) -> dict:

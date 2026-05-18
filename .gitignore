@@ -18,6 +18,7 @@ frontend/.vite/
 data/
 osm/valhalla_tiles/
 *.osm.pbf
+*.osm.pbf.bak
 *.db
 *.sqlite
 *.sqlite3

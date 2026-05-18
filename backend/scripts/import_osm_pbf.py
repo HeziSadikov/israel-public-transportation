@@ -186,6 +186,7 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _resolve_pbf_path(args: argparse.Namespace) -> Path:
     if args.pbf:
         return Path(args.pbf).expanduser().resolve()
     return Path(OSM_PBF_PATH).expanduser().resolve()

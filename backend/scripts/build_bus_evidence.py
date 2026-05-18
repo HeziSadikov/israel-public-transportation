@@ -37,14 +37,25 @@ def main(argv: Optional[list[str]] = None) -> int:
         action="store_true",
         help="Rebuild even when bus_evidence fingerprint matches last successful run.",
     )
+    ap.add_argument(
+        "--exact-trip-counts",
+        action="store_true",
+        help=(
+            "Use per-pattern trips join (slow). Default uses fast pre-aggregation "
+            "by route/direction/shape."
+        ),
+    )
     args = ap.parse_args(argv)
 
     db_url = args.database_url or db.DB_URL
     conn = _connect(db_url)
     try:
+        log("build_bus_evidence", "schema checks starting")
         db.ensure_pattern_physical_layer_schema(conn=conn)
         ensure_detour_v3_layer(conn)
         ps.ensure_pipeline_schema(conn)
+        conn.commit()
+        log("build_bus_evidence", "schema checks done")
         feed_id = int(args.feed_id) if args.feed_id is not None else int(db.get_active_feed_id(conn))
         with conn.cursor() as cur:
             cur.execute("SELECT checksum FROM feed_versions WHERE id = %s", (feed_id,))
@@ -62,7 +73,18 @@ def main(argv: Optional[list[str]] = None) -> int:
             return 0
         ps.mark_feed_running(conn, feed_id, ps.StageName.BUS_EVIDENCE.value, current_fp)
         conn.commit()
-        out = build_bus_evidence(conn, feed_id=feed_id, commit=True)
+        trip_mode = "exact" if args.exact_trip_counts else "fast"
+        log(
+            "build_bus_evidence",
+            f"feed_id={feed_id} starting aggregate trip_count_mode={trip_mode}",
+        )
+        out = build_bus_evidence(
+            conn,
+            feed_id=feed_id,
+            commit=True,
+            exact_trip_counts=bool(args.exact_trip_counts),
+        )
+        log("build_bus_evidence", f"feed_id={feed_id} committing")
         ps.mark_feed_succeeded(conn, feed_id, ps.StageName.BUS_EVIDENCE.value, current_fp, stats=out)
         conn.commit()
         log("build_bus_evidence", f"done {out!r}")

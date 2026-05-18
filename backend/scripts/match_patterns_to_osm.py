@@ -22,6 +22,8 @@ from backend.adapters.osm_detour import valhalla_health
 from backend.bus_corridor.match_patterns_to_osm import match_single_pattern_to_osm
 from backend.infra import db_access as db
 from backend.infra.config import VALHALLA_TRACE_ATTRIBUTES_ENABLED, VALHALLA_URL
+import logging
+
 from backend.infra.logging_utils import ensure_cli_action_logging, log
 from backend.infra.osm_import_db import ensure_detour_v3_layer
 
@@ -144,7 +146,9 @@ def _process_rows_sequential(
         except Exception:
             conn.rollback()
             failed += 1
-            log("match_patterns_to_osm", f"pattern_id={pid} error", exc_info=True)
+            logging.getLogger("app.action").exception(
+                "[match_patterns_to_osm] pattern_id=%s error", pid
+            )
     return written, skipped, failed
 
 
@@ -174,8 +178,6 @@ def _process_rows_parallel_page(
             c = pool_conns.get(tid)
             if c is None or c.closed:
                 c = _connect(db_url)
-                db.ensure_pattern_physical_layer_schema(conn=c)
-                ensure_detour_v3_layer(c)
                 pool_conns[tid] = c
             return c
 
@@ -209,7 +211,9 @@ def _process_rows_parallel_page(
                     conn.rollback()
                 except Exception:
                     pass
-                log("match_patterns_to_osm", f"pattern_id={pid} error", exc_info=True)
+                logging.getLogger("app.action").exception(
+                    "[match_patterns_to_osm] pattern_id=%s error", pid
+                )
                 return "error", pid
         finally:
             sem.release()
@@ -225,7 +229,9 @@ def _process_rows_parallel_page(
         except Exception:
             with lock:
                 failed += 1
-            log("match_patterns_to_osm", f"pattern_id={pid} future_error", exc_info=True)
+            logging.getLogger("app.action").exception(
+                "[match_patterns_to_osm] pattern_id=%s future_error", pid
+            )
             continue
         with lock:
             if outcome == "written":
@@ -319,9 +325,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         db.ensure_pattern_physical_layer_schema(conn=conn)
         ensure_detour_v3_layer(conn)
-        from backend.infra.pipeline_skip import ensure_pipeline_schema
+        from backend.infra.pipeline_skip import commit_if_in_transaction, ensure_pipeline_schema
 
         ensure_pipeline_schema(conn)
+        commit_if_in_transaction(conn)
         feed_id = int(db.get_active_feed_id(conn))
     finally:
         conn.close()
@@ -395,8 +402,6 @@ def main(argv: Optional[List[str]] = None) -> int:
 
                 run = _connect(db_url)
                 try:
-                    db.ensure_pattern_physical_layer_schema(conn=run)
-                    ensure_detour_v3_layer(run)
                     w, s, f = _process_rows_sequential(
                         rows,
                         conn=run,

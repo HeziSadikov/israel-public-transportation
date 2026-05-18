@@ -210,8 +210,18 @@ Ingest and precompute scripts use **content fingerprints** (data + CLI + algorit
 - **After lock:** parallel workers re-check `may_skip` inside the rebuild transaction (`skipped_after_lock`).
 - **Helpers:** `backend/infra/pipeline_skip.py`; stage tables: `feed_pipeline_stages`, `osm_pipeline_stages`, `pattern_signatures`, `pattern_osm_match_status`, etc. (migration `backend/sql/migrations/ensure_content_addressed_pipeline.sql`).
 - **Orchestrator:** `python -m scripts.precompute_all_postgis --force-all` forwards force flags to subprocesses.
+- **Planner:** `--plan-only` prints a read-only skip/run plan (no downloads, ingest, or stage writes). `--explain-skips` adds detail. `--from-stage` / `--to-stage` filter artifacts. `--force-artifact NAME` forces one stage.
+- **Ingest reuse:** `ingest_gtfs_postgis` reuses any `feed_versions` row with the same zip checksum (reactivates inactive feeds). Logs `reused existing feed_id=X by checksum`. Use `--force` or `--no-reuse-existing-feed` for a full reload. GTFS bus-way evidence is **not** built during default ingest; use `--rebuild-gtfs-bus-way-evidence` or `backend.scripts.build_gtfs_bus_way_evidence`.
+- **GTFS-only migration:** `ensure_content_addressed_pipeline.sql` always creates `feed_pipeline_stages` and pattern registry tables. `osm_pipeline_stages` is created only when `osm_import_runs` already exists (`osm_pipeline_stages=skipped` in logs is expected on GTFS-only DBs). After OSM import, run ingest/patterns again or `ensure_pipeline_schema` to create OSM registry tables.
 
 Existence/count checks are allowed only as sanity checks **after** fingerprint validation, never as skip authorization.
+
+**Recommended daily dev:**
+
+```bash
+python -m scripts.precompute_all_postgis --with-ingest --ingest-fetch-if-newer --workers 4 --plan-only --explain-skips
+python -m scripts.precompute_all_postgis --with-ingest --ingest-fetch-if-newer --workers 4
+```
 
 **Manage / CI**
 

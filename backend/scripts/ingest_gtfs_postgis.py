@@ -18,7 +18,8 @@ Usage (example):
     python -m backend.scripts.ingest_gtfs_postgis --fetch-always
 
 This script:
-  - SHA-256 checksums the zip; skips loading if the active feed already has the same checksum (use --force to override).
+  - SHA-256 checksums the zip; reuses any feed_versions row with the same checksum (reactivate if inactive).
+    Use --force or --no-reuse-existing-feed to always create a new feed and full reload.
   - Creates a new feed_versions row.
   - Loads core GTFS CSVs into Postgres tables (see db_postgis_schema.sql).
   - Builds shapes_lines (LineStrings) and basic derived tables such as
@@ -274,12 +275,49 @@ def _log_feed_versions_blockers(database_url: str, phase: str) -> None:
         log("ingest", f"phase={phase} feed_versions_lock_diag_error={e!s}")
 
 
+def _try_reuse_feed_by_checksum(
+    conn,
+    zip_checksum: str,
+    *,
+    reuse_existing: bool,
+) -> bool:
+    """Return True when ingest load can be skipped (active skip or reactivate)."""
+    if not reuse_existing:
+        return False
+    from backend.infra.pipeline_skip import (
+        ensure_pipeline_schema,
+        find_feed_by_zip_checksum,
+        mark_feed_succeeded,
+        reactivate_feed,
+        StageName,
+    )
+
+    ensure_pipeline_schema(conn)
+    match = find_feed_by_zip_checksum(conn, zip_checksum)
+    if match is None:
+        return False
+    feed_id = match.feed_id
+    msg = f"reused existing feed_id={feed_id} by checksum={zip_checksum}"
+    if match.active:
+        mark_feed_succeeded(conn, feed_id, StageName.INGEST.value, zip_checksum)
+        conn.commit()
+        print(f"[ingest] Skip: {msg}", flush=True)
+        log("ingest", f"phase=checksum_reuse skip=true {msg}")
+    else:
+        reactivate_feed(conn, feed_id, zip_checksum)
+        print(f"[ingest] Reactivated: {msg}", flush=True)
+        log("ingest", f"phase=checksum_reactivate {msg}")
+    return True
+
+
 def ingest_gtfs(
     gtfs_zip: Path,
     database_url: str,
     source_url: str | None = None,
     *,
     force: bool = False,
+    reuse_existing: bool = True,
+    with_gtfs_bus_way_evidence: bool = False,
 ):
     log("ingest", "phase=checksum start")
     t_checksum = time.perf_counter()
@@ -292,45 +330,37 @@ def ingest_gtfs(
     conn.autocommit = False
     try:
         if not force:
-            log("ingest", "phase=checksum_skip_check start")
+            log("ingest", "phase=checksum_reuse_check start")
             t_skip_check = time.perf_counter()
             with conn.cursor() as cur:
                 cur.execute("SET LOCAL lock_timeout = '8s'")
                 cur.execute("SET LOCAL statement_timeout = '20s'")
-                try:
-                    cur.execute(
-                        "SELECT id, checksum FROM feed_versions WHERE active = TRUE LIMIT 1"
-                    )
-                    row = cur.fetchone()
-                except (pg_errors.LockNotAvailable, pg_errors.QueryCanceled) as e:
-                    elapsed = time.perf_counter() - t_skip_check
-                    conn.rollback()
+            try:
+                if _try_reuse_feed_by_checksum(
+                    conn, zip_checksum, reuse_existing=reuse_existing
+                ):
                     log(
                         "ingest",
-                        (
-                            "phase=checksum_skip_check error="
-                            f"{type(e).__name__} elapsed_s={elapsed:.2f} "
-                            "hint=feed_versions may be blocked by another transaction"
-                        ),
+                        f"phase=checksum_reuse_check done skip=true elapsed_s={time.perf_counter() - t_skip_check:.2f}",
                     )
-                    _log_lock_diagnostics(database_url, "checksum_skip_check")
-                    _log_feed_versions_blockers(database_url, "checksum_skip_check")
-                    raise
-            if row and row[1] and row[1] == zip_checksum:
+                    return
+            except (pg_errors.LockNotAvailable, pg_errors.QueryCanceled) as e:
                 conn.rollback()
-                print(
-                    f"[ingest] Skip: zip unchanged (checksum={zip_checksum}, feed_id={row[0]})",
-                    flush=True,
-                )
                 log(
                     "ingest",
-                    f"phase=checksum_skip_check done skip=true feed_id={row[0]} elapsed_s={time.perf_counter() - t_skip_check:.2f}",
+                    (
+                        "phase=checksum_reuse_check error="
+                        f"{type(e).__name__} elapsed_s={time.perf_counter() - t_skip_check:.2f} "
+                        "hint=feed_versions may be blocked by another transaction"
+                    ),
                 )
-                return
+                _log_lock_diagnostics(database_url, "checksum_reuse_check")
+                _log_feed_versions_blockers(database_url, "checksum_reuse_check")
+                raise
             conn.rollback()
             log(
                 "ingest",
-                f"phase=checksum_skip_check done skip=false elapsed_s={time.perf_counter() - t_skip_check:.2f}",
+                f"phase=checksum_reuse_check done skip=false elapsed_s={time.perf_counter() - t_skip_check:.2f}",
             )
 
         with conn, conn.cursor() as cur:
@@ -696,17 +726,15 @@ def ingest_gtfs(
                     f"phase=build_shapes_lines done elapsed_s={time.perf_counter() - t_shapes_lines:.2f}",
                 )
 
-                # Build GTFS->OSM bus-way evidence (feed-scoped) for strict detour-v2 compatibility checks.
-                # This is intentionally a conservative spatial association stage:
-                # shape line buffered proximity -> OSM road segment way ids.
-                print("[ingest] Building gtfs_bus_way_evidence ...", flush=True)
-                log("ingest", "phase=build_gtfs_bus_way_evidence start")
-                t_gtfs_way_ev = time.perf_counter()
-                rebuild_gtfs_bus_way_evidence_for_feed(cur, feed_id)
-                log(
-                    "ingest",
-                    f"phase=build_gtfs_bus_way_evidence done elapsed_s={time.perf_counter() - t_gtfs_way_ev:.2f}",
-                )
+                if with_gtfs_bus_way_evidence:
+                    print("[ingest] Building gtfs_bus_way_evidence ...", flush=True)
+                    log("ingest", "phase=build_gtfs_bus_way_evidence start")
+                    t_gtfs_way_ev = time.perf_counter()
+                    rebuild_gtfs_bus_way_evidence_for_feed(cur, feed_id)
+                    log(
+                        "ingest",
+                        f"phase=build_gtfs_bus_way_evidence done elapsed_s={time.perf_counter() - t_gtfs_way_ev:.2f}",
+                    )
 
                 # Compute basic trip_time_bounds from stop_times
                 print("[ingest] Computing trip_time_bounds ...", flush=True)
@@ -895,7 +923,26 @@ def main():
     ap.add_argument(
         "--force",
         action="store_true",
-        help="Ingest even if the active feed already has the same zip checksum",
+        help=(
+            "Always create a new feed_versions row and full GTFS reload "
+            "(disables checksum reuse / reactivation)."
+        ),
+    )
+    ap.add_argument(
+        "--no-reuse-existing-feed",
+        action="store_true",
+        help=(
+            "Do not reuse or reactivate an existing feed_versions row with the same zip checksum "
+            "(default: reuse when checksum matches any row)."
+        ),
+    )
+    ap.add_argument(
+        "--with-gtfs-bus-way-evidence",
+        action="store_true",
+        help=(
+            "During ingest, rebuild gtfs_bus_way_evidence (default off; use "
+            "backend.scripts.build_gtfs_bus_way_evidence or precompute --rebuild-gtfs-bus-way-evidence)."
+        ),
     )
     ap.add_argument(
         "--fetch",
@@ -1025,7 +1072,15 @@ def main():
             )
 
     log("ingest", "phase=ingest_gtfs_call start")
-    ingest_gtfs(gtfs_path, database_url, source_url=args.source_url, force=args.force)
+    reuse_existing = not args.force and not args.no_reuse_existing_feed
+    ingest_gtfs(
+        gtfs_path,
+        database_url,
+        source_url=args.source_url,
+        force=args.force,
+        reuse_existing=reuse_existing,
+        with_gtfs_bus_way_evidence=bool(args.with_gtfs_bus_way_evidence),
+    )
     log("ingest", "phase=ingest_gtfs_call done")
     log("ingest", "phase=main done")
 

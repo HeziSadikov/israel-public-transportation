@@ -46,6 +46,21 @@ def _connect(database_url: Optional[str]):
     return psycopg2.connect(database_url or DB_URL, cursor_factory=DictCursor)
 
 
+def _handle_pretty_osm_error(
+    exc: Exception,
+    *,
+    policy: str,
+    route_id: str,
+    direction_id: Optional[str],
+) -> None:
+    log(
+        "precompute_graphs",
+        f"route ({route_id!r},{direction_id!r}) pretty_osm failed: {exc!s}",
+    )
+    if policy == "fail":
+        raise
+
+
 def _build_preview_payload(cache_entry: Dict[str, Any]) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     from shapely.geometry import mapping, Point
 
@@ -206,7 +221,7 @@ def _build_one(
     shape_line: Optional[Any],
     stop_times: Optional[List],
     *,
-    fast_preview_geojson: bool = False,
+    fast_preview_geojson: bool = True,
 ) -> Tuple[Any, Dict]:
     """Build graph for one pattern; returns (pattern, cache_entry dict)."""
     result = build_graph_for_pattern_from_postgis(
@@ -353,6 +368,7 @@ def _build_chunk(
     fast_preview_geojson: bool,
     with_pretty_osm: bool,
     commit_batch_size: int,
+    pretty_osm_error_policy: str = "warn",
 ) -> int:
     """Build and save graphs for a chunk of (route_id, direction_id). Used by parallel workers."""
     conn_w = _connect(database_url)
@@ -523,8 +539,13 @@ def _build_chunk(
                                     conn=conn_w,
                                     commit=False,
                                 )
-                    except Exception:
-                        pass
+                    except Exception as pretty_exc:
+                        _handle_pretty_osm_error(
+                            pretty_exc,
+                            policy=pretty_osm_error_policy,
+                            route_id=r,
+                            direction_id=d,
+                        )
                 _commit_route_bundle(
                     conn_w,
                     commit_bs=commit_bs,
@@ -662,15 +683,26 @@ def main():
     ap.add_argument(
         "--fast-preview-geojson",
         action="store_true",
+        help="Build route preview GeoJSON from pattern stops + one polyline (default; faster).",
+    )
+    ap.add_argument(
+        "--full-edge-preview-geojson",
+        action="store_true",
         help=(
-            "Build route preview GeoJSON from pattern stops + one polyline (faster; less map detail). "
-            "Default uses full graph edge geometries for previews (same fidelity as before the fast path)."
+            "Use full graph edge geometries for route preview GeoJSON (slower; more map detail). "
+            "Default is fast preview."
         ),
     )
     ap.add_argument(
         "--legacy-preview-geojson",
         action="store_true",
         help=argparse.SUPPRESS,
+    )
+    ap.add_argument(
+        "--pretty-osm-error-policy",
+        choices=("warn", "fail"),
+        default="warn",
+        help="When --with-pretty-osm map-match fails: warn (default) or fail the run.",
     )
     ap.add_argument(
         "--with-pretty-osm",
@@ -694,6 +726,12 @@ def main():
     profiles = [p.strip() for p in str(args.profiles).split(",") if p.strip()]
     if not profiles:
         profiles = ["weekday", "friday", "saturday", "sunday"]
+    fast_preview_geojson = not bool(args.full_edge_preview_geojson)
+    if args.fast_preview_geojson:
+        fast_preview_geojson = True
+    if getattr(args, "legacy_preview_geojson", False):
+        fast_preview_geojson = False
+    pretty_osm_policy = str(args.pretty_osm_error_policy)
 
     conn = _connect(args.database_url)
     try:
@@ -935,7 +973,7 @@ def main():
         log(
             "precompute_graphs",
             (
-                f"Graph build options: fast_preview_geojson={bool(args.fast_preview_geojson)}, "
+                f"Graph build options: fast_preview_geojson={fast_preview_geojson}, "
                 f"with_pretty_osm={bool(args.with_pretty_osm)}, "
                 f"commit_batch_size={max(1, int(args.commit_batch_size))}"
             ),
@@ -946,7 +984,7 @@ def main():
             total_build = len(to_build)
             commit_bs_seq = max(1, int(args.commit_batch_size))
             pending_seq: List[int] = [0]
-            fast_pv = bool(args.fast_preview_geojson)
+            fast_pv = fast_preview_geojson
             with_pretty_seq = bool(args.with_pretty_osm)
             for i, (r, d) in enumerate(to_build, start=1):
                 meta = patterns[(r, d)]
@@ -1086,8 +1124,13 @@ def main():
                                         conn=conn,
                                         commit=False,
                                     )
-                        except Exception:
-                            pass
+                        except Exception as pretty_exc:
+                            _handle_pretty_osm_error(
+                                pretty_exc,
+                                policy=pretty_osm_policy,
+                                route_id=r,
+                                direction_id=d,
+                            )
                     _commit_route_bundle(
                         conn,
                         commit_bs=commit_bs_seq,
@@ -1174,9 +1217,10 @@ def main():
                             label,
                             pe,
                             max(0, int(args.worker_heartbeat_seconds)),
-                            bool(args.fast_preview_geojson),
+                            fast_preview_geojson,
                             bool(args.with_pretty_osm),
                             max(1, int(args.commit_batch_size)),
+                            pretty_osm_policy,
                         )
                     )
                 completed = 0
@@ -1198,6 +1242,33 @@ def main():
             "precompute_graphs",
             f"Done. built={built}, skipped_unchanged={reused_count}, no_pattern={no_pattern_count}, profiles={profiles}",
         )
+        try:
+            from backend.infra import pipeline_skip as ps
+
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT checksum FROM feed_versions WHERE id = %s",
+                    (feed_id,),
+                )
+                fv = cur.fetchone()
+            zip_ck = str(fv["checksum"]) if fv and fv.get("checksum") else ""
+            graphs_fp = ps.build_graphs_stage_fingerprint(
+                gtfs_zip_checksum=zip_ck,
+                profiles=profiles,
+                with_pretty_osm=bool(args.with_pretty_osm),
+                fast_preview_geojson=fast_preview_geojson,
+            )
+            ps.ensure_pipeline_schema(conn)
+            ps.mark_feed_succeeded(
+                conn,
+                feed_id,
+                ps.StageName.GRAPHS.value,
+                graphs_fp,
+                stats={"built": built, "skipped_unchanged": reused_count},
+            )
+            conn.commit()
+        except Exception as mark_err:
+            log("precompute_graphs", f"phase=pipeline_stage_mark warning={mark_err!s}")
         log("precompute_graphs", "phase=main done")
     finally:
         conn.close()

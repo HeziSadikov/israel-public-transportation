@@ -17,6 +17,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, Optional, Tuple
 
+from psycopg2 import errors as pg_errors
+from psycopg2 import extensions as pg_extensions
 from psycopg2.extras import Json
 
 from backend.infra.logging_utils import log
@@ -86,6 +88,16 @@ class UnitLockKey:
 class RebuildYield:
     skipped_after_lock: bool = False
     skipped_fast_path: bool = False
+    failed_outcome: bool = False
+
+
+@dataclass(frozen=True)
+class FeedChecksumMatch:
+    feed_id: int
+    active: bool
+
+
+FEED_ACTIVATION_LOCK = UnitLockKey(stage_name="feed_activation")
 
 
 def fingerprint_sha256(payload: Dict[str, Any]) -> str:
@@ -119,6 +131,47 @@ def acquire_unit_lock(conn, unit: UnitLockKey) -> None:
         cur.execute("SELECT pg_advisory_xact_lock(%s, %s)", (k1, k2))
 
 
+def commit_if_in_transaction(conn) -> None:
+    """End an open transaction so session settings (e.g. autocommit) can be changed."""
+    if conn.autocommit:
+        return
+    if conn.status == pg_extensions.STATUS_IN_TRANSACTION:
+        conn.commit()
+
+
+def relation_exists(conn, qualified_name: str) -> bool:
+    """Return True if relation exists (e.g. 'public.feed_pipeline_stages')."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT to_regclass(%s)", (qualified_name,))
+        row = cur.fetchone()
+    return row is not None and row[0] is not None
+
+
+def osm_import_registry_available(conn) -> bool:
+    return relation_exists(conn, "public.osm_import_runs")
+
+
+def osm_pipeline_stages_available(conn) -> bool:
+    return relation_exists(conn, "public.osm_pipeline_stages")
+
+
+def _pipeline_migration_diagnostics(conn) -> str:
+    parts = [
+        f"feed_pipeline_stages={'yes' if relation_exists(conn, 'public.feed_pipeline_stages') else 'no'}",
+        f"pattern_signatures={'yes' if relation_exists(conn, 'public.pattern_signatures') else 'no'}",
+        f"pattern_osm_match_status={'yes' if relation_exists(conn, 'public.pattern_osm_match_status') else 'no'}",
+        f"pattern_edge_match_status={'yes' if relation_exists(conn, 'public.pattern_edge_match_status') else 'no'}",
+        f"osm_import_runs={'yes' if osm_import_registry_available(conn) else 'no'}",
+    ]
+    if osm_pipeline_stages_available(conn):
+        parts.append("osm_pipeline_stages=yes")
+    elif osm_import_registry_available(conn):
+        parts.append("osm_pipeline_stages=no")
+    else:
+        parts.append("osm_pipeline_stages=skipped")
+    return " ".join(parts)
+
+
 def ensure_pipeline_schema(conn) -> None:
     if not _MIGRATION_PATH.exists():
         raise FileNotFoundError(f"Pipeline migration not found: {_MIGRATION_PATH}")
@@ -126,7 +179,9 @@ def ensure_pipeline_schema(conn) -> None:
     with conn.cursor() as cur:
         cur.execute(sql)
     conn.commit()
-    log("pipeline-skip", f"applied migration {_MIGRATION_PATH.name}")
+    diag = _pipeline_migration_diagnostics(conn)
+    commit_if_in_transaction(conn)
+    log("pipeline-skip", f"applied migration {_MIGRATION_PATH.name} {diag}")
 
 
 # ---------------------------------------------------------------------------
@@ -134,22 +189,41 @@ def ensure_pipeline_schema(conn) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _cursor_row_dict(row: Any, cur) -> Optional[Dict[str, Any]]:
+    if row is None:
+        return None
+    if hasattr(row, "keys"):
+        return dict(row)
+    if cur.description:
+        cols = [d[0] for d in cur.description]
+        return dict(zip(cols, row))
+    return None
+
+
+def feed_pipeline_stages_available(conn) -> bool:
+    """True when content-addressed feed stage registry exists (migration applied)."""
+    return relation_exists(conn, "public.feed_pipeline_stages")
+
+
 def get_feed_stage(
     conn,
     feed_id: int,
     stage_name: str,
 ) -> Optional[Dict[str, Any]]:
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT input_fingerprint, outcome, completed_at, stats_json
-            FROM feed_pipeline_stages
-            WHERE feed_id = %s AND stage_name = %s
-            """,
-            (feed_id, stage_name),
-        )
-        row = cur.fetchone()
-        return dict(row) if row else None
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT input_fingerprint, outcome, completed_at, stats_json
+                FROM feed_pipeline_stages
+                WHERE feed_id = %s AND stage_name = %s
+                """,
+                (feed_id, stage_name),
+            )
+            return _cursor_row_dict(cur.fetchone(), cur)
+    except pg_errors.UndefinedTable:
+        conn.rollback()
+        return None
 
 
 def get_feed_stage_success_fingerprint(
@@ -245,6 +319,72 @@ def mark_feed_failed(
         outcome=OUTCOME_FAILED,
         stats=stats,
     )
+
+
+def find_feed_by_zip_checksum(
+    conn, zip_checksum: str
+) -> Optional[FeedChecksumMatch]:
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, active
+                FROM feed_versions
+                WHERE checksum = %s
+                ORDER BY active DESC, id DESC
+                LIMIT 1
+                """,
+                (zip_checksum,),
+            )
+            row = cur.fetchone()
+    except pg_errors.UndefinedTable:
+        conn.rollback()
+        return None
+    if not row:
+        return None
+    feed_id = int(row[0] if not hasattr(row, "keys") else row["id"])
+    active = bool(row[1] if not hasattr(row, "keys") else row["active"])
+    return FeedChecksumMatch(feed_id=feed_id, active=active)
+
+
+def reactivate_feed(conn, feed_id: int, zip_checksum: str) -> None:
+    """Atomically switch active feed and mark INGEST succeeded for zip_checksum."""
+    prev_autocommit = conn.autocommit
+    conn.autocommit = False
+    try:
+        with conn:
+            acquire_unit_lock(conn, FEED_ACTIVATION_LOCK)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT checksum FROM feed_versions WHERE id = %s FOR UPDATE",
+                    (feed_id,),
+                )
+                row = cur.fetchone()
+                stored = row[0] if row else None
+                if stored != zip_checksum:
+                    raise ValueError(
+                        f"feed_id={feed_id} checksum mismatch "
+                        f"(expected {zip_checksum!r}, got {stored!r})"
+                    )
+                cur.execute("UPDATE feed_versions SET active = FALSE")
+                cur.execute(
+                    "UPDATE feed_versions SET active = TRUE WHERE id = %s",
+                    (feed_id,),
+                )
+                cur.execute(
+                    "SELECT COUNT(*)::int FROM feed_versions WHERE active = TRUE"
+                )
+                n_active = int(cur.fetchone()[0])
+            if n_active != 1:
+                raise RuntimeError(
+                    f"expected exactly one active feed after reactivate, got {n_active}"
+                )
+            mark_feed_succeeded(
+                conn, feed_id, StageName.INGEST.value, zip_checksum
+            )
+        conn.commit()
+    finally:
+        conn.autocommit = prev_autocommit
 
 
 # ---------------------------------------------------------------------------
@@ -391,19 +531,25 @@ def set_osm_import_dataset_fingerprint(
 
 
 def get_latest_osm_dataset_fingerprint(conn) -> Optional[str]:
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT osm_dataset_fingerprint
-            FROM osm_import_runs
-            WHERE status IN ('success', 'verify_only')
-              AND osm_dataset_fingerprint IS NOT NULL
-            ORDER BY id DESC
-            LIMIT 1
-            """
-        )
-        row = cur.fetchone()
-    fp = row.get("osm_dataset_fingerprint") if row else None
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT osm_dataset_fingerprint
+                FROM osm_import_runs
+                WHERE status IN ('success', 'verify_only')
+                  AND osm_dataset_fingerprint IS NOT NULL
+                ORDER BY id DESC
+                LIMIT 1
+                """
+            )
+            row = cur.fetchone()
+    except pg_errors.UndefinedTable:
+        conn.rollback()
+        return None
+    if not row:
+        return None
+    fp = row.get("osm_dataset_fingerprint") if hasattr(row, "keys") else row[0]
     return str(fp) if fp else None
 
 
@@ -625,6 +771,27 @@ def build_osm_dataset_fingerprint(
     )
 
 
+def build_graphs_stage_fingerprint(
+    *,
+    gtfs_zip_checksum: str,
+    profiles: list[str],
+    with_pretty_osm: bool,
+    fast_preview_geojson: bool,
+) -> str:
+    return fingerprint_sha256(
+        {
+            "stage": StageName.GRAPHS.value,
+            "algorithm_version": GRAPHS_ALGORITHM_VERSION,
+            "cli": {
+                "profiles": sorted(profiles),
+                "with_pretty_osm": with_pretty_osm,
+                "fast_preview_geojson": fast_preview_geojson,
+            },
+            "upstream": {"gtfs_zip_checksum": gtfs_zip_checksum},
+        }
+    )
+
+
 def build_patterns_stage_fingerprint(
     *,
     gtfs_zip_checksum: str,
@@ -831,7 +998,11 @@ def rebuild_unit(
                 return
             mark_running()
             yield result
-            if not result.skipped_after_lock:
+            if result.skipped_after_lock:
+                pass
+            elif result.failed_outcome:
+                mark_failed()
+            else:
                 mark_succeeded()
     except Exception as e:
         conn.rollback()

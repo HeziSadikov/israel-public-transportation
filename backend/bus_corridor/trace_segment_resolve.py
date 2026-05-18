@@ -29,6 +29,18 @@ def edge_way_and_endpoint_nodes(edge: Dict[str, Any], ordinal: int, way_id: int)
     return fn, tn
 
 
+def trace_edge_has_osm_endpoint_ids(edge: Dict[str, Any]) -> bool:
+    """True when Valhalla supplied both directed OSM node endpoints (not graph-internal ids)."""
+    for key in ("begin_osm_node_id", "end_osm_node_id"):
+        v = edge.get(key)
+        try:
+            if v is None or int(v) <= 0:
+                return False
+        except (TypeError, ValueError):
+            return False
+    return True
+
+
 def trace_edge_resolution_triple(edge: Dict[str, Any], ordinal: int) -> Tuple[int, int, int]:
     """(osm_way_id, from_node_id, to_node_id) — node ids agree with legacy pattern_edge tooling."""
     way_id = int(edge.get("way_id") or 0)
@@ -119,31 +131,66 @@ def pick_segment_for_trace_edge(
     return int(tied_scored[0][1])
 
 
+def _segment_to_node_id(row: Dict[str, Any]) -> Optional[int]:
+    try:
+        v = row.get("to_node_id")
+        return int(v) if v is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
 def resolve_trace_edges_to_segment_ids(
     edges: Sequence[Dict[str, Any]],
     triple_to_rows: Dict[Tuple[int, int, int], List[Dict[str, Any]]],
     *,
     v3_import_source: str,
+    way_to_rows: Optional[Dict[int, List[Dict[str, Any]]]] = None,
 ) -> Tuple[Optional[List[int]], int]:
     """
     Map each trace edge to ``segment_id`` using pre-fetched candidates per triple.
+
+    When Valhalla omits ``begin_osm_node_id`` / ``end_osm_node_id``, exact triple lookup
+    uses legacy sentinel node ids; on miss, ``way_to_rows`` enables way-level resolution with
+    heading fit and continuity from the previous segment's ``to_node_id``.
 
     Returns (segment_id list or None on missing way_id / unresolved triple, unresolved_count hint).
     """
     ids: List[int] = []
     unresolved = 0
+    prev_to_node: Optional[int] = None
     for ordinal, edge in enumerate(edges):
         way_id = int(edge.get("way_id") or 0)
         if way_id <= 0:
             return None, len(edges)
         triple = trace_edge_resolution_triple(edge, ordinal)
-        cand = triple_to_rows.get(triple) or []
+        if trace_edge_has_osm_endpoint_ids(edge):
+            cand = triple_to_rows.get(triple) or []
+        elif way_to_rows is not None:
+            cand = list(way_to_rows.get(way_id) or [])
+            if not cand:
+                cand = triple_to_rows.get(triple) or []
+            elif prev_to_node is not None:
+                linked = [
+                    r
+                    for r in cand
+                    if int(r.get("from_node_id") or 0) == int(prev_to_node)
+                ]
+                if linked:
+                    cand = linked
+        else:
+            cand = triple_to_rows.get(triple) or []
         if not cand:
             unresolved += 1
             return None, unresolved
         sid = pick_segment_for_trace_edge(
             edge, ordinal, cand, v3_import_source=v3_import_source
         )
+        if sid is None:
+            unresolved += 1
+            return None, unresolved
+        picked = next((r for r in cand if int(r["segment_id"]) == int(sid)), None)
+        if picked is not None:
+            prev_to_node = _segment_to_node_id(picked)
         ids.append(int(sid))
     deduped_ids: List[int] = []
     for sid in ids:
@@ -157,6 +204,7 @@ __all__ = [
     "angular_distance_deg",
     "flatten_per_leg_trace_edges",
     "dedupe_consecutive_trace_edges",
+    "trace_edge_has_osm_endpoint_ids",
     "trace_edge_resolution_triple",
     "resolve_trace_edges_to_segment_ids",
 ]
