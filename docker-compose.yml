@@ -34,16 +34,19 @@ services:
       postgis:
         condition: service_healthy
     environment:
-      DATABASE_URL: "postgresql://${POSTGRES_USER:-user}:${POSTGRES_PASSWORD:-pass}@postgis:5432/${POSTGRES_DB:-israel_gtfs}"
+      DATABASE_URL: ${DATABASE_URL:-postgresql://${POSTGRES_USER:-user}:${POSTGRES_PASSWORD:-pass}@postgis:5432/${POSTGRES_DB:-israel_gtfs}}
       OSM_ENGINE_URL: "http://osrm:5000"
       VALHALLA_URL: "http://valhalla:8002"
       TZ: ${LOCAL_TZ:-Asia/Jerusalem}
+      DETOUR_V3_ENABLED: "true"
+      DETOUR_ENGINE: "v3"
+      DETOUR_V3_IMPORT_RUN_ID: ${DETOUR_V3_IMPORT_RUN_ID:-}
+      DETOUR_V3_COST_MODE: ${DETOUR_V3_COST_MODE:-bus_corridor_plus_connectors}
       GRAPH_WARMUP_ENABLED: ${GRAPH_WARMUP_ENABLED:-true}
       GRAPH_WARMUP_TIMEOUT_S: ${GRAPH_WARMUP_TIMEOUT_S:-300}
       GRAPH_WARMUP_PROFILES: ${GRAPH_WARMUP_PROFILES:-weekday,friday,saturday,sunday}
       HYBRID_DETOUR_ENABLED: ${HYBRID_DETOUR_ENABLED:-true}
-      # Preview warmup loads tens of thousands of pickled graphs into RAM; Docker Desktop
-      # often OOM-kills (exit 137) before startup finishes. Override with true if you raise memory.
+      # Preview warmup loads many pickled graphs into RAM; set false on Docker Desktop if OOM (exit 137).
       GRAPH_WARMUP_PREVIEWS_ENABLED: ${GRAPH_WARMUP_PREVIEWS_ENABLED:-false}
     ports:
       - "8000:8000"
@@ -61,6 +64,7 @@ services:
       - backend
     environment:
       VITE_API_BASE: ${VITE_API_BASE:-http://127.0.0.1:8000/api/v1}
+      VITE_DETOUR_COMPUTE_ENGINE: ${VITE_DETOUR_COMPUTE_ENGINE:-v3}
       TZ: ${LOCAL_TZ:-Asia/Jerusalem}
     ports:
       - "5173:5173"

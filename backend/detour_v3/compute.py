@@ -19,11 +19,8 @@ from backend.domain.detour_v2.policy import DetourPolicyConfig, get_default_poli
 from backend.domain.detour_v2.serialize import format_detour_ai_log_line
 from backend.domain.detour_v2.trip_impact_analyzer import analyze_trip_impact
 from backend.infra import db_access as db
-from backend.infra.config import (
-    DETOUR_V3_COST_MODE,
-    DETOUR_V3_ENABLED,
-    DETOUR_V3_IMPORT_RUN_ID,
-)
+from backend.infra.config import DETOUR_V3_COST_MODE, DETOUR_V3_ENABLED
+from backend.infra.detour_v3_runtime import resolve_detour_v3_import_run_id
 from backend.infra.logging_utils import log
 from backend.routing.anchors import (
     SegmentAnchorPair,
@@ -154,8 +151,9 @@ def compute_detour_for_trip(
             )
 
         feed_id = db.get_active_feed_id(conn)
+        osm_run_id = resolve_detour_v3_import_run_id(conn)
         polygon_wkt = polygon_geojson_feature_to_wkt(blockage_geojson)
-        bans = project_polygon_to_bans(conn, polygon_wkt, segment_import_run_id=DETOUR_V3_IMPORT_RUN_ID)
+        bans = project_polygon_to_bans(conn, polygon_wkt, segment_import_run_id=osm_run_id)
 
         pid = db.resolve_pattern_id_for_trip(str(trip_id), conn)
         if not pid:
@@ -189,7 +187,7 @@ def compute_detour_for_trip(
                 ),
             )
 
-        graph = load_road_graph(conn, segment_import_run_id=DETOUR_V3_IMPORT_RUN_ID)
+        graph = load_road_graph(conn, segment_import_run_id=osm_run_id)
         seg_nodes = {sid: (s.from_node_id, s.to_node_id) for sid, s in graph.segments.items()}
 
         raw_anchors = anchor_pairs_for_pattern_blocks(pattern_seg_ids, set(bans.banned_segment_ids))
@@ -289,7 +287,11 @@ def compute_detour_for_trip(
             )
             geom_feat = db.fetch_segment_path_geojson_feature(path, conn=conn)
             decoded = _decoded_from_path(graph, path)
-            decoded.geometry_geojson = geom_feat.get("geometry") or decoded.geometry_geojson
+            # Match v2 wire format: FeatureCollection (not bare LineString geometry).
+            decoded.geometry_geojson = {
+                "type": "FeatureCollection",
+                "features": [geom_feat] if geom_feat.get("type") == "Feature" else [],
+            }
 
             cand = RankedCandidate(
                 strategy="v3_own_graph_astar",

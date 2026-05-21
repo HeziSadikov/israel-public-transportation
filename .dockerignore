@@ -1,21 +1,28 @@
 .git
 .gitignore
+.cursor
+agent-transcripts
 
 __pycache__/
 *.pyc
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+*.egg-info/
 
 frontend/node_modules/
 frontend/dist/
 
 data/
-osm/*.pbf
-osm/*.osm
-osm/*.osrm*
-osm/valhalla_tiles/
-osm/tiles.tar
+cache/
+.graph_cache/
+**/*.pkl
+**/*.pickle
+
+osm/
+*.pbf
+*.osm
+*.osrm*
 
 *.zip
 *.db
@@ -23,3 +30,10 @@ osm/tiles.tar
 *.sqlite3
 
 .env
+.env.*
+!.env.example
+
+docs/
+tests/
+*.md
+!README.md

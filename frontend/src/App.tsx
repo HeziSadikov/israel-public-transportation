@@ -743,18 +743,29 @@ const App: React.FC = () => {
     };
   };
 
+  const geometryToFeatureCollection = (
+    raw: GeoJSON.FeatureCollection | GeoJSON.Feature | GeoJSON.Geometry | null | undefined
+  ): GeoJSON.FeatureCollection => {
+    if (!raw) return { type: "FeatureCollection", features: [] };
+    if (raw.type === "FeatureCollection") return raw as GeoJSON.FeatureCollection;
+    if (raw.type === "Feature") {
+      return { type: "FeatureCollection", features: [raw as GeoJSON.Feature] };
+    }
+    if (raw.type === "LineString" || raw.type === "MultiLineString") {
+      return {
+        type: "FeatureCollection",
+        features: [{ type: "Feature", geometry: raw, properties: { kind: "detour_path" } }],
+      };
+    }
+    return { type: "FeatureCollection", features: [] };
+  };
+
   const mapV2ResultToDetour = (r: DetourV2ComputeResult): DetourResponse | null => {
-    const raw = (r.selected?.geometry_geojson ?? null) as
-      | GeoJSON.FeatureCollection
-      | GeoJSON.Feature
-      | null;
+    const raw = r.selected?.geometry_geojson ?? null;
     if (!raw) return null;
-    const asFeatureCollection: GeoJSON.FeatureCollection =
-      raw.type === "FeatureCollection"
-        ? (raw as GeoJSON.FeatureCollection)
-        : raw.type === "Feature"
-          ? { type: "FeatureCollection", features: [raw as GeoJSON.Feature] }
-          : { type: "FeatureCollection", features: [] };
+    const asFeatureCollection = geometryToFeatureCollection(
+      raw as GeoJSON.FeatureCollection | GeoJSON.Feature | GeoJSON.Geometry
+    );
     return {
       blocked_edges_count: 0,
       stop_path: [],
@@ -788,7 +799,11 @@ const App: React.FC = () => {
       mapRef.current?.fitToDetour();
     } else {
       setDetour(null);
-      setMessage("Detour v2 completed but returned no drawable geometry.");
+      const eng = result.compute_engine_used ?? "detour";
+      const status = result.status ?? "unknown";
+      setMessage(
+        `Detour (${eng}) finished with status "${status}" but returned no drawable geometry.`
+      );
     }
     // E4: build v2 overlay from anchors and stitching.
     const anchors = result.anchors;

@@ -266,15 +266,92 @@ def _warmup_route_previews(
     return loaded_gtfs, loaded_osm, skipped_stale
 
 
+def _route_geojson_has_line(route_geojson: object) -> bool:
+    """True when preview GeoJSON includes a drawable route polyline."""
+    if not isinstance(route_geojson, dict):
+        return False
+    for feat in route_geojson.get("features") or []:
+        if not isinstance(feat, dict):
+            continue
+        geom = feat.get("geometry") or {}
+        if geom.get("type") != "LineString":
+            continue
+        coords = geom.get("coordinates") or []
+        if len(coords) >= 2:
+            return True
+    return False
+
+
+def _repair_preview_route_line_if_needed(
+    payload: Dict[str, object],
+    feed_id: int,
+) -> Dict[str, object]:
+    """
+    Older precomputes cached stop-only previews before shapes_lines existed.
+    Append the pattern shape polyline when missing so the map can draw the route.
+    """
+    geo = payload.get("route_geojson")
+    if _route_geojson_has_line(geo):
+        return payload
+    pattern_id = payload.get("pattern_id")
+    if not pattern_id:
+        return payload
+    conn = db_access_module._get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT repr_shape_id
+                FROM patterns
+                WHERE feed_id = %s AND pattern_id = %s
+                LIMIT 1
+                """,
+                (feed_id, str(pattern_id)),
+            )
+            row = cur.fetchone()
+        repr_shape_id = (
+            row["repr_shape_id"]
+            if row and row.get("repr_shape_id") is not None
+            else None
+        )
+        if not repr_shape_id:
+            return payload
+        line = db_access_module.get_shape_line(str(repr_shape_id), conn)
+        if line is None or len(getattr(line, "coords", []) or []) < 2:
+            return payload
+        from shapely.geometry import mapping
+
+        features = list((geo or {}).get("features") or [])
+        features.append(
+            {
+                "type": "Feature",
+                "geometry": mapping(line),
+                "properties": {"kind": "pattern_shape"},
+            }
+        )
+        repaired = {
+            **payload,
+            "route_geojson": {"type": "FeatureCollection", "features": features},
+        }
+        log(
+            "graph/preview",
+            f"repaired stop-only preview pattern_id={pattern_id} shape_id={repr_shape_id}",
+        )
+        return repaired
+    finally:
+        conn.close()
+
+
 def _build_preview_payload_from_cache_entry(cache: Dict) -> Dict[str, object]:
     """
     Build route preview payload (geojson + ordered stops) from a cache entry.
     """
     if cache.get("preview_geojson") is not None and cache.get("preview_stops") is not None:
-        return {
-            "route_geojson": cache.get("preview_geojson"),
-            "stops": cache.get("preview_stops"),
-        }
+        if _route_geojson_has_line(cache.get("preview_geojson")):
+            return {
+                "route_geojson": cache.get("preview_geojson"),
+                "stops": cache.get("preview_stops"),
+            }
     from shapely.geometry import mapping, Point
 
     pattern = cache["pattern"]
@@ -672,6 +749,16 @@ def startup_detour_v2_schema():
         log("db/schema", "pattern legal anchor tables ensured (if missing)")
     except Exception as e:
         log("db/schema", f"ensure pattern legal anchor schema failed: {e}")
+    try:
+        from backend.infra.detour_v3_runtime import bootstrap_detour_v3_runtime
+
+        conn = db_access_module._get_conn()
+        try:
+            bootstrap_detour_v3_runtime(conn)
+        finally:
+            conn.close()
+    except Exception as e:
+        log("detour_v3/bootstrap", f"feed/osm cohort bootstrap failed: {e}")
 
 
 @app.on_event("startup")
@@ -1482,6 +1569,8 @@ def graph_preview(
     )
     mem_preview = GRAPH_CACHE.get(preview_mem_key)
     if isinstance(mem_preview, dict) and mem_preview.get("route_geojson") is not None:
+        payload = _repair_preview_route_line_if_needed(mem_preview, feed_id)
+        GRAPH_CACHE[preview_mem_key] = payload
         elapsed = (time.perf_counter() - t0) * 1000.0
         response.headers["X-Elapsed-Ms"] = f"{elapsed:.1f}"
         response.headers["X-Cache-Hit"] = "memory"
@@ -1490,7 +1579,7 @@ def graph_preview(
             "graph/preview",
             f"route_id={route_id} dir={direction_id} preview_hit=memory graph_hit=none elapsed_ms={elapsed:.1f}",
         )
-        return mem_preview
+        return payload
 
     db_preview = db_access_module.get_cached_route_preview_pg(
         feed_id=feed_id,
@@ -1504,6 +1593,7 @@ def graph_preview(
         try:
             payload = pickle.loads(db_preview["preview_blob"])
             if isinstance(payload, dict) and payload.get("route_geojson") is not None:
+                payload = _repair_preview_route_line_if_needed(payload, feed_id)
                 GRAPH_CACHE[preview_mem_key] = payload
                 elapsed = (time.perf_counter() - t0) * 1000.0
                 response.headers["X-Elapsed-Ms"] = f"{elapsed:.1f}"
@@ -1589,6 +1679,7 @@ def graph_preview(
         bool(cache.get("used_osm_snapping", False)),
         feed_version,
     )
+    payload = _repair_preview_route_line_if_needed(payload, feed_id)
     GRAPH_CACHE[preview_mem_key] = payload
     try:
         db_access_module.save_route_preview_pg(

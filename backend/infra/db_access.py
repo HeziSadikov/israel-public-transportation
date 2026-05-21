@@ -38,6 +38,7 @@ import os
 import hashlib
 import json
 import time
+from datetime import datetime, timedelta
 
 import psycopg2
 from psycopg2.extras import DictCursor, Json
@@ -55,6 +56,9 @@ STOP_ROUTES_STATEMENT_TIMEOUT_MS = int(os.getenv("STOP_ROUTES_STATEMENT_TIMEOUT_
 # Set AREA_ROUTES_STATEMENT_TIMEOUT_MS to e.g. 180000 to cap long queries (milliseconds).
 AREA_ROUTES_STATEMENT_TIMEOUT_MS = int(os.getenv("AREA_ROUTES_STATEMENT_TIMEOUT_MS", "0"))
 ROUTES_TILE_STATEMENT_TIMEOUT_MS = int(os.getenv("ROUTES_TILE_STATEMENT_TIMEOUT_MS", "15000"))
+# GTFS allows trip times past midnight; area search uses 27:00 as the end-of-service-day cap.
+_GTFS_DAY_END_SEC = 27 * 3600
+_TIME_MATCH_CONF_RANK = {"high": 2, "approx": 1, "unknown": 0}
 
 
 class StopRoutesQueryTimeoutError(RuntimeError):
@@ -3230,6 +3234,7 @@ def _get_routes_in_polygon_pass_through_multi_day(
             ),
             candidate_trips AS MATERIALIZED (
                 SELECT DISTINCT
+                    s.date_ymd,
                     t.feed_id,
                     t.trip_id,
                     t.route_id,
@@ -3421,6 +3426,7 @@ def _get_routes_in_polygon_pass_through_multi_day(
                 feed_id,
                 feed_id,
                 feed_id,
+                feed_id,
             ),
         )
         return [
@@ -3442,6 +3448,73 @@ def _get_routes_in_polygon_pass_through_multi_day(
         ]
 
 
+def _iter_multi_day_windows(
+    start_date_ymd: str,
+    start_sec: int,
+    end_date_ymd: str,
+    end_sec: int,
+) -> List[Tuple[str, int, int]]:
+    """
+    Expand a calendar range into per-day (date, start_sec, end_sec) slices.
+    Mirrors the day_windows CTE used by the legacy monolithic multi-day SQL.
+    """
+    start_dt = datetime.strptime(start_date_ymd, "%Y%m%d")
+    end_dt = datetime.strptime(end_date_ymd, "%Y%m%d")
+    out: List[Tuple[str, int, int]] = []
+    cur = start_dt
+    while cur <= end_dt:
+        date_ymd = cur.strftime("%Y%m%d")
+        day_start = start_sec if cur == start_dt else 0
+        day_end = end_sec if cur == end_dt else _GTFS_DAY_END_SEC
+        out.append((date_ymd, day_start, day_end))
+        cur += timedelta(days=1)
+    return out
+
+
+def _merge_route_in_area_rows(chunks: Sequence[Sequence[RouteInAreaRow]]) -> List[RouteInAreaRow]:
+    grouped: Dict[Tuple[str, Optional[int]], RouteInAreaRow] = {}
+    for chunk in chunks:
+        for row in chunk:
+            key = (row.route_id, row.direction_id)
+            existing = grouped.get(key)
+            if existing is None:
+                grouped[key] = RouteInAreaRow(
+                    route_id=row.route_id,
+                    direction_id=row.direction_id,
+                    route_short_name=row.route_short_name,
+                    route_long_name=row.route_long_name,
+                    agency_id=row.agency_id,
+                    agency_name=row.agency_name,
+                    first_time_s=row.first_time_s,
+                    last_time_s=row.last_time_s,
+                    trip_count=row.trip_count,
+                    last_stop_name=row.last_stop_name,
+                    time_match_confidence=row.time_match_confidence,
+                    time_match_note=row.time_match_note,
+                )
+                continue
+            first_vals = [v for v in (existing.first_time_s, row.first_time_s) if v is not None]
+            last_vals = [v for v in (existing.last_time_s, row.last_time_s) if v is not None]
+            existing.first_time_s = min(first_vals) if first_vals else None
+            existing.last_time_s = max(last_vals) if last_vals else None
+            existing.trip_count = int(existing.trip_count or 0) + int(row.trip_count or 0)
+            row_rank = _TIME_MATCH_CONF_RANK.get(row.time_match_confidence, 0)
+            existing_rank = _TIME_MATCH_CONF_RANK.get(existing.time_match_confidence, 0)
+            if row_rank < existing_rank:
+                existing.time_match_confidence = row.time_match_confidence
+                existing.time_match_note = row.time_match_note
+            elif row_rank == existing_rank and row.time_match_note and not existing.time_match_note:
+                existing.time_match_note = row.time_match_note
+    return sorted(
+        grouped.values(),
+        key=lambda r: (
+            r.route_short_name or r.route_id or "",
+            r.route_id or "",
+            r.direction_id if r.direction_id is not None else "",
+        ),
+    )
+
+
 def get_routes_in_polygon_range(
     polygon_wkt: str,
     start_date_ymd: str,
@@ -3456,10 +3529,9 @@ def get_routes_in_polygon_range(
         conn = _get_conn()
         close = True
     try:
-        # UI and most clients send the same start/end calendar day. The multi-day query below
-        # builds per-day rows (generate_series + calendar joins) and can be orders of magnitude
-        # slower on full national feeds, effectively hanging /area/routes. Single-day path matches
-        # the legacy get_routes_in_polygon implementation.
+        # Multi-day windows (e.g. overnight 22:00→05:00 across two calendar days) are split
+        # into per-day single-day queries and merged. The monolithic multi-day SQL joins all
+        # stop_times at once and can hang on full national feeds.
         sd = (start_date_ymd or "").strip()
         ed = (end_date_ymd or "").strip()
         if sd and sd == ed:
@@ -3478,184 +3550,41 @@ def get_routes_in_polygon_range(
             )
 
         feed_id = get_active_feed_id(conn)
+        day_slices = _iter_multi_day_windows(sd, start_sec, ed, end_sec)
         log(
             "area/routes",
-            f"phase=pg_multi_day_begin feed_id={feed_id} start_date={sd} end_date={ed} "
-            f"time_window_sec={start_sec}-{end_sec} wkt_chars={len(polygon_wkt)} "
-            f"statement_timeout_ms={AREA_ROUTES_STATEMENT_TIMEOUT_MS} "
+            f"phase=pg_multi_day_split feed_id={feed_id} start_date={sd} end_date={ed} "
+            f"time_window_sec={start_sec}-{end_sec} day_count={len(day_slices)} "
+            f"wkt_chars={len(polygon_wkt)} statement_timeout_ms={AREA_ROUTES_STATEMENT_TIMEOUT_MS} "
             f"time_semantics_mode={time_semantics_mode}",
         )
-        if time_semantics_mode != "legacy_trip_overlap":
-            return _get_routes_in_polygon_pass_through_multi_day(
-                conn=conn,
-                feed_id=feed_id,
-                polygon_wkt=polygon_wkt,
-                start_date_ymd=start_date_ymd,
-                start_sec=start_sec,
-                end_date_ymd=end_date_ymd,
-                end_sec=end_sec,
+        t_split = time.perf_counter()
+        chunks: List[List[RouteInAreaRow]] = []
+        for date_ymd, day_start, day_end in day_slices:
+            t_day = time.perf_counter()
+            day_rows = get_routes_in_polygon(
+                polygon_wkt,
+                date_ymd,
+                day_start,
+                day_end,
                 time_semantics_mode=time_semantics_mode,
+                conn=conn,
             )
-        with conn.cursor() as cur:
-            cur.execute(
-                "SET LOCAL statement_timeout = %s", (AREA_ROUTES_STATEMENT_TIMEOUT_MS,)
-            )
-            t_exec = time.perf_counter()
-            cur.execute(
-                """
-                WITH bounds AS (
-                    SELECT
-                        to_date(%s::text, 'YYYYMMDD') AS start_date,
-                        to_date(%s::text, 'YYYYMMDD') AS end_date,
-                        %s::int AS start_sec,
-                        %s::int AS end_sec
-                ),
-                day_windows AS (
-                    SELECT
-                        to_char(gs::date, 'YYYYMMDD')::int AS date_ymd,
-                        EXTRACT(DOW FROM gs::date)::int AS dow,
-                        CASE WHEN gs::date = b.start_date THEN b.start_sec ELSE 0 END AS day_start_sec,
-                        CASE WHEN gs::date = b.end_date THEN b.end_sec ELSE 27 * 3600 END AS day_end_sec
-                    FROM bounds b
-                    JOIN LATERAL generate_series(b.start_date, b.end_date, interval '1 day') gs ON TRUE
-                ),
-                calendar_services AS (
-                    SELECT dw.date_ymd, dw.day_start_sec, dw.day_end_sec, c.service_id
-                    FROM day_windows dw
-                    JOIN calendar c ON c.feed_id = %s
-                     AND dw.date_ymd BETWEEN c.start_date AND c.end_date
-                     AND (
-                        (dw.dow = 0 AND c.sunday = 1)
-                        OR (dw.dow = 1 AND c.monday = 1)
-                        OR (dw.dow = 2 AND c.tuesday = 1)
-                        OR (dw.dow = 3 AND c.wednesday = 1)
-                        OR (dw.dow = 4 AND c.thursday = 1)
-                        OR (dw.dow = 5 AND c.friday = 1)
-                        OR (dw.dow = 6 AND c.saturday = 1)
-                     )
-                ),
-                add_services AS (
-                    SELECT dw.date_ymd, dw.day_start_sec, dw.day_end_sec, cd.service_id
-                    FROM day_windows dw
-                    JOIN calendar_dates cd ON cd.feed_id = %s
-                     AND cd.date = dw.date_ymd
-                     AND cd.exception_type = 1
-                ),
-                remove_services AS (
-                    SELECT dw.date_ymd, cd.service_id
-                    FROM day_windows dw
-                    JOIN calendar_dates cd ON cd.feed_id = %s
-                     AND cd.date = dw.date_ymd
-                     AND cd.exception_type = 2
-                ),
-                base_services AS (
-                    SELECT date_ymd, day_start_sec, day_end_sec, service_id FROM calendar_services
-                    UNION
-                    SELECT date_ymd, day_start_sec, day_end_sec, service_id FROM add_services
-                ),
-                active_services AS (
-                    SELECT bs.date_ymd, bs.day_start_sec, bs.day_end_sec, bs.service_id
-                    FROM base_services bs
-                    LEFT JOIN remove_services r
-                      ON r.date_ymd = bs.date_ymd AND r.service_id = bs.service_id
-                    WHERE r.service_id IS NULL
-                ),
-                shapes_in_area AS MATERIALIZED (
-                    SELECT sl.feed_id, sl.shape_id
-                    FROM shapes_lines sl
-                    WHERE sl.feed_id = %s
-                      AND ST_Intersects(sl.geom, ST_GeomFromText(%s, 4326))
-                ),
-                shape_hit_trips AS MATERIALIZED (
-                    SELECT DISTINCT t.feed_id, t.trip_id, t.route_id, t.direction_id, t.service_id
-                    FROM shapes_in_area sia
-                    JOIN trips t
-                      ON t.feed_id = sia.feed_id
-                      AND t.shape_id = sia.shape_id
-                      AND t.shape_id IS NOT NULL
-                    WHERE t.feed_id = %s
-                ),
-                trips_in_window AS MATERIALIZED (
-                    SELECT sht.feed_id, sht.trip_id, sht.route_id, sht.direction_id
-                    FROM shape_hit_trips sht
-                    JOIN active_services s ON s.service_id = sht.service_id
-                    JOIN trip_time_bounds b ON b.feed_id = sht.feed_id AND b.trip_id = sht.trip_id
-                    WHERE sht.feed_id = %s
-                      AND b.last_sec >= s.day_start_sec
-                      AND b.first_sec <= s.day_end_sec
-                ),
-                routes_geom AS (
-                    SELECT DISTINCT
-                        tiw.route_id,
-                        tiw.direction_id,
-                        r.short_name AS route_short_name,
-                        r.long_name AS route_long_name,
-                        r.agency_id,
-                        MIN(b.first_sec) AS first_time_s,
-                        MAX(b.last_sec) AS last_time_s,
-                        COUNT(DISTINCT tiw.trip_id)::int AS trip_count
-                    FROM trips_in_window tiw
-                    JOIN trip_time_bounds b
-                      ON b.feed_id = tiw.feed_id AND b.trip_id = tiw.trip_id
-                    JOIN routes r
-                      ON r.feed_id = tiw.feed_id AND r.route_id = tiw.route_id
-                    GROUP BY tiw.route_id, tiw.direction_id, r.short_name, r.long_name, r.agency_id
-                )
-                SELECT
-                    rg.route_id,
-                    rg.direction_id,
-                    rg.route_short_name,
-                    rg.route_long_name,
-                    rg.agency_id,
-                    a.name AS agency_name,
-                    rg.first_time_s,
-                    rg.last_time_s,
-                    rg.trip_count,
-                    NULL::text AS last_stop_name
-                FROM routes_geom rg
-                LEFT JOIN agencies a
-                  ON a.feed_id = %s AND a.agency_id = rg.agency_id
-                ORDER BY rg.route_short_name, rg.route_id, rg.direction_id
-                """,
-                (
-                    start_date_ymd,
-                    end_date_ymd,
-                    start_sec,
-                    end_sec,
-                    feed_id,
-                    feed_id,
-                    feed_id,
-                    feed_id,
-                    polygon_wkt,
-                    feed_id,
-                    feed_id,
-                    feed_id,
-                ),
-            )
-            exec_ms = int((time.perf_counter() - t_exec) * 1000)
-            log("area/routes", f"phase=pg_multi_day_execute_done elapsed_ms={exec_ms}")
-            t_fetch = time.perf_counter()
-            raw_rows = cur.fetchall()
-            fetch_ms = int((time.perf_counter() - t_fetch) * 1000)
+            day_ms = int((time.perf_counter() - t_day) * 1000)
             log(
                 "area/routes",
-                f"phase=pg_multi_day_fetch_done rows={len(raw_rows)} elapsed_ms={fetch_ms}",
+                f"phase=pg_multi_day_day date={date_ymd} window_sec={day_start}-{day_end} "
+                f"rows={len(day_rows)} elapsed_ms={day_ms}",
             )
-            return [
-                RouteInAreaRow(
-                    route_id=r["route_id"],
-                    direction_id=r["direction_id"],
-                    route_short_name=r["route_short_name"],
-                    route_long_name=r["route_long_name"],
-                    agency_id=r["agency_id"],
-                    agency_name=r["agency_name"],
-                    first_time_s=r["first_time_s"],
-                    last_time_s=r["last_time_s"],
-                    trip_count=r["trip_count"],
-                    last_stop_name=r.get("last_stop_name"),
-                )
-                for r in raw_rows
-            ]
+            chunks.append(day_rows)
+        merged = _merge_route_in_area_rows(chunks)
+        split_ms = int((time.perf_counter() - t_split) * 1000)
+        log(
+            "area/routes",
+            f"phase=pg_multi_day_split_done day_count={len(day_slices)} "
+            f"route_rows={len(merged)} elapsed_ms={split_ms}",
+        )
+        return merged
     finally:
         if close:
             conn.close()
