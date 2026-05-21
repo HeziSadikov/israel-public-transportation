@@ -29,7 +29,7 @@ PATTERNS_ALGORITHM_VERSION = "patterns_postgis_v1"
 GRAPHS_ALGORITHM_VERSION = "graphs_precompute_v1"
 OSM_IMPORT_ALGORITHM_VERSION = "osm_pbf_import_v1"
 SEGMENT_TURNS_ALGORITHM_VERSION = "segment_turns_v1"
-PATTERN_OSM_MATCH_ALGORITHM_VERSION = "pattern_osm_match_v1"
+PATTERN_OSM_MATCH_ALGORITHM_VERSION = "pattern_osm_match_v2"
 BUS_EVIDENCE_ALGORITHM_VERSION = "bus_evidence_v1"
 GTFS_BUS_WAY_EVIDENCE_ALGORITHM_VERSION = "gtfs_bus_way_evidence_v1"
 LEGAL_ANCHORS_ALGORITHM_VERSION = "legal_anchors_v1"
@@ -831,8 +831,7 @@ def build_pattern_osm_match_fingerprint(
     costing: str,
     densify_m: float,
     full_trace_max_km: float,
-    chunk_legs: int,
-    chunk_overlap: int,
+    slice_overlap_m: float,
 ) -> str:
     return fingerprint_sha256(
         {
@@ -846,8 +845,7 @@ def build_pattern_osm_match_fingerprint(
                 "costing": costing,
                 "densify_m": densify_m,
                 "full_trace_max_km": full_trace_max_km,
-                "chunk_legs": chunk_legs,
-                "chunk_overlap": chunk_overlap,
+                "slice_overlap_m": slice_overlap_m,
             },
         }
     )

@@ -41,8 +41,7 @@ def test_build_pattern_osm_match_fingerprint_includes_config():
         costing="bus",
         densify_m=15.0,
         full_trace_max_km=10.0,
-        chunk_legs=11,
-        chunk_overlap=1,
+        slice_overlap_m=200.0,
     )
     fp2 = ps.build_pattern_osm_match_fingerprint(
         pattern_signature="psig",
@@ -50,8 +49,7 @@ def test_build_pattern_osm_match_fingerprint_includes_config():
         costing="bus",
         densify_m=20.0,
         full_trace_max_km=10.0,
-        chunk_legs=11,
-        chunk_overlap=1,
+        slice_overlap_m=200.0,
     )
     assert fp1 != fp2
 

@@ -102,8 +102,7 @@ def _process_rows_sequential(
     conn,
     feed_id: int,
     full_trace_max_km: float,
-    chunk_legs: int,
-    chunk_overlap: int,
+    slice_overlap_m: float,
     force_refresh: bool,
     verbose: bool,
 ) -> Tuple[int, int, int]:
@@ -120,8 +119,7 @@ def _process_rows_sequential(
                 repr_trip_id=str(r["repr_trip_id"]) if r.get("repr_trip_id") else None,
                 repr_shape_id=str(r["repr_shape_id"]) if r.get("repr_shape_id") else None,
                 full_trace_max_km=float(full_trace_max_km),
-                chunk_legs=int(chunk_legs),
-                chunk_overlap=int(chunk_overlap),
+                slice_overlap_m=float(slice_overlap_m),
                 force_refresh=bool(force_refresh),
             )
             if res.status == "written":
@@ -162,8 +160,7 @@ def _process_rows_parallel_page(
     pool_conns: dict[int, Any],
     pool_lock: threading.Lock,
     full_trace_max_km: float,
-    chunk_legs: int,
-    chunk_overlap: int,
+    slice_overlap_m: float,
     force_refresh: bool,
     verbose: bool,
 ) -> Tuple[int, int, int]:
@@ -194,8 +191,7 @@ def _process_rows_parallel_page(
                     repr_trip_id=str(row["repr_trip_id"]) if row.get("repr_trip_id") else None,
                     repr_shape_id=str(row["repr_shape_id"]) if row.get("repr_shape_id") else None,
                     full_trace_max_km=float(full_trace_max_km),
-                    chunk_legs=int(chunk_legs),
-                    chunk_overlap=int(chunk_overlap),
+                    slice_overlap_m=float(slice_overlap_m),
                     force_refresh=bool(force_refresh),
                 )
                 if res.status == "written":
@@ -304,8 +300,24 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     ap.add_argument("--verbose", action="store_true")
     ap.add_argument("--full-trace-max-km", type=float, default=10.0)
-    ap.add_argument("--chunk-legs", type=int, default=11)
-    ap.add_argument("--chunk-overlap", type=int, default=1)
+    ap.add_argument(
+        "--slice-overlap-m",
+        type=float,
+        default=200.0,
+        help="Overlap between consecutive km-slices along the full shape (default 200).",
+    )
+    ap.add_argument(
+        "--chunk-legs",
+        type=int,
+        default=11,
+        help=argparse.SUPPRESS,
+    )
+    ap.add_argument(
+        "--chunk-overlap",
+        type=int,
+        default=1,
+        help=argparse.SUPPRESS,
+    )
     args = ap.parse_args(argv)
 
     if args.limit < 1:
@@ -407,8 +419,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                         conn=run,
                         feed_id=feed_id,
                         full_trace_max_km=float(args.full_trace_max_km),
-                        chunk_legs=int(args.chunk_legs),
-                        chunk_overlap=int(args.chunk_overlap),
+                        slice_overlap_m=float(args.slice_overlap_m),
                         force_refresh=bool(args.force_refresh),
                         verbose=bool(args.verbose),
                     )
@@ -467,8 +478,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                         pool_conns=pool_conns,
                         pool_lock=pool_lock,
                         full_trace_max_km=float(args.full_trace_max_km),
-                        chunk_legs=int(args.chunk_legs),
-                        chunk_overlap=int(args.chunk_overlap),
+                        slice_overlap_m=float(args.slice_overlap_m),
                         force_refresh=bool(args.force_refresh),
                         verbose=bool(args.verbose),
                     )

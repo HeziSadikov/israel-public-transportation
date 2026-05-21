@@ -8,8 +8,8 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 from shapely.geometry import LineString
 
 from backend.domain.detour_physical.edge_matcher import (
+    match_pattern_shape_to_osm_edges,
     score_gtfs_leg_against_edges,
-    trace_pattern_split_to_legs,
 )
 from backend.infra import db_access as db
 from backend.infra import pipeline_skip as ps
@@ -17,7 +17,6 @@ from backend.infra.osm_import_db import IMPORT_SOURCE_V3
 
 from .trace_segment_resolve import (
     dedupe_consecutive_trace_edges,
-    flatten_per_leg_trace_edges,
     resolve_trace_edges_to_segment_ids,
     trace_edge_has_osm_endpoint_ids,
     trace_edge_resolution_triple,
@@ -25,6 +24,7 @@ from .trace_segment_resolve import (
 
 
 SOURCE_VALHALLA_TRACE = "valhalla_trace"
+SOURCE_VALHALLA_TRACE_FULL_SHAPE = "valhalla_trace_full_shape"
 
 
 @dataclass(frozen=True)
@@ -44,20 +44,6 @@ def _shape_line_for_pattern(conn, feed_id: int, repr_shape_id: Optional[str]) ->
     return g if isinstance(g, LineString) else None
 
 
-def _stop_times_for_trip(conn, feed_id: int, trip_id: str) -> List[Dict[str, Any]]:
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT stop_id, stop_sequence, shape_dist_traveled
-            FROM stop_times
-            WHERE feed_id = %s AND trip_id = %s
-            ORDER BY stop_sequence
-            """,
-            (feed_id, trip_id),
-        )
-        return [dict(r) for r in cur.fetchall()]
-
-
 def _confidence_from_flat_edges(shape_line: LineString, flat_edges: List[Dict[str, Any]]) -> float:
     score = score_gtfs_leg_against_edges(shape_line, flat_edges)
     return float(min(1.0, max(0.0, (score.total + 5.0) / 15.0)))
@@ -71,8 +57,7 @@ def _build_match_fingerprint(
     costing: str,
     densify_m: float,
     full_trace_max_km: float,
-    chunk_legs: int,
-    chunk_overlap: int,
+    slice_overlap_m: float,
     repr_trip_id: Optional[str],
     repr_shape_id: Optional[str],
 ) -> str:
@@ -92,8 +77,7 @@ def _build_match_fingerprint(
         costing=costing,
         densify_m=densify_m,
         full_trace_max_km=full_trace_max_km,
-        chunk_legs=chunk_legs,
-        chunk_overlap=chunk_overlap,
+        slice_overlap_m=slice_overlap_m,
     )
 
 
@@ -102,11 +86,9 @@ def _do_match_write(
     *,
     feed_id: int,
     pid: str,
-    repr_trip_id: Optional[str],
     repr_shape_id: Optional[str],
     full_trace_max_km: float,
-    chunk_legs: int,
-    chunk_overlap: int,
+    slice_overlap_m: float,
     costing: str,
     densify_m: float,
 ) -> PatternOsmMatchResult:
@@ -114,29 +96,27 @@ def _do_match_write(
     if shape_line is None or shape_line.is_empty:
         return PatternOsmMatchResult(pid, "skipped_no_shape", 0, message="no representative shape")
 
-    if not repr_trip_id:
-        return PatternOsmMatchResult(pid, "skipped_no_trip", 0, message="no repr_trip_id")
-    stops = _stop_times_for_trip(conn, feed_id, str(repr_trip_id))
-    if len(stops) < 2:
-        return PatternOsmMatchResult(pid, "skipped_no_stops", 0, message="fewer than 2 stop_times rows")
-
-    per_leg, notes = trace_pattern_split_to_legs(
+    trace_res, notes = match_pattern_shape_to_osm_edges(
         shape_line,
-        stops,
         full_trace_max_km=full_trace_max_km,
-        chunk_legs=chunk_legs,
-        chunk_overlap=chunk_overlap,
+        slice_overlap_m=slice_overlap_m,
         costing=costing,
         densify_m=densify_m,
-        only_leg_indices=None,
     )
     nt = tuple(notes)
 
-    flat = flatten_per_leg_trace_edges(per_leg)
-    if not flat:
-        return PatternOsmMatchResult(pid, "failed_trace", 0, trace_notes=nt, message="could not flatten leg edges")
+    if not trace_res.success or not trace_res.edge_records:
+        return PatternOsmMatchResult(
+            pid,
+            "failed_trace",
+            0,
+            trace_notes=nt,
+            message="shape-primary trace failed",
+        )
 
-    flat = dedupe_consecutive_trace_edges(flat)
+    flat = dedupe_consecutive_trace_edges(list(trace_res.edge_records))
+    if not flat:
+        return PatternOsmMatchResult(pid, "failed_trace", 0, trace_notes=nt, message="empty edge list after dedupe")
 
     triples = [trace_edge_resolution_triple(e, i) for i, e in enumerate(flat)]
     triple_map = db.fetch_osm_road_segments_by_way_endpoint_triples(triples, conn=conn)
@@ -170,7 +150,7 @@ def _do_match_write(
             "seq": i + 1,
             "segment_id": sid,
             "confidence": conf,
-            "source": SOURCE_VALHALLA_TRACE,
+            "source": SOURCE_VALHALLA_TRACE_FULL_SHAPE,
         }
         for i, sid in enumerate(ids)
     ]
@@ -187,8 +167,7 @@ def match_single_pattern_to_osm(
     repr_trip_id: Optional[str],
     repr_shape_id: Optional[str],
     full_trace_max_km: float = 10.0,
-    chunk_legs: int = 11,
-    chunk_overlap: int = 1,
+    slice_overlap_m: float = 200.0,
     costing: str = "bus",
     densify_m: float = 15.0,
     force_refresh: bool = False,
@@ -196,6 +175,9 @@ def match_single_pattern_to_osm(
     """
     Trace representative shape → Valhalla edges → ``osm_road_segments.segment_id`` chain;
     REPLACE rows in ``pattern_osm_segments`` for this pattern.
+
+    Corridor coverage follows the full GTFS shape polyline (``repr_shape_id``).
+    ``repr_trip_id`` is used for pattern signature / fingerprint identity only.
 
     Skip authorization uses content fingerprint + succeeded status only (never row counts).
     Caller should commit ``conn`` after a ``written`` result.
@@ -208,8 +190,7 @@ def match_single_pattern_to_osm(
         costing=costing,
         densify_m=densify_m,
         full_trace_max_km=full_trace_max_km,
-        chunk_legs=chunk_legs,
-        chunk_overlap=chunk_overlap,
+        slice_overlap_m=slice_overlap_m,
         repr_trip_id=repr_trip_id,
         repr_shape_id=repr_shape_id,
     )
@@ -233,14 +214,9 @@ def match_single_pattern_to_osm(
     if ps.fast_path_may_skip(_last_fp, _last_outcome, current_fp, force=force_refresh):
         return PatternOsmMatchResult(pid, "skipped_fingerprint", 0, message="fingerprint unchanged")
 
-    if not repr_trip_id:
-        return PatternOsmMatchResult(pid, "skipped_no_trip", 0, message="no repr_trip_id")
     shape_line = _shape_line_for_pattern(conn, feed_id, repr_shape_id)
     if shape_line is None or shape_line.is_empty:
         return PatternOsmMatchResult(pid, "skipped_no_shape", 0, message="no representative shape")
-    stops = _stop_times_for_trip(conn, feed_id, str(repr_trip_id))
-    if len(stops) < 2:
-        return PatternOsmMatchResult(pid, "skipped_no_stops", 0, message="fewer than 2 stop_times rows")
 
     unit = ps.UnitLockKey(
         stage_name=ps.StageName.PATTERN_OSM_MATCH.value,
@@ -279,11 +255,9 @@ def match_single_pattern_to_osm(
                 conn,
                 feed_id=feed_id,
                 pid=pid,
-                repr_trip_id=repr_trip_id,
                 repr_shape_id=repr_shape_id,
                 full_trace_max_km=full_trace_max_km,
-                chunk_legs=chunk_legs,
-                chunk_overlap=chunk_overlap,
+                slice_overlap_m=slice_overlap_m,
                 costing=costing,
                 densify_m=densify_m,
             )
@@ -300,8 +274,7 @@ def match_patterns_to_osm(
     feed_id: int,
     patterns: Sequence[Mapping[str, Any]],
     full_trace_max_km: float = 10.0,
-    chunk_legs: int = 11,
-    chunk_overlap: int = 1,
+    slice_overlap_m: float = 200.0,
     costing: str = "bus",
     densify_m: float = 15.0,
     force_refresh: bool = False,
@@ -317,8 +290,7 @@ def match_patterns_to_osm(
                 repr_trip_id=str(prow["repr_trip_id"]) if prow.get("repr_trip_id") else None,
                 repr_shape_id=str(prow["repr_shape_id"]) if prow.get("repr_shape_id") else None,
                 full_trace_max_km=full_trace_max_km,
-                chunk_legs=chunk_legs,
-                chunk_overlap=chunk_overlap,
+                slice_overlap_m=slice_overlap_m,
                 costing=costing,
                 densify_m=densify_m,
                 force_refresh=force_refresh,
@@ -330,6 +302,7 @@ def match_patterns_to_osm(
 __all__ = [
     "PatternOsmMatchResult",
     "SOURCE_VALHALLA_TRACE",
+    "SOURCE_VALHALLA_TRACE_FULL_SHAPE",
     "match_patterns_to_osm",
     "match_single_pattern_to_osm",
 ]

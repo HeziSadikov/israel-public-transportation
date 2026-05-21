@@ -277,7 +277,7 @@ Production detours historically used **detour v2** (GTFS anchors + Valhalla road
 - `DETOUR_V3_IMPORT_RUN_ID` — optional: load only segments/turn edges from one `osm_import_runs.id` cohort.
 - `DETOUR_V3_COST_MODE` — `bus_corridor_plus_connectors` (default, soft surcharge off-corridor segments) or `strict_bus_corridor` (heavy penalty unless segment is GTFS-evidenced).
 
-**CLI (detour v3 layers):** `python -m backend.scripts.import_osm_pbf --with-segments --with-turns`, `python -m backend.scripts.build_segment_turns` (rebuild turns only), `python -m backend.scripts.match_patterns_to_osm`, `python -m backend.scripts.build_bus_evidence`.
+**CLI (detour v3 layers):** `python -m backend.scripts.import_osm_pbf --with-segments --with-turns`, `python -m backend.scripts.build_segment_turns` (rebuild turns only), `python -m backend.scripts.match_patterns_to_osm` (traces the **full** representative GTFS shape polyline into `pattern_osm_segments`, not stop-to-stop legs), `python -m backend.scripts.build_bus_evidence`.
 
 **Offline precompute (``scripts/precompute_all_postgis.py``):** one-liner (use ``=`` for args whose values start with ``-``; PowerShell-friendly):
 

@@ -77,16 +77,18 @@ def trace_linestring_with_km_cap(
     max_km: float,
     costing: str = "bus",
     densify_m: float = 15.0,
+    slice_overlap_m: float = 200.0,
 ) -> EdgeMatchResult:
     """Map-match ``line``, splitting into <= ``max_km`` slices when Valhalla rejects very long shapes."""
     if line.is_empty:
         return EdgeMatchResult(success=False, notes=["empty_line"])
     total_m = line_length_m(line)
     cap_m = max(1000.0, float(max_km) * 1000.0)
+    overlap_m = max(0.0, min(float(slice_overlap_m), cap_m * 0.5))
     if total_m <= cap_m:
         return match_gtfs_slice_to_osm_edges(line, costing=costing, densify_m=densify_m)
     edges_all: List[Dict[str, Any]] = []
-    notes: List[str] = ["km_sliced_trace"]
+    notes: List[str] = ["km_sliced_trace", f"slice_overlap_m={overlap_m:.0f}"]
     start_m = 0.0
     while start_m < total_m - 1.0:
         end_m = min(total_m, start_m + cap_m)
@@ -97,7 +99,12 @@ def trace_linestring_with_km_cap(
             notes.append(f"subslice_fail_m={start_m:.0f}-{end_m:.0f}")
             return EdgeMatchResult(success=False, notes=notes)
         edges_all.extend(res.edge_records)
-        start_m = end_m
+        if end_m >= total_m - 1.0:
+            break
+        next_start = end_m - overlap_m
+        if next_start <= start_m:
+            next_start = end_m
+        start_m = max(0.0, next_start)
     score = _score_trace_edges(line, edges_all) if edges_all else None
     return EdgeMatchResult(
         success=True,
@@ -105,6 +112,30 @@ def trace_linestring_with_km_cap(
         score=score,
         notes=notes + [f"edges={len(edges_all)}"],
     )
+
+
+def match_pattern_shape_to_osm_edges(
+    shape_line: LineString,
+    *,
+    full_trace_max_km: float = 10.0,
+    slice_overlap_m: float = 200.0,
+    costing: str = "bus",
+    densify_m: float = 15.0,
+) -> Tuple[EdgeMatchResult, List[str]]:
+    """
+    Map-match the full representative GTFS shape (shape-primary corridor).
+    Does not use stop_times or per-leg splitting.
+    """
+    res = trace_linestring_with_km_cap(
+        shape_line,
+        max_km=full_trace_max_km,
+        costing=costing,
+        densify_m=densify_m,
+        slice_overlap_m=slice_overlap_m,
+    )
+    notes: List[str] = ["full_shape_primary_trace"]
+    notes.extend(list(res.notes or []))
+    return res, notes
 
 
 def match_full_shape_to_osm_edges(

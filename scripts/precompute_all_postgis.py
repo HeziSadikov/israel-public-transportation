@@ -522,6 +522,8 @@ def main() -> None:
         pom_workers = max(1, pom_workers)
         if not any(t == "--workers" or t.startswith("--workers=") for t in pom_extra):
             pom_extra.extend(["--workers", str(pom_workers)])
+        if not any(t == "--slice-overlap-m" or t.startswith("--slice-overlap-m=") for t in pom_extra):
+            pom_extra.extend(["--slice-overlap-m", "200"])
         _run_py_module("backend.scripts.match_patterns_to_osm", pom_extra, db)
         log("precompute-all", "phase=pattern_osm_match done")
     elif args.with_pattern_osm_match:

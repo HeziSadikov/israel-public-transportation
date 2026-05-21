@@ -14,6 +14,7 @@ Implemented in M4 / M5.
 from .build_bus_evidence import build_bus_evidence
 from .match_patterns_to_osm import (
     SOURCE_VALHALLA_TRACE,
+    SOURCE_VALHALLA_TRACE_FULL_SHAPE,
     PatternOsmMatchResult,
     match_patterns_to_osm,
     match_single_pattern_to_osm,
@@ -26,6 +27,7 @@ from .pattern_osm_path import (
 
 __all__ = [
     "SOURCE_VALHALLA_TRACE",
+    "SOURCE_VALHALLA_TRACE_FULL_SHAPE",
     "PatternOsmMatchResult",
     "build_bus_evidence",
     "clear_pattern_osm_path",

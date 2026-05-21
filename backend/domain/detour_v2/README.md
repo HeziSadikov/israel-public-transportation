@@ -6,7 +6,7 @@ Road-graph-first detour computation for Israeli buses (`standard_plus_bus`).
 
 - **Legacy** (`/api/v1/detours/by-area`, `detour_graph.py`): GTFS pattern graph + optional Valhalla hybrid; caches in `detour_by_area_cache`. Responses include `diagnostics.detour_engine` (`v1`|`v2`|`v3`, from `DETOUR_ENGINE` / request) for observability; per-trip bus-quality detours use `POST /api/v1/detours/compute`.
 - **v2** (`/api/v1/detours/compute`, default when `DETOUR_ENGINE=v2` or `compute_engine=v2`): planned-service context from GTFS shapes/stops, Valhalla road candidates between anchors, feasibility on decoded segments/turns, explainable ranking; persistence in `detour_requests` / `detour_candidates` / `approved_detours`.
-- **v3** (`backend/detour_v3`, selected when `DETOUR_ENGINE=v3` / `v3_default` or `compute_engine=v3`): PostGIS `pattern_osm_segments` + `osm_segment_turns` + A* avoidance routing; Valhalla is offline-only for map-matching in `match_patterns_to_osm`.
+- **v3** (`backend/detour_v3`, selected when `DETOUR_ENGINE=v3` / `v3_default` or `compute_engine=v3`): PostGIS `pattern_osm_segments` + `osm_segment_turns` + A* avoidance routing; Valhalla is offline-only for map-matching in `match_patterns_to_osm`. **`pattern_osm_segments` covers the full representative GTFS shape** (`repr_shape_id`); stop_times do not bound corridor coverage. Trip impact and v3 anchors both use the same shape geometry.
 
 ## Module map
 
